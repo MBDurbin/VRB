@@ -1,11 +1,14 @@
 import serial
 import time
 import threading
+import csv
+import os
 
 # ================= CONFIGURATION =================
 # REPLACE 'COM3' with your actual port (e.g., '/dev/ttyUSB0' on Linux/Mac)
 SERIAL_PORT = 'COM3'
 BAUD_RATE = 9600
+CSV_FILENAME = r"C:\Users\Durbi\PycharmProjects\Resistor Bank Master\FSAE - ETS - Speed and Time 1 Lap.csv"
 
 # SYSTEM CONSTANTS (Based on your "1st bit = 1/4, 8th bit = 32" rule)
 # This assumes an 8-bit resolution where the LSB (Last bit) is 0.25 Ohms
@@ -97,6 +100,11 @@ def resistance_to_binary(target_ohms):
 def main():
     print("--- Master Controller Starting ---")
 
+    # Check if CSV exists
+    if not os.path.exists(CSV_FILENAME):
+        print(f"ERROR: Could not find '{CSV_FILENAME}'")
+        return
+
     try:
         # Open Serial Port
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
@@ -109,46 +117,72 @@ def main():
         hb_thread.daemon = True
         hb_thread.start()
 
-        print("System Running. Press Ctrl+C to stop.")
+        # 3. Get Constant Battery Voltage (since CSV doesn't have it)
+        try:
+            battery_voltage = float(input("\nEnter Battery Voltage (V) for this run: "))
+        except ValueError:
+            battery_voltage = 43.5  # Default fallback
+            print("Invalid voltage. Defaulting to 400V.")
 
-        while True:
-            # --- FLOWCHART STEP: "Current Voltage & Velocity Data" ---
-            # In a real system, these would read from sensors.
-            # Here, we ask for manual input for testing.
-            try:
-                v_in = float(input("\nEnter Velocity (m/s): "))
-                volts_in = float(input("Enter Module Voltage (V): "))
-            except ValueError:
-                print("Invalid number.")
-                continue
+        print(f"\nStarting Simulation from: {CSV_FILENAME}")
+        print("Press Ctrl+C to abort.")
+        time.sleep(1)
+        i=0
+        while i<11:
+            i += 1
+            print(f"--------LAP {i}/11--------")
+            # 4. Read and Replay CSV
+            with open(CSV_FILENAME, 'r') as csvfile:
+                reader = csv.DictReader(csvfile)
 
-            # --- FLOWCHART STEP: Calculate Resistance ---
-            req_r = calculate_required_resistance(v_in, volts_in)
-            print(f"  -> Calc Power Load: {(volts_in ** 2) / req_r:.2f} W")
-            print(f"  -> Target Resistance: {req_r:.4f} Ohms")
+                start_time = time.time()
 
-            # --- FLOWCHART STEP: Convert to Binary ---
-            bin_str = resistance_to_binary(req_r)
+                for row in reader:
+                    # --- A. Parse CSV Data ---
+                    try:
+                        # CSV Headers: 'YouTube Time', 'Time (s)', 'Speed (mph)'
+                        sim_time = float(row['Time (s)'])
+                        speed_mph = float(row['Speed (mph)'])
+                    except (ValueError, KeyError):
+                        continue  # Skip bad rows
 
-            # --- SAFETY CHECK (Matches Arduino Logic) ---
-            # If we calculated 0 resistance (Short Circuit), force it to safe limit
-            if bin_str == "00000000":
-                print("  -> WARNING: 0 Resistance Calc. Forcing 0.25 Safe Mode.")
-                bin_str = "00000001"
+                    # --- B. Conversions ---
+                    # Convert mph to m/s
+                    velocity_ms = speed_mph * 0.44704
 
-            print(f"  -> Sending Binary: {bin_str}")
+                    # --- C. Physics & Logic ---
+                    req_r = calculate_required_resistance(velocity_ms, battery_voltage)
+                    bin_str = resistance_to_binary(req_r)
 
-            # --- FLOWCHART STEP: Serial Signal to Arduino ---
-            # We encode string to bytes and add newline '\n' because
-            # Arduino uses readStringUntil('\n')
-            with serial_lock:
-                ser.write((bin_str + '\n').encode('utf-8'))
+                    # Safety Fix: Prevent pure 0
+                    if bin_str == "00000000":
+                        bin_str = "00000001"
+
+                    # --- D. Send to Arduino ---
+                    # (Removed the duplicate write command from previous version)
+                    with serial_lock:
+                        ser.write((bin_str + '\n').encode('utf-8'))
+
+                    # --- E. Console Feedback ---
+                    print(
+                        f"T={sim_time:>3}s | Spd={speed_mph:>3.0f}mph | Pwr={(battery_voltage ** 2) / req_r:>5.0f}W | R={req_r:>5.2f}Ω | Bits={bin_str}")
+
+                    # --- F. Real-time Sync ---
+                    # This logic keeps the script synced with Sim Time, regardless of calculation lag
+                    # 'Time (s)' in your CSV increments by 1.
+
+                    # If you want it to run exactly at the speed of the CSV:
+                    time_to_wait = 1.0  # Your CSV seems to be 1Hz
+                    time.sleep(time_to_wait)
 
     except KeyboardInterrupt:
         print("\nStopping System...")
-        stop_heartbeat.set()
-        hb_thread.join()
-        ser.close()
+    finally:
+        if 'stop_heartbeat' in locals():
+            stop_heartbeat.set()
+            hb_thread.join()
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
         print("Disconnected.")
 
 

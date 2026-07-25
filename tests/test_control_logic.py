@@ -29,54 +29,101 @@ from control_logic import (
 # ================= SAFETY TRIP =================
 
 class TestSafetyTrip:
+    """Thresholds here mirror the Molicel INR-21700-P45B v1.2 datasheet for 12S4P:
+    180 A continuous (45 A/cell x 4P), 60 C discharge ceiling, 36.0 V undervoltage
+    trip (3.0 V/cell, above the 30.0 V absolute cutoff).
+    """
+
+    LIMITS = dict(max_safe_temp=60.0, max_safe_current=180.0,
+                  current_buffer=5.0, min_safe_voltage=36.0)
+
     def test_nominal_no_trip(self):
-        is_fault, reason = check_safety_trip(max_temp=40.0, amps=100.0,
-                                              max_safe_temp=65.0, max_safe_current=182.0,
-                                              current_buffer=5.0)
+        is_fault, reason = check_safety_trip(max_temp=40.0, amps=100.0, voltage=48.0,
+                                              **self.LIMITS)
         assert is_fault is False
         assert reason is None
 
     def test_just_under_temp_threshold_no_trip(self):
-        is_fault, _ = check_safety_trip(max_temp=64.99, amps=0.0,
-                                         max_safe_temp=65.0, max_safe_current=182.0,
-                                         current_buffer=5.0)
+        is_fault, _ = check_safety_trip(max_temp=59.99, amps=0.0, voltage=48.0,
+                                         **self.LIMITS)
         assert is_fault is False
 
     def test_at_temp_threshold_trips(self):
-        is_fault, reason = check_safety_trip(max_temp=65.0, amps=0.0,
-                                              max_safe_temp=65.0, max_safe_current=182.0,
-                                              current_buffer=5.0)
+        is_fault, reason = check_safety_trip(max_temp=60.0, amps=0.0, voltage=48.0,
+                                              **self.LIMITS)
         assert is_fault is True
         assert reason == "OVERTEMP"
 
     def test_over_temp_threshold_trips(self):
-        is_fault, reason = check_safety_trip(max_temp=70.0, amps=0.0,
-                                              max_safe_temp=65.0, max_safe_current=182.0,
-                                              current_buffer=5.0)
+        is_fault, reason = check_safety_trip(max_temp=70.0, amps=0.0, voltage=48.0,
+                                              **self.LIMITS)
         assert is_fault is True
         assert reason == "OVERTEMP"
 
     def test_current_within_buffer_no_trip(self):
-        # max=182, buffer=5 -> trips at 187
-        is_fault, _ = check_safety_trip(max_temp=0.0, amps=186.99,
-                                         max_safe_temp=65.0, max_safe_current=182.0,
-                                         current_buffer=5.0)
+        # max=180, buffer=5 -> trips at 185
+        is_fault, _ = check_safety_trip(max_temp=0.0, amps=184.99, voltage=48.0,
+                                         **self.LIMITS)
         assert is_fault is False
 
     def test_current_at_buffered_limit_trips(self):
-        is_fault, reason = check_safety_trip(max_temp=0.0, amps=187.0,
-                                              max_safe_temp=65.0, max_safe_current=182.0,
-                                              current_buffer=5.0)
+        is_fault, reason = check_safety_trip(max_temp=0.0, amps=185.0, voltage=48.0,
+                                              **self.LIMITS)
         assert is_fault is True
         assert reason == "OVERCURRENT"
 
-    def test_both_over_reports_overtemp_first(self):
-        # Matches original code's `"OVERTEMP" if over_temp else "OVERCURRENT"` precedence.
-        is_fault, reason = check_safety_trip(max_temp=100.0, amps=300.0,
-                                              max_safe_temp=65.0, max_safe_current=182.0,
-                                              current_buffer=5.0)
+    def test_datasheet_continuous_rating_is_not_exceeded_silently(self):
+        # 4P x 45 A/cell = 180 A. Anything at or past limit+buffer must fault.
+        is_fault, reason = check_safety_trip(max_temp=25.0, amps=187.0, voltage=48.0,
+                                              **self.LIMITS)
+        assert is_fault is True
+        assert reason == "OVERCURRENT"
+
+    # --- Undervoltage (2.5 V/cell = 30.0 V absolute cutoff for 12S) ---
+
+    def test_nominal_voltage_no_trip(self):
+        is_fault, _ = check_safety_trip(max_temp=25.0, amps=50.0, voltage=43.2,
+                                         **self.LIMITS)
+        assert is_fault is False
+
+    def test_just_above_undervoltage_no_trip(self):
+        is_fault, _ = check_safety_trip(max_temp=25.0, amps=50.0, voltage=36.01,
+                                         **self.LIMITS)
+        assert is_fault is False
+
+    def test_at_undervoltage_threshold_trips(self):
+        is_fault, reason = check_safety_trip(max_temp=25.0, amps=50.0, voltage=36.0,
+                                              **self.LIMITS)
+        assert is_fault is True
+        assert reason == "UNDERVOLTAGE"
+
+    def test_sagged_below_cell_cutoff_trips(self):
+        # 45 mohm pack IR at 187 A sags 8.4 V; a 3.2 V/cell pack lands at 2.499 V/cell.
+        is_fault, reason = check_safety_trip(max_temp=25.0, amps=100.0, voltage=29.99,
+                                              **self.LIMITS)
+        assert is_fault is True
+        assert reason == "UNDERVOLTAGE"
+
+    def test_zero_voltage_reading_faults_rather_than_running(self):
+        # Lost/failed voltage sensing must fail safe, not be treated as healthy.
+        is_fault, reason = check_safety_trip(max_temp=25.0, amps=0.0, voltage=0.0,
+                                              **self.LIMITS)
+        assert is_fault is True
+        assert reason == "UNDERVOLTAGE"
+
+    # --- Priority ordering ---
+
+    def test_temp_outranks_current(self):
+        is_fault, reason = check_safety_trip(max_temp=100.0, amps=300.0, voltage=48.0,
+                                              **self.LIMITS)
         assert is_fault is True
         assert reason == "OVERTEMP"
+
+    def test_current_outranks_undervoltage(self):
+        is_fault, reason = check_safety_trip(max_temp=25.0, amps=300.0, voltage=20.0,
+                                              **self.LIMITS)
+        assert is_fault is True
+        assert reason == "OVERCURRENT"
 
 
 # ================= FSM TRANSITION GUARDS =================
@@ -166,62 +213,62 @@ class TestLapPhysics:
 
 class TestResistanceTargeting:
     def test_zero_power_requests_max_resistance(self):
-        req_r = compute_target_resistance(voltage=48.0, req_power=0.0, max_safe_current=182.0,
+        req_r = compute_target_resistance(voltage=48.0, req_power=0.0, max_safe_current=180.0,
                                            current_max_temp=25.0, derate_enabled=False,
-                                           derate_start_temp=55.0, max_safe_temp=65.0)
+                                           derate_start_temp=55.0, max_safe_temp=60.0)
         assert req_r == MAX_RESISTANCE
 
     def test_never_exceeds_max_resistance(self):
-        req_r = compute_target_resistance(voltage=48.0, req_power=0.001, max_safe_current=182.0,
+        req_r = compute_target_resistance(voltage=48.0, req_power=0.001, max_safe_current=180.0,
                                            current_max_temp=25.0, derate_enabled=False,
-                                           derate_start_temp=55.0, max_safe_temp=65.0)
+                                           derate_start_temp=55.0, max_safe_temp=60.0)
         assert req_r <= MAX_RESISTANCE
 
     def test_never_drops_below_current_limit_clamp(self):
         # Huge power demand should be clamped by max current, not driven to a tiny resistance.
-        req_r = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=182.0,
+        req_r = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=180.0,
                                            current_max_temp=25.0, derate_enabled=False,
-                                           derate_start_temp=55.0, max_safe_temp=65.0)
-        expected_floor = 48.0 / 182.0
+                                           derate_start_temp=55.0, max_safe_temp=60.0)
+        expected_floor = 48.0 / 180.0
         assert math.isclose(req_r, expected_floor, rel_tol=1e-6)
 
     def test_derate_disabled_ignores_high_temp(self):
-        no_derate = compute_target_resistance(voltage=48.0, req_power=1000.0, max_safe_current=182.0,
-                                                current_max_temp=64.0, derate_enabled=False,
-                                                derate_start_temp=55.0, max_safe_temp=65.0)
-        with_derate = compute_target_resistance(voltage=48.0, req_power=1000.0, max_safe_current=182.0,
-                                                  current_max_temp=64.0, derate_enabled=True,
-                                                  derate_start_temp=55.0, max_safe_temp=65.0)
+        no_derate = compute_target_resistance(voltage=48.0, req_power=1000.0, max_safe_current=180.0,
+                                                current_max_temp=59.0, derate_enabled=False,
+                                                derate_start_temp=55.0, max_safe_temp=60.0)
+        with_derate = compute_target_resistance(voltage=48.0, req_power=1000.0, max_safe_current=180.0,
+                                                  current_max_temp=59.0, derate_enabled=True,
+                                                  derate_start_temp=55.0, max_safe_temp=60.0)
         assert with_derate >= no_derate
 
     def test_derate_below_start_temp_is_noop(self):
-        below = compute_target_resistance(voltage=48.0, req_power=1000.0, max_safe_current=182.0,
+        below = compute_target_resistance(voltage=48.0, req_power=1000.0, max_safe_current=180.0,
                                             current_max_temp=50.0, derate_enabled=True,
-                                            derate_start_temp=55.0, max_safe_temp=65.0)
-        disabled = compute_target_resistance(voltage=48.0, req_power=1000.0, max_safe_current=182.0,
+                                            derate_start_temp=55.0, max_safe_temp=60.0)
+        disabled = compute_target_resistance(voltage=48.0, req_power=1000.0, max_safe_current=180.0,
                                               current_max_temp=50.0, derate_enabled=False,
-                                              derate_start_temp=55.0, max_safe_temp=65.0)
+                                              derate_start_temp=55.0, max_safe_temp=60.0)
         assert math.isclose(below, disabled, rel_tol=1e-9)
 
     def test_derate_at_max_temp_forces_min_current(self):
         # Huge req_power pushes the un-derated resistance down near the current-limit
-        # clamp (48/182 ~= 0.26 ohm); full derate should force it up to the 1.0A floor (48 ohm).
-        req_r = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=182.0,
-                                           current_max_temp=65.0, derate_enabled=True,
-                                           derate_start_temp=55.0, max_safe_temp=65.0)
+        # clamp (48/180 ~= 0.27 ohm); full derate should force it up to the 1.0A floor (48 ohm).
+        req_r = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=180.0,
+                                           current_max_temp=60.0, derate_enabled=True,
+                                           derate_start_temp=55.0, max_safe_temp=60.0)
         assert math.isclose(req_r, 48.0, rel_tol=1e-6)
 
     def test_misconfigured_derate_thresholds_do_not_crash(self):
         # derate_start_temp >= max_safe_temp used to raise ZeroDivisionError and
         # crash the safety-critical process. It must now fail safe (full derate) instead.
-        req_r = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=182.0,
-                                           current_max_temp=70.0, derate_enabled=True,
-                                           derate_start_temp=65.0, max_safe_temp=65.0)
+        req_r = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=180.0,
+                                           current_max_temp=65.0, derate_enabled=True,
+                                           derate_start_temp=60.0, max_safe_temp=60.0)
         assert math.isclose(req_r, 48.0, rel_tol=1e-6)
 
-        req_r2 = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=182.0,
-                                            current_max_temp=75.0, derate_enabled=True,
-                                            derate_start_temp=70.0, max_safe_temp=65.0)
+        req_r2 = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=180.0,
+                                            current_max_temp=70.0, derate_enabled=True,
+                                            derate_start_temp=65.0, max_safe_temp=60.0)
         assert math.isclose(req_r2, 48.0, rel_tol=1e-6)
 
 

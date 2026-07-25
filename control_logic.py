@@ -47,12 +47,26 @@ def send_binary_command(ser, steps):
 # Extracted so this logic can be unit-tested without a running GUI,
 # Arduino, or DAQ.
 
-def check_safety_trip(max_temp, amps, max_safe_temp, max_safe_current, current_buffer):
-    """Returns (is_fault, reason) where reason is 'OVERTEMP', 'OVERCURRENT', or None."""
+def check_safety_trip(max_temp, amps, voltage, max_safe_temp, max_safe_current,
+                      current_buffer, min_safe_voltage):
+    """Returns (is_fault, reason).
+
+    reason is 'OVERTEMP', 'OVERCURRENT', 'UNDERVOLTAGE', or None. Checked in that
+    priority order so the reported cause is deterministic when several trip at once.
+
+    Undervoltage is measured under load, so min_safe_voltage should sit above the
+    cell's absolute cutoff (2.5 V/cell = 30.0 V for 12S) to leave room for IR sag.
+    """
     over_temp = max_temp >= max_safe_temp
     over_current = amps >= (max_safe_current + current_buffer)
-    if over_temp or over_current:
-        return True, ("OVERTEMP" if over_temp else "OVERCURRENT")
+    under_voltage = voltage <= min_safe_voltage
+
+    if over_temp:
+        return True, "OVERTEMP"
+    if over_current:
+        return True, "OVERCURRENT"
+    if under_voltage:
+        return True, "UNDERVOLTAGE"
     return False, None
 
 
@@ -151,9 +165,16 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     fsm_state = "DISCONNECTED"
     target_res = 0.0
 
-    max_safe_current = 182.0
+    # Defaults per Molicel INR-21700-P45B datasheet v1.2, 12S4P:
+    #   45 A/cell continuous * 4P            = 180 A
+    #   discharge operating range            = -40 to 60 C
+    #   2.5 V/cell cutoff * 12S              = 30.0 V absolute floor;
+    #     36.0 V (3.0 V/cell) leaves headroom for IR sag under load
+    #     (45 mohm pack IR * 180 A = 8.1 V sag)
+    max_safe_current = 180.0
     current_buffer = 5.0
-    max_safe_temp = 65.0
+    max_safe_temp = 60.0
+    min_safe_voltage = 36.0
 
     derate_enabled = False
     derate_start_temp = 55.0
@@ -213,10 +234,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     max_safe_current = limits.get('max_amps', max_safe_current)
                     current_buffer = limits.get('amp_buffer', current_buffer)
                     max_safe_temp = limits.get('max_temp', max_safe_temp)
+                    min_safe_voltage = limits.get('min_volts', min_safe_voltage)
                     derate_enabled = limits.get('derate_en', derate_enabled)
                     derate_start_temp = limits.get('derate_start', derate_start_temp)
                     print(
-                        f"[LOGIC] Limits Updated -> Max A:{max_safe_current} | Max T:{max_safe_temp} | Derate:{derate_enabled}")
+                        f"[LOGIC] Limits Updated -> Max A:{max_safe_current} | Max T:{max_safe_temp} | Min V:{min_safe_voltage} | Derate:{derate_enabled}")
 
                 elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV":
                     filepath = cmd[1]
@@ -264,7 +286,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
         # --- D. Safety Monitors ---
         is_fault, trigger_reason = check_safety_trip(
-            data['max_temp'], data['amps'], max_safe_temp, max_safe_current, current_buffer
+            data['max_temp'], data['amps'], data['voltage'],
+            max_safe_temp, max_safe_current, current_buffer, min_safe_voltage
         )
 
         if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:

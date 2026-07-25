@@ -144,12 +144,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.csv_writer = None
         self.heatmap_window = None
 
-        # Default Safety Thresholds
+        # Default Safety Thresholds -- Molicel INR-21700-P45B v1.2, 12S4P.
+        # V Crit trips a fault; V Warn is a display-only line on the plot.
         self.lim_v_warn = 38.0
-        self.lim_v_crit = 36.0
-        self.lim_c_crit = 182.0
+        self.lim_v_crit = 36.0   # 3.0 V/cell, above the 2.5 V/cell (30.0 V) cutoff
+        self.lim_c_crit = 180.0  # 45 A/cell continuous * 4P
         self.lim_c_buffer = 5.0
-        self.lim_t_crit = 65.0
+        self.lim_t_crit = 60.0   # datasheet discharge range tops out at 60 C
 
         # Derate Variables
         self.derate_enabled = False
@@ -355,8 +356,8 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.sb_t_derate = self.create_sidebar_spinbox(self.lim_t_derate, 20.0, 150.0)
         self.sb_t_crit = self.create_sidebar_spinbox(self.lim_t_crit, 20.0, 150.0)
 
-        form_layout.addRow("V Warn [V]:", self.sb_v_warn)
-        form_layout.addRow("V Crit [V]:", self.sb_v_crit)
+        form_layout.addRow("V Warn [V] (display):", self.sb_v_warn)
+        form_layout.addRow("V Crit [V] (trip):", self.sb_v_crit)
         form_layout.addRow("Max Amp [A]:", self.sb_c_crit)
         form_layout.addRow("E-Stop Buffer [A]:", self.sb_c_buffer)
         form_layout.addRow(self.chk_derate)
@@ -450,6 +451,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             'max_amps': self.lim_c_crit,
             'amp_buffer': self.lim_c_buffer,
             'max_temp': self.lim_t_crit,
+            'min_volts': self.lim_v_crit,
             'derate_en': self.derate_enabled,
             'derate_start': self.lim_t_derate
         }

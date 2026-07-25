@@ -14,7 +14,7 @@ Unit tests cover the decision math (`pytest`). This covers everything else.
 python -m pytest
 ```
 
-All 33 tests must pass before starting. Then plug in the SIL dongle and:
+All 48 tests must pass before starting. Then plug in the SIL dongle and:
 
 ```bash
 python main_v2.py
@@ -32,17 +32,21 @@ plant-model window and the main telemetry GUI appear.
 | A1 | Observe idle state | State pill reads `DISCONNECTED` (no resistor Arduino in SIL) |
 | A2 | Drag the SIL **Simulated Load** slider | Current label + cyan graph track the slider within ~1s |
 | A3 | Drag the SIL **Max Temp** slider | Heatmap (SHOW HEATMAP) cells recolor blue→red |
-| A4 | Let it sit 60s | Voltage/current graphs scroll continuously, no freeze, no console spam |
+| A4 | Drag the SIL **Pack OCV** slider | Pack voltage label + yellow graph follow; sag grows with load |
+| A5 | Let it sit 60s | Voltage/current graphs scroll continuously, no freeze, no console spam |
 
 ## B. Safety trips
 
 | # | Step | Expected |
 |---|------|----------|
-| B1 | Raise temp slider past **Max Temp** (default 65 °C) | State goes `FAULT` (red), console logs `OVERTEMP ALARM!` |
+| B1 | Raise temp slider past **Max Temp** (default 60 °C) | State goes `FAULT` (red), console logs `OVERTEMP ALARM!` |
 | B2 | While in FAULT, lower temp back to 25 °C | State **stays** `FAULT` — must not self-clear |
 | B3 | Press **RESET** | Returns to `IDLE` |
-| B4 | Raise current slider past **Max Amp + E-Stop Buffer** (187 A) | `FAULT`, console logs `OVERCURRENT ALARM!` |
+| B4 | Raise current slider past **Max Amp + E-Stop Buffer** (185 A) | `FAULT`, console logs `OVERCURRENT ALARM!` |
 | B5 | RESET, then press **E-STOP** with no fault present | Immediately `FAULT` regardless of prior state |
+| B6 | RESET, then drag SIL **Pack OCV** down to 3.00 V/cell | `FAULT`, console logs `UNDERVOLTAGE ALARM!` |
+| B7 | RESET, set OCV to 3.20 V/cell, then raise current to ~150 A | `FAULT` on sag alone — pack reads 31.65 V under load despite 38.4 V at rest |
+| B8 | With all three faults possible at once (hot + high amps + low OCV) | Console reports `OVERTEMP` — priority is temp > current > voltage |
 
 ## C. FSM transition guards
 
@@ -64,6 +68,7 @@ plant-model window and the main telemetry GUI appear.
 | D3 | Immediately after D2, press **E-STOP** | Responds instantly, never freezes (regression test for Risk #2) |
 | D4 | Set `Derate Start` above `Max Temp`, enable derate, then RUN | No crash. Logic process stays alive (fail-safe full derate) |
 | D5 | Set `Max Amp` to 0, then RUN | No crash, no divide-by-zero |
+| D8 | Set `V Crit` to 45 V while running at 4.20 V/cell OCV | Trips `UNDERVOLTAGE` — confirms the spinbox actually reaches the logic process |
 | D6 | Toggle heatmap open/closed 10x while `RUNNING` | No crash, temps keep updating, run continues |
 | D7 | Close the heatmap window via its X while `RUNNING` | Main GUI unaffected, run continues |
 
@@ -104,6 +109,15 @@ blocks ~2-4s **per COM port** while probing. A full queue meant the E-STOP press
 froze the GUI. All commands now route through `send_command_nonblocking()`,
 which drops the oldest command rather than blocking, and never evicts a queued
 STOP. Covered by `tests/test_gui_dispatch.py`.
+
+**Risk #3 — no undervoltage protection existed at all. FIXED.**
+`V Warn` and `V Crit` were wired only to the dashed lines on the voltage plot and
+were never placed in `limits_dict`, so they never reached the logic process.
+`check_safety_trip` only ever saw temperature and current — nothing stopped a
+discharge below the P45B's 2.5 V/cell cutoff. `V Crit` now trips a genuine
+UNDERVOLTAGE fault (default 36.0 V = 3.0 V/cell, leaving room for the 8.1 V sag
+that 45 mohm pack IR produces at 180 A). `V Warn` remains display-only and its
+label now says so.
 
 ### Residual limitation (by design, verify behavior in D3)
 

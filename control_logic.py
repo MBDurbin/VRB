@@ -2,6 +2,7 @@ import time
 import serial
 import serial.tools.list_ports
 import pandas as pd
+from dataclasses import dataclass
 from multiprocessing import Queue, Event
 from queue import Empty
 
@@ -12,6 +13,61 @@ CSV_FILENAME = r"C:\Users\Durbi\PycharmProjects\Resistor Bank Master\FSAE - ETS 
 MAX_RESISTANCE = 63.75
 RESISTOR_RESOLUTION = 0.25
 RESISTOR_SCAN_COOLDOWN = 3.0
+
+
+# ================= VEHICLE MODEL =================
+
+@dataclass
+class VehicleParams:
+    """Vehicle and environment parameters for the road-load model.
+
+    Every value here was previously hardcoded inside compute_required_power().
+    Retune the simulation by editing a field rather than the physics -- either
+    mutate DEFAULT_VEHICLE, or build a variant and pass it in:
+
+        fast = VehicleParams(drag_coefficient=0.55, mass_driver_kg=65.0)
+        compute_required_power(v, a, params=fast)
+    """
+
+    # --- Mass ---
+    mass_car_kg: float = 260.0
+    mass_driver_kg: float = 70.0
+
+    # Rotational inertia of wheels, brake rotors, axles and drivetrain, modelled
+    # as extra "virtual" mass. Applies to acceleration ONLY: spinning components
+    # resist changes in speed but do not press the tyres into the track, so this
+    # must not feed the normal force behind rolling resistance.
+    # Typical 1.04-1.10 for an open-wheel/student formula car.
+    rotational_mass_factor: float = 1.05
+
+    # --- Environment ---
+    air_density_kgm3: float = 1.2255  # ISA sea level, 15 C
+    gravity_ms2: float = 9.81
+
+    # --- Aerodynamics ---
+    # Drag and downforce carry separate reference areas: they are frequently the
+    # same number, but a wing package can change one without the other.
+    drag_coefficient: float = 0.6           # Cd
+    drag_area_m2: float = 2.224             # reference area for drag
+    lift_coefficient: float = -1.0          # Cl, negative = downforce
+    downforce_area_m2: float = 2.224        # reference area for downforce
+
+    # --- Tyres ---
+    rolling_resistance_coeff: float = 0.015
+
+    # --- Drivetrain ---
+    # Mechanical efficiency between motor shaft and contact patch (chain, gears,
+    # bearings). ~0.95 for a well-maintained chain drive.
+    drivetrain_efficiency: float = 0.95
+
+    @property
+    def total_mass_kg(self) -> float:
+        return self.mass_car_kg + self.mass_driver_kg
+
+
+# Module-level default. Mutating a field here retunes every call that does not
+# pass an explicit params object.
+DEFAULT_VEHICLE = VehicleParams()
 
 
 def auto_detect_resistor():
@@ -46,7 +102,7 @@ def send_binary_command(ser, steps):
 # ================= PURE SAFETY / PHYSICS LOGIC =================
 # Extracted so this logic can be unit-tested without a running GUI,
 # Arduino, or DAQ.
-
+#Double Checked
 def check_safety_trip(max_temp, amps, voltage, max_safe_temp, max_safe_current,
                       current_buffer, min_safe_voltage):
     """Returns (is_fault, reason).
@@ -69,7 +125,7 @@ def check_safety_trip(max_temp, amps, voltage, max_safe_temp, max_safe_current,
         return True, "UNDERVOLTAGE"
     return False, None
 
-
+#Double Checked
 def coulomb_step(amps, dt, remaining_ah, total_capacity_ah):
     """Advances coulomb counting by dt seconds. Returns (new_remaining_ah, true_soc_pct)."""
     ah_consumed = (amps * dt) / 3600.0
@@ -97,19 +153,60 @@ def compute_lap_physics(row, prev_velocity_ms, prev_time_s, is_first_row, row_id
     return velocity_ms, acceleration, current_time_s
 
 
-def compute_required_power(velocity_ms, acceleration, mass_car=260.0, mass_driver=70.0):
-    """Road-load power required to hold the profile's speed/acceleration."""
-    total_mass = mass_car + mass_driver
+def compute_road_load_forces(velocity_ms, acceleration, params=None):
+    """Longitudinal force breakdown at the contact patch, in newtons.
 
-    f_downforce = 0.5 * 1.2255 * abs(-1.0) * 2.224 * (velocity_ms ** 2)
-    f_drag = 0.5 * 1.2255 * 0.6 * 2.224 * (velocity_ms ** 2)
-    normal_force = (total_mass * 9.81) + f_downforce
+    Returned separately from power so the individual terms can be inspected and
+    tested. Positive force opposes motion / must be overcome.
+    """
+    p = params if params is not None else DEFAULT_VEHICLE
 
-    f_roll = 0.015 * normal_force
-    f_accel = total_mass * acceleration
+    total_mass = p.total_mass_kg
+    dynamic_pressure = 0.5 * p.air_density_kgm3 * (velocity_ms ** 2)
 
-    f_total = f_roll + f_drag + f_accel
-    return f_total * velocity_ms
+    f_downforce = dynamic_pressure * abs(p.lift_coefficient) * p.downforce_area_m2
+    f_drag = dynamic_pressure * p.drag_coefficient * p.drag_area_m2
+
+    # Downforce presses the tyres harder into the track, so rolling resistance
+    # rises with speed rather than staying at the static-weight value.
+    normal_force = (total_mass * p.gravity_ms2) + f_downforce
+    f_roll = p.rolling_resistance_coeff * normal_force
+
+    # Rotational inertia resists speed changes only -- hence the factor applies
+    # here and deliberately NOT to normal_force above.
+    f_accel = (total_mass * p.rotational_mass_factor) * acceleration
+
+    return {
+        'drag': f_drag,
+        'downforce': f_downforce,
+        'rolling': f_roll,
+        'accel': f_accel,
+        'total': f_roll + f_drag + f_accel,
+    }
+
+
+def compute_required_power(velocity_ms, acceleration, params=None):
+    """Powertrain-side power for the profile's speed/acceleration, in watts.
+
+    This is power at the motor input, not at the contact patch: the drivetrain
+    efficiency correction is applied last. Positive means the pack is driving
+    the car; negative means braking.
+    """
+    p = params if params is not None else DEFAULT_VEHICLE
+
+    forces = compute_road_load_forces(velocity_ms, acceleration, p)
+    power_at_wheels = forces['total'] * velocity_ms
+
+    # Clamp to a sane range so a mistyped efficiency cannot divide by zero and
+    # take down the safety-critical logic process.
+    eta = min(1.0, max(0.01, p.drivetrain_efficiency))
+
+    if power_at_wheels > 0:
+        # Driving: the powertrain must produce more than reaches the road.
+        return power_at_wheels / eta
+
+    # Braking: friction eats part of what would otherwise come back.
+    return power_at_wheels * eta
 
 
 def compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
@@ -178,6 +275,10 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
     derate_enabled = False
     derate_start_temp = 55.0
+
+    # Vehicle model used by the lap physics. Edit fields here (or swap in another
+    # VehicleParams) to retune drag, mass, rotational inertia or drivetrain loss.
+    vehicle = VehicleParams()
 
     last_heartbeat = time.time()
     last_physics_time = time.time()
@@ -324,7 +425,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         prev_velocity_ms = velocity_ms
                         prev_time_s = current_time_s
 
-                        req_power = compute_required_power(velocity_ms, acceleration)
+                        req_power = compute_required_power(velocity_ms, acceleration, vehicle)
 
                         voltage = data['voltage']
                         current_max_temp = data['max_temp']

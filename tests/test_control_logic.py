@@ -18,9 +18,11 @@ from control_logic import (
     coulomb_step,
     compute_lap_physics,
     compute_required_power,
+    compute_road_load_forces,
     compute_target_resistance,
     resistance_to_steps,
     is_valid_transition,
+    VehicleParams,
     MAX_RESISTANCE,
     RESISTOR_RESOLUTION,
 )
@@ -287,6 +289,153 @@ class TestRequiredPower:
         cruise = compute_required_power(velocity_ms=20.0, acceleration=0.0)
         braking = compute_required_power(velocity_ms=20.0, acceleration=-5.0)
         assert braking < cruise
+
+
+# ================= ROTATIONAL MASS =================
+
+class TestRotationalMass:
+    def test_factor_increases_acceleration_force(self):
+        plain = VehicleParams(rotational_mass_factor=1.0)
+        spun = VehicleParams(rotational_mass_factor=1.05)
+
+        f_plain = compute_road_load_forces(20.0, 3.0, plain)['accel']
+        f_spun = compute_road_load_forces(20.0, 3.0, spun)['accel']
+
+        assert f_spun > f_plain
+        assert math.isclose(f_spun / f_plain, 1.05, rel_tol=1e-9)
+
+    def test_factor_scales_exactly_with_total_mass(self):
+        p = VehicleParams(mass_car_kg=260.0, mass_driver_kg=70.0,
+                          rotational_mass_factor=1.05)
+        f = compute_road_load_forces(20.0, 2.0, p)['accel']
+        assert math.isclose(f, 330.0 * 1.05 * 2.0, rel_tol=1e-9)
+
+    def test_no_effect_at_steady_speed(self):
+        # Spinning components resist speed *changes* only.
+        plain = VehicleParams(rotational_mass_factor=1.0)
+        spun = VehicleParams(rotational_mass_factor=1.10)
+
+        assert math.isclose(compute_required_power(25.0, 0.0, plain),
+                            compute_required_power(25.0, 0.0, spun), rel_tol=1e-12)
+
+    def test_does_not_inflate_rolling_resistance(self):
+        # The factor must not reach the normal force -- rotating mass does not
+        # press the tyres into the track.
+        plain = VehicleParams(rotational_mass_factor=1.0)
+        spun = VehicleParams(rotational_mass_factor=1.10)
+
+        assert math.isclose(compute_road_load_forces(20.0, 5.0, plain)['rolling'],
+                            compute_road_load_forces(20.0, 5.0, spun)['rolling'],
+                            rel_tol=1e-12)
+
+    def test_increases_power_demand_while_accelerating(self):
+        plain = VehicleParams(rotational_mass_factor=1.0)
+        spun = VehicleParams(rotational_mass_factor=1.05)
+        assert compute_required_power(20.0, 4.0, spun) > compute_required_power(20.0, 4.0, plain)
+
+
+# ================= DRIVETRAIN EFFICIENCY =================
+
+class TestDrivetrainEfficiency:
+    def test_driving_power_is_scaled_up(self):
+        lossless = VehicleParams(drivetrain_efficiency=1.0)
+        lossy = VehicleParams(drivetrain_efficiency=0.95)
+
+        p_lossless = compute_required_power(25.0, 1.0, lossless)
+        p_lossy = compute_required_power(25.0, 1.0, lossy)
+
+        assert p_lossless > 0
+        assert p_lossy > p_lossless
+        assert math.isclose(p_lossy, p_lossless / 0.95, rel_tol=1e-9)
+
+    def test_braking_power_is_scaled_down_in_magnitude(self):
+        lossless = VehicleParams(drivetrain_efficiency=1.0)
+        lossy = VehicleParams(drivetrain_efficiency=0.95)
+
+        p_lossless = compute_required_power(20.0, -8.0, lossless)
+        p_lossy = compute_required_power(20.0, -8.0, lossy)
+
+        assert p_lossless < 0  # actually braking
+        assert p_lossy > p_lossless          # closer to zero
+        assert abs(p_lossy) < abs(p_lossless)  # less energy recovered
+        assert math.isclose(p_lossy, p_lossless * 0.95, rel_tol=1e-9)
+
+    def test_unity_efficiency_is_a_noop(self):
+        unity = VehicleParams(drivetrain_efficiency=1.0)
+        forces = compute_road_load_forces(22.0, 1.5, unity)
+        assert math.isclose(compute_required_power(22.0, 1.5, unity),
+                            forces['total'] * 22.0, rel_tol=1e-12)
+
+    def test_zero_efficiency_does_not_divide_by_zero(self):
+        # A mistyped efficiency must not crash the safety-critical process.
+        broken = VehicleParams(drivetrain_efficiency=0.0)
+        result = compute_required_power(20.0, 2.0, broken)
+        assert math.isfinite(result)
+
+    def test_negative_efficiency_does_not_flip_sign(self):
+        broken = VehicleParams(drivetrain_efficiency=-0.5)
+        driving = compute_required_power(20.0, 2.0, broken)
+        assert driving > 0  # still a discharge, not a phantom regen
+
+
+# ================= PARAMETERISATION =================
+
+class TestVehicleParams:
+    def test_defaults_match_documented_vehicle(self):
+        p = VehicleParams()
+        assert p.total_mass_kg == 330.0
+        assert p.rotational_mass_factor == 1.05
+        assert p.drivetrain_efficiency == 0.95
+
+    def test_drag_coefficient_is_tunable(self):
+        slippery = VehicleParams(drag_coefficient=0.3)
+        draggy = VehicleParams(drag_coefficient=0.9)
+        assert (compute_road_load_forces(30.0, 0.0, draggy)['drag'] >
+                compute_road_load_forces(30.0, 0.0, slippery)['drag'])
+
+    def test_drag_area_is_tunable_independently_of_downforce_area(self):
+        base = VehicleParams()
+        wide = VehicleParams(drag_area_m2=base.drag_area_m2 * 2)
+
+        f_base = compute_road_load_forces(30.0, 0.0, base)
+        f_wide = compute_road_load_forces(30.0, 0.0, wide)
+
+        assert math.isclose(f_wide['drag'], f_base['drag'] * 2, rel_tol=1e-9)
+        assert math.isclose(f_wide['downforce'], f_base['downforce'], rel_tol=1e-12)
+
+    def test_downforce_raises_rolling_resistance_with_speed(self):
+        winged = VehicleParams(lift_coefficient=-2.0)
+        flat = VehicleParams(lift_coefficient=0.0)
+        assert (compute_road_load_forces(30.0, 0.0, winged)['rolling'] >
+                compute_road_load_forces(30.0, 0.0, flat)['rolling'])
+
+    def test_rolling_coefficient_is_tunable(self):
+        sticky = VehicleParams(rolling_resistance_coeff=0.030)
+        slick = VehicleParams(rolling_resistance_coeff=0.010)
+        assert (compute_road_load_forces(15.0, 0.0, sticky)['rolling'] >
+                compute_road_load_forces(15.0, 0.0, slick)['rolling'])
+
+    def test_air_density_is_tunable(self):
+        sea = VehicleParams(air_density_kgm3=1.2255)
+        altitude = VehicleParams(air_density_kgm3=1.0)
+        assert (compute_road_load_forces(30.0, 0.0, sea)['drag'] >
+                compute_road_load_forces(30.0, 0.0, altitude)['drag'])
+
+    def test_mass_is_tunable(self):
+        light = VehicleParams(mass_car_kg=200.0)
+        heavy = VehicleParams(mass_car_kg=320.0)
+        assert heavy.total_mass_kg > light.total_mass_kg
+        assert (compute_road_load_forces(20.0, 2.0, heavy)['accel'] >
+                compute_road_load_forces(20.0, 2.0, light)['accel'])
+
+    def test_omitting_params_uses_module_default(self):
+        explicit = compute_required_power(20.0, 1.0, VehicleParams())
+        implicit = compute_required_power(20.0, 1.0)
+        assert math.isclose(explicit, implicit, rel_tol=1e-12)
+
+    def test_force_terms_sum_to_total(self):
+        f = compute_road_load_forces(24.0, 1.7, VehicleParams())
+        assert math.isclose(f['total'], f['drag'] + f['rolling'] + f['accel'], rel_tol=1e-12)
 
 
 # ================= STEP CONVERSION =================

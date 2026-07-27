@@ -1,68 +1,27 @@
+import os
 import time
 import serial
 import serial.tools.list_ports
 import pandas as pd
-from dataclasses import dataclass
 from multiprocessing import Queue, Event
 from queue import Empty
 
+# VehicleParams lives in rig_config so every user-tunable value sits in one
+# place. Re-exported here because callers and tests import it from this module.
+from rig_config import RigConfig, VehicleParams, PackConfig, SafetyLimits  # noqa: F401
+
 # ================= CONFIGURATION =================
 RESISTOR_BAUD_RATE = 9600
-CSV_FILENAME = r"C:\Users\Durbi\PycharmProjects\Resistor Bank Master\FSAE - ETS - Speed and Time 1 Lap.csv"
+
+# Resolved relative to this file so the rig runs from any checkout on any
+# machine. An absolute path here would break for every future team.
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LAP_CSV = "FSAE - ETS - Speed and Time 1 Lap.csv"
+CSV_FILENAME = os.path.join(PROJECT_DIR, DEFAULT_LAP_CSV)
 
 MAX_RESISTANCE = 63.75
 RESISTOR_RESOLUTION = 0.25
 RESISTOR_SCAN_COOLDOWN = 3.0
-
-
-# ================= VEHICLE MODEL =================
-
-@dataclass
-class VehicleParams:
-    """Vehicle and environment parameters for the road-load model.
-
-    Every value here was previously hardcoded inside compute_required_power().
-    Retune the simulation by editing a field rather than the physics -- either
-    mutate DEFAULT_VEHICLE, or build a variant and pass it in:
-
-        fast = VehicleParams(drag_coefficient=0.55, mass_driver_kg=65.0)
-        compute_required_power(v, a, params=fast)
-    """
-
-    # --- Mass ---
-    mass_car_kg: float = 260.0
-    mass_driver_kg: float = 70.0
-
-    # Rotational inertia of wheels, brake rotors, axles and drivetrain, modelled
-    # as extra "virtual" mass. Applies to acceleration ONLY: spinning components
-    # resist changes in speed but do not press the tyres into the track, so this
-    # must not feed the normal force behind rolling resistance.
-    # Typical 1.04-1.10 for an open-wheel/student formula car.
-    rotational_mass_factor: float = 1.05
-
-    # --- Environment ---
-    air_density_kgm3: float = 1.2255  # ISA sea level, 15 C
-    gravity_ms2: float = 9.81
-
-    # --- Aerodynamics ---
-    # Drag and downforce carry separate reference areas: they are frequently the
-    # same number, but a wing package can change one without the other.
-    drag_coefficient: float = 0.6           # Cd
-    drag_area_m2: float = 2.224             # reference area for drag
-    lift_coefficient: float = -1.0          # Cl, negative = downforce
-    downforce_area_m2: float = 2.224        # reference area for downforce
-
-    # --- Tyres ---
-    rolling_resistance_coeff: float = 0.015
-
-    # --- Drivetrain ---
-    # Mechanical efficiency between motor shaft and contact patch (chain, gears,
-    # bearings). ~0.95 for a well-maintained chain drive.
-    drivetrain_efficiency: float = 0.95
-
-    @property
-    def total_mass_kg(self) -> float:
-        return self.mass_car_kg + self.mass_driver_kg
 
 
 # Module-level default. Mutating a field here retunes every call that does not
@@ -262,31 +221,35 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     fsm_state = "DISCONNECTED"
     target_res = 0.0
 
-    # Defaults per Molicel INR-21700-P45B datasheet v1.2, 12S4P:
-    #   45 A/cell continuous * 4P            = 180 A
-    #   discharge operating range            = -40 to 60 C
-    #   2.5 V/cell cutoff * 12S              = 30.0 V absolute floor;
-    #     36.0 V (3.0 V/cell) leaves headroom for IR sag under load
-    #     (45 mohm pack IR * 180 A = 8.1 V sag)
-    max_safe_current = 180.0
-    current_buffer = 5.0
-    max_safe_temp = 60.0
-    min_safe_voltage = 36.0
+    # All limits, the pack spec and the vehicle model come from rig_config.json
+    # (falling back to the P45B 12S4P defaults). Nothing here is hardcoded, so a
+    # future team retargets the rig from the GUI rather than from source.
+    config = RigConfig.load()
+    pack = config.pack
+    vehicle = config.vehicle
 
-    derate_enabled = False
-    derate_start_temp = 55.0
+    max_safe_current = config.limits.max_amps
+    current_buffer = config.limits.amp_buffer
+    max_safe_temp = config.limits.max_temp
+    min_safe_voltage = config.limits.min_volts
 
-    # Vehicle model used by the lap physics. Edit fields here (or swap in another
-    # VehicleParams) to retune drag, mass, rotational inertia or drivetrain loss.
-    vehicle = VehicleParams()
+    derate_enabled = config.limits.derate_enabled
+    derate_start_temp = config.limits.derate_start
+
+    print(f"[LOGIC] Pack: {pack.cell_model} {pack.series_count}S{pack.parallel_count}P "
+          f"-> {pack.capacity_ah:.1f} Ah, {pack.max_current_a:.0f} A, "
+          f"{pack.min_voltage:.1f}-{pack.max_voltage:.1f} V, {pack.resistance_ohm * 1000:.0f} mOhm")
+    print(f"[LOGIC] Trips: {max_safe_current:.0f} A (+{current_buffer:.0f} buffer) | "
+          f"{max_safe_temp:.0f} C | {min_safe_voltage:.1f} V")
+    for warning in config.limits.exceedances(pack):
+        print(f"[LOGIC WARNING] {warning}")
 
     last_heartbeat = time.time()
     last_physics_time = time.time()
     last_resistor_scan = time.time()
 
     # --- COULOMB COUNTING VARIABLES ---
-    # Based on Molicel P45B: 4.5Ah * 4P = 18.0Ah
-    total_capacity_ah = 18.0
+    total_capacity_ah = pack.capacity_ah
     remaining_ah = total_capacity_ah
     last_coulomb_time = time.time()
 
@@ -340,6 +303,41 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     derate_start_temp = limits.get('derate_start', derate_start_temp)
                     print(
                         f"[LOGIC] Limits Updated -> Max A:{max_safe_current} | Max T:{max_safe_temp} | Min V:{min_safe_voltage} | Derate:{derate_enabled}")
+
+                elif isinstance(cmd, tuple) and cmd[0] == "SET_CONFIG":
+                    # Full config push from the GUI's Configure dialog: new car,
+                    # new cells, or both. Rejected while RUNNING so the physics
+                    # model cannot change underneath an in-progress lap.
+                    if fsm_state == "RUNNING":
+                        print("[LOGIC] Ignoring config change while RUNNING. Stop the run first.")
+                    else:
+                        try:
+                            new_config = RigConfig.from_dict(cmd[1])
+                            config = new_config
+                            pack = config.pack
+                            vehicle = config.vehicle
+
+                            max_safe_current = config.limits.max_amps
+                            current_buffer = config.limits.amp_buffer
+                            max_safe_temp = config.limits.max_temp
+                            min_safe_voltage = config.limits.min_volts
+                            derate_enabled = config.limits.derate_enabled
+                            derate_start_temp = config.limits.derate_start
+
+                            # Capacity change invalidates the running coulomb
+                            # count, so rebaseline rather than carry a stale Ah.
+                            total_capacity_ah = pack.capacity_ah
+                            remaining_ah = total_capacity_ah
+                            last_coulomb_time = time.time()
+
+                            print(f"[LOGIC] Config updated -> {pack.cell_model} "
+                                  f"{pack.series_count}S{pack.parallel_count}P, "
+                                  f"{pack.capacity_ah:.1f} Ah, "
+                                  f"{vehicle.total_mass_kg:.0f} kg car+driver")
+                            for warning in config.limits.exceedances(pack):
+                                print(f"[LOGIC WARNING] {warning}")
+                        except Exception as exc:
+                            print(f"[LOGIC ERROR] Rejected bad config: {exc}")
 
                 elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV":
                     filepath = cmd[1]

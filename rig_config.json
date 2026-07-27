@@ -1,0 +1,39 @@
+{
+  "vehicle": {
+    "mass_car_kg": 260.0,
+    "mass_driver_kg": 70.0,
+    "rotational_mass_factor": 1.05,
+    "air_density_kgm3": 1.2255,
+    "gravity_ms2": 9.81,
+    "drag_coefficient": 0.6,
+    "drag_area_m2": 2.224,
+    "lift_coefficient": -1.0,
+    "downforce_area_m2": 2.224,
+    "rolling_resistance_coeff": 0.015,
+    "drivetrain_efficiency": 0.95
+  },
+  "pack": {
+    "cell_model": "Molicel INR-21700-P45B",
+    "series_count": 12,
+    "parallel_count": 4,
+    "cell_capacity_ah": 4.5,
+    "cell_capacity_min_ah": 4.3,
+    "cell_max_continuous_a": 45.0,
+    "cell_max_voltage": 4.2,
+    "cell_nominal_voltage": 3.6,
+    "cell_min_voltage": 2.5,
+    "cell_max_temp_c": 60.0,
+    "cell_dc_milliohm": 15.0,
+    "use_minimum_capacity": false
+  },
+  "limits": {
+    "derive_from_pack": true,
+    "max_amps": 175.0,
+    "amp_buffer": 5.0,
+    "max_temp": 60.0,
+    "min_volts": 36.0,
+    "warn_volts": 38.0,
+    "derate_enabled": false,
+    "derate_start": 55.0
+  }
+}

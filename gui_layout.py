@@ -2,8 +2,14 @@ import sys
 import csv
 import time
 import os
+from dataclasses import fields
 from queue import Empty, Full
 from multiprocessing import Queue, Event
+
+from rig_config import (
+    RigConfig, VehicleParams, PackConfig,
+    VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, field_label,
+)
 from PyQt6 import QtWidgets, QtCore
 import pyqtgraph as pg
 
@@ -48,12 +54,250 @@ def send_command_nonblocking(cmd_queue, cmd):
         return False
 
 
+# ================= CONFIGURATION DIALOG =================
+
+class ConfigDialog(QtWidgets.QDialog):
+    """Editor for the vehicle model and battery pack.
+
+    Fields are generated from the dataclasses in rig_config, so adding a
+    parameter there makes it appear here with no GUI changes needed. Pack limits
+    are shown derived live from the per-cell datasheet values, which is the whole
+    point: a future team enters their cell's numbers and the pack current,
+    voltage and capacity limits follow, instead of being hand-computed.
+    """
+
+    def __init__(self, config: RigConfig, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Rig Configuration")
+        self.resize(760, 700)
+        self.setStyleSheet("background-color: #1e1e1e; color: white; font-size: 13px;")
+
+        self.config = config
+        self.vehicle_widgets = {}
+        self.pack_widgets = {}
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        intro = QtWidgets.QLabel(
+            "Retarget this rig for a different car or a different cell. Pack limits "
+            "are derived from the per-cell datasheet values below, so enter what your "
+            "cell is rated for and the pack numbers follow automatically."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #aaa; font-style: italic; padding-bottom: 8px;")
+        layout.addWidget(intro)
+
+        tabs = QtWidgets.QTabWidget()
+        tabs.setStyleSheet(
+            "QTabBar::tab { background: #333; color: white; padding: 8px 16px; }"
+            "QTabBar::tab:selected { background: #0055ff; }"
+        )
+        tabs.addTab(self._build_vehicle_tab(), "Vehicle")
+        tabs.addTab(self._build_pack_tab(), "Battery Pack")
+        layout.addWidget(tabs)
+
+        self.lbl_derived = QtWidgets.QLabel()
+        self.lbl_derived.setWordWrap(True)
+        self.lbl_derived.setStyleSheet(
+            "background-color: #262626; border: 1px solid #444; padding: 10px; "
+            "font-family: Consolas; font-size: 12px;"
+        )
+        layout.addWidget(self.lbl_derived)
+
+        self.lbl_warnings = QtWidgets.QLabel()
+        self.lbl_warnings.setWordWrap(True)
+        self.lbl_warnings.setStyleSheet(
+            "background-color: #3a1111; border: 1px solid #a33; color: #ff9999; "
+            "padding: 10px; font-size: 12px;"
+        )
+        self.lbl_warnings.setVisible(False)
+        layout.addWidget(self.lbl_warnings)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+            | QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Save).setStyleSheet(
+            "background-color: darkgreen; color: white; font-weight: bold; padding: 8px 20px;")
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setStyleSheet(
+            "background-color: #555; color: white; padding: 8px 20px;")
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults).setStyleSheet(
+            "background-color: #444; color: white; padding: 8px 20px;")
+
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(
+            QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults
+        ).clicked.connect(self.restore_defaults)
+        layout.addWidget(buttons)
+
+        self.refresh_derived()
+
+    # --- tab construction -------------------------------------------------
+
+    def _make_editor(self, value):
+        """Build an input widget appropriate to the value's type."""
+        if isinstance(value, bool):
+            w = QtWidgets.QCheckBox()
+            w.setChecked(value)
+            w.stateChanged.connect(self.refresh_derived)
+        elif isinstance(value, int):
+            w = QtWidgets.QSpinBox()
+            w.setRange(1, 999)
+            w.setValue(value)
+            w.setKeyboardTracking(False)
+            w.valueChanged.connect(self.refresh_derived)
+        elif isinstance(value, float):
+            w = QtWidgets.QDoubleSpinBox()
+            w.setDecimals(4)
+            # Wide enough for any plausible parameter; negative allowed so Cl can
+            # express downforce with the usual sign convention.
+            w.setRange(-10000.0, 100000.0)
+            w.setValue(value)
+            w.setKeyboardTracking(False)
+            w.valueChanged.connect(self.refresh_derived)
+        else:
+            w = QtWidgets.QLineEdit(str(value))
+            w.editingFinished.connect(self.refresh_derived)
+
+        w.setStyleSheet(
+            "background-color: #333; color: white; border: 1px solid #555; "
+            "padding: 4px; font-family: Consolas;"
+        )
+        return w
+
+    def _build_form(self, instance, labels, widget_store):
+        container = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(container)
+        form.setContentsMargins(15, 15, 15, 15)
+        form.setSpacing(8)
+
+        for f in fields(instance):
+            value = getattr(instance, f.name)
+            label_text, unit = field_label(f.name, labels)
+            if unit:
+                label_text = f"{label_text}  [{unit}]"
+
+            editor = self._make_editor(value)
+            widget_store[f.name] = editor
+            form.addRow(label_text + ":", editor)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+        scroll.setStyleSheet("border: none;")
+        return scroll
+
+    def _build_vehicle_tab(self):
+        return self._build_form(self.config.vehicle, VEHICLE_FIELD_LABELS, self.vehicle_widgets)
+
+    def _build_pack_tab(self):
+        return self._build_form(self.config.pack, PACK_FIELD_LABELS, self.pack_widgets)
+
+    # --- reading values back ---------------------------------------------
+
+    def _read_widget(self, widget):
+        if isinstance(widget, QtWidgets.QCheckBox):
+            return widget.isChecked()
+        if isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+            return widget.value()
+        return widget.text()
+
+    def collect(self) -> RigConfig:
+        """Build a RigConfig from the current widget values."""
+        vehicle = VehicleParams(**{
+            name: self._read_widget(w) for name, w in self.vehicle_widgets.items()
+        })
+        pack = PackConfig(**{
+            name: self._read_widget(w) for name, w in self.pack_widgets.items()
+        })
+
+        limits = self.config.limits
+        limits.apply_pack_derivation(pack)
+        return RigConfig(vehicle=vehicle, pack=pack, limits=limits)
+
+    # --- live feedback ----------------------------------------------------
+
+    def refresh_derived(self):
+        try:
+            candidate = self.collect()
+        except Exception as exc:
+            self.lbl_derived.setText(f"Invalid configuration: {exc}")
+            return
+
+        pack, vehicle = candidate.pack, candidate.vehicle
+        sag = pack.sag_volts(pack.max_current_a)
+
+        self.lbl_derived.setText(
+            f"DERIVED PACK      {pack.series_count}S{pack.parallel_count}P "
+            f"= {pack.cell_count} cells\n"
+            f"  Capacity        {pack.capacity_ah:.2f} Ah "
+            f"({'minimum' if pack.use_minimum_capacity else 'typical'} cell capacity)\n"
+            f"  Voltage         {pack.min_voltage:.1f} V cutoff  ->  "
+            f"{pack.nominal_voltage:.1f} V nominal  ->  {pack.max_voltage:.1f} V full\n"
+            f"  Max current     {pack.max_current_a:.0f} A "
+            f"({pack.cell_max_continuous_a:.0f} A/cell x {pack.parallel_count}P)\n"
+            f"  Internal R      {pack.resistance_ohm * 1000:.1f} mOhm  "
+            f"-> {sag:.1f} V sag at {pack.max_current_a:.0f} A\n"
+            f"  Energy          {pack.energy_wh:.0f} Wh\n"
+            f"\n"
+            f"DERIVED VEHICLE\n"
+            f"  Total mass      {vehicle.total_mass_kg:.1f} kg "
+            f"({vehicle.total_mass_kg * vehicle.rotational_mass_factor:.1f} kg effective "
+            f"under acceleration)\n"
+            f"\n"
+            f"RESULTING TRIPS   {candidate.limits.max_amps:.0f} A "
+            f"(+{candidate.limits.amp_buffer:.0f} buffer)  |  "
+            f"{candidate.limits.max_temp:.0f} C  |  "
+            f"{candidate.limits.min_volts:.1f} V"
+        )
+
+        warnings = candidate.limits.exceedances(pack)
+        if warnings:
+            self.lbl_warnings.setText("WARNING\n" + "\n".join(f"  - {w}" for w in warnings))
+            self.lbl_warnings.setVisible(True)
+        else:
+            self.lbl_warnings.setVisible(False)
+
+    def restore_defaults(self):
+        confirm = QtWidgets.QMessageBox.question(
+            self, "Restore defaults?",
+            "Reset the vehicle and pack to the shipped Molicel P45B 12S4P defaults?\n\n"
+            "This discards your car's parameters.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        defaults = RigConfig.defaults()
+        for name, w in self.vehicle_widgets.items():
+            self._write_widget(w, getattr(defaults.vehicle, name))
+        for name, w in self.pack_widgets.items():
+            self._write_widget(w, getattr(defaults.pack, name))
+        self.refresh_derived()
+
+    def _write_widget(self, widget, value):
+        if isinstance(widget, QtWidgets.QCheckBox):
+            widget.setChecked(bool(value))
+        elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+            widget.setValue(value)
+        else:
+            widget.setText(str(value))
+
+
 # ================= HEATMAP WINDOW =================
 class HeatmapWindow(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, series_count=12, parallel_count=4):
         super().__init__()
-        self.setWindowTitle("12S4P Battery Thermal Map")
-        self.resize(850, 350)
+        # Grid follows the configured pack topology rather than a hardcoded
+        # 12S4P, so a future team's pack draws correctly.
+        self.series_count = series_count
+        self.parallel_count = parallel_count
+
+        self.setWindowTitle(f"{series_count}S{parallel_count}P Battery Thermal Map")
+        self.resize(min(1600, 70 * series_count + 60), 90 * parallel_count)
         self.setStyleSheet("background-color: #121212;")
 
         main_layout = QtWidgets.QVBoxLayout(self)
@@ -66,7 +310,7 @@ class HeatmapWindow(QtWidgets.QWidget):
         label_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         label_layout.setContentsMargins(15, 0, 0, 10)
 
-        for i in range(12):
+        for i in range(series_count):
             lbl = QtWidgets.QLabel(f"S{i + 1}")
             lbl.setFixedSize(self.CELL_SIZE, 20)
             lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -75,9 +319,9 @@ class HeatmapWindow(QtWidgets.QWidget):
 
         main_layout.addLayout(label_layout)
 
-        self.cell_labels = [[None for _ in range(12)] for _ in range(4)]
+        self.cell_labels = [[None for _ in range(series_count)] for _ in range(parallel_count)]
 
-        for row in range(4):
+        for row in range(parallel_count):
             row_layout = QtWidgets.QHBoxLayout()
             row_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
             row_layout.setContentsMargins(0, 0, 0, 0)
@@ -85,7 +329,7 @@ class HeatmapWindow(QtWidgets.QWidget):
             if row % 2 != 0:
                 row_layout.addSpacing(self.RADIUS)
 
-            for col in range(12):
+            for col in range(self.series_count):
                 lbl = QtWidgets.QLabel("0.0")
                 lbl.setFixedSize(self.CELL_SIZE, self.CELL_SIZE)
                 lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -114,9 +358,9 @@ class HeatmapWindow(QtWidgets.QWidget):
         for bus in temp_array:
             flat_temps.extend(bus)
 
-        for col in range(12):
-            for row in range(4):
-                sensor_idx = (col * 4) + row
+        for col in range(self.series_count):
+            for row in range(self.parallel_count):
+                sensor_idx = (col * self.parallel_count) + row
 
                 if sensor_idx < len(flat_temps):
                     t = flat_temps[sensor_idx]
@@ -144,17 +388,21 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.csv_writer = None
         self.heatmap_window = None
 
-        # Default Safety Thresholds -- Molicel INR-21700-P45B v1.2, 12S4P.
+        # Vehicle, pack and safety limits all come from rig_config.json, falling
+        # back to the P45B 12S4P defaults. Editable from the Configure dialog so
+        # a future team retargets the rig without touching source.
+        self.config = RigConfig.load()
+
         # V Crit trips a fault; V Warn is a display-only line on the plot.
-        self.lim_v_warn = 38.0
-        self.lim_v_crit = 36.0   # 3.0 V/cell, above the 2.5 V/cell (30.0 V) cutoff
-        self.lim_c_crit = 180.0  # 45 A/cell continuous * 4P
-        self.lim_c_buffer = 5.0
-        self.lim_t_crit = 60.0   # datasheet discharge range tops out at 60 C
+        self.lim_v_warn = self.config.limits.warn_volts
+        self.lim_v_crit = self.config.limits.min_volts
+        self.lim_c_crit = self.config.limits.max_amps
+        self.lim_c_buffer = self.config.limits.amp_buffer
+        self.lim_t_crit = self.config.limits.max_temp
 
         # Derate Variables
-        self.derate_enabled = False
-        self.lim_t_derate = 55.0
+        self.derate_enabled = self.config.limits.derate_enabled
+        self.lim_t_derate = self.config.limits.derate_start
 
         # Dynamic lists for continuous scrolling data
         self.time_data = []
@@ -199,6 +447,12 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             "background-color: #333; color: white; font-size: 16px; font-weight: bold; padding: 5px; border: 1px solid #555;")
 
         # FSM Command Buttons
+        self.btn_config = QtWidgets.QPushButton("⚙ CONFIGURE")
+        self.btn_config.setToolTip("Set up this rig for a different car or a different cell")
+        self.btn_config.setStyleSheet(
+            "background-color: #444; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+        self.btn_config.clicked.connect(self.open_config_dialog)
+
         self.btn_load_csv = QtWidgets.QPushButton("📂 LOAD CSV")
         self.btn_load_csv.setStyleSheet(
             "background-color: #444; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
@@ -240,6 +494,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         top_layout.addWidget(self.lbl_pack_v)
         top_layout.addWidget(self.lbl_current)
         top_layout.addWidget(self.lbl_soc)
+        top_layout.addWidget(self.btn_config)
         top_layout.addWidget(self.btn_load_csv)
         top_layout.addWidget(lbl_laps)
         top_layout.addWidget(self.spin_laps)
@@ -256,10 +511,17 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.lbl_active_csv = QtWidgets.QLabel("Profile: Default (Speed and Time 1 Lap.csv)")
         self.lbl_active_csv.setStyleSheet("color: #aaa; font-style: italic; font-size: 14px; margin-left: 10px;")
 
+        # Always-visible statement of which car and which pack is loaded, so an
+        # operator can never be unsure what the rig is currently modelling.
+        self.lbl_active_config = QtWidgets.QLabel()
+        self.lbl_active_config.setStyleSheet("color: #66aaff; font-size: 14px; margin-left: 20px;")
+        self.refresh_config_label()
+
         self.lbl_lap_progress = QtWidgets.QLabel("Lap: -- / --")
         self.lbl_lap_progress.setStyleSheet("color: #0f0; font-weight: bold; font-size: 18px; margin-right: 20px;")
 
         sub_top_layout.addWidget(self.lbl_active_csv)
+        sub_top_layout.addWidget(self.lbl_active_config)
         sub_top_layout.addStretch()
         sub_top_layout.addWidget(self.lbl_lap_progress)
         main_layout.addLayout(sub_top_layout)
@@ -319,12 +581,12 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         # Right Sidebar: Cell Voltages & Live Threshold Controls
         cell_layout = QtWidgets.QVBoxLayout()
-        cell_label = QtWidgets.QLabel("12S Cell Voltages")
+        cell_label = QtWidgets.QLabel(f"{self.config.pack.series_count}S Cell Voltages")
         cell_label.setStyleSheet("font-size: 16px; font-weight: bold; color: white;")
         cell_layout.addWidget(cell_label)
 
         self.lbl_cells = []
-        for i in range(12):
+        for i in range(self.config.pack.series_count):
             lbl = QtWidgets.QLabel(f"Cell {i + 1:>2}: 0.00 V")
             lbl.setStyleSheet("font-family: Consolas; font-size: 14px;")
             self.lbl_cells.append(lbl)
@@ -434,6 +696,90 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             filename = os.path.basename(filepath)
             self.lbl_active_csv.setText(f"Profile: {filename}")
 
+    def refresh_config_label(self):
+        pack = self.config.pack
+        vehicle = self.config.vehicle
+        self.lbl_active_config.setText(
+            f"Car: {vehicle.total_mass_kg:.0f} kg  |  "
+            f"Pack: {pack.cell_model} {pack.series_count}S{pack.parallel_count}P "
+            f"({pack.capacity_ah:.1f} Ah, {pack.max_current_a:.0f} A)"
+        )
+
+    def open_config_dialog(self):
+        dialog = ConfigDialog(self.config, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            new_config = dialog.collect()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self, "Invalid configuration", f"Could not apply configuration:\n\n{exc}")
+            return
+
+        warnings = new_config.limits.exceedances(new_config.pack)
+        if warnings:
+            body = "\n".join(f"  - {w}" for w in warnings)
+            confirm = QtWidgets.QMessageBox.warning(
+                self, "Limits exceed cell ratings",
+                f"This configuration exceeds what the cells are rated for:\n\n{body}\n\n"
+                "Apply anyway?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+        self.config = new_config
+        self.apply_config_to_widgets()
+        self.refresh_config_label()
+
+        try:
+            path = self.config.save()
+            print(f"[GUI] Configuration saved to {path}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Could not save",
+                f"Configuration applied for this session but not saved to disk:\n\n{exc}")
+
+        self.send_command(("SET_CONFIG", self.config.to_dict()))
+
+    def apply_config_to_widgets(self):
+        """Push config-derived limits into the sidebar spinboxes.
+
+        Signals are blocked so repopulating the boxes does not emit a burst of
+        SET_LIMITS commands that would race the SET_CONFIG we are about to send.
+        """
+        limits = self.config.limits
+        pairs = [
+            (self.sb_v_warn, limits.warn_volts),
+            (self.sb_v_crit, limits.min_volts),
+            (self.sb_c_crit, limits.max_amps),
+            (self.sb_c_buffer, limits.amp_buffer),
+            (self.sb_t_crit, limits.max_temp),
+            (self.sb_t_derate, limits.derate_start),
+        ]
+        for widget, value in pairs:
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+
+        self.chk_derate.blockSignals(True)
+        self.chk_derate.setChecked(limits.derate_enabled)
+        self.chk_derate.blockSignals(False)
+
+        self.lim_v_warn = limits.warn_volts
+        self.lim_v_crit = limits.min_volts
+        self.lim_c_crit = limits.max_amps
+        self.lim_c_buffer = limits.amp_buffer
+        self.lim_t_crit = limits.max_temp
+        self.lim_t_derate = limits.derate_start
+        self.derate_enabled = limits.derate_enabled
+
+        self.warn_line_v.setValue(self.lim_v_warn)
+        self.crit_line_v.setValue(self.lim_v_crit)
+        self.crit_line_c.setValue(self.lim_c_crit)
+
     def handle_limit_change(self):
         self.lim_v_warn = self.sb_v_warn.value()
         self.lim_v_crit = self.sb_v_crit.value()
@@ -447,19 +793,25 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.crit_line_v.setValue(self.lim_v_crit)
         self.crit_line_c.setValue(self.lim_c_crit)
 
-        limits_dict = {
-            'max_amps': self.lim_c_crit,
-            'amp_buffer': self.lim_c_buffer,
-            'max_temp': self.lim_t_crit,
-            'min_volts': self.lim_v_crit,
-            'derate_en': self.derate_enabled,
-            'derate_start': self.lim_t_derate
-        }
-        self.send_command(("SET_LIMITS", limits_dict))
+        # Hand-edited limits are an intentional override, so stop re-deriving
+        # them from the pack -- otherwise the next config load would silently
+        # revert the operator's values.
+        limits = self.config.limits
+        limits.derive_from_pack = False
+        limits.warn_volts = self.lim_v_warn
+        limits.min_volts = self.lim_v_crit
+        limits.max_amps = self.lim_c_crit
+        limits.amp_buffer = self.lim_c_buffer
+        limits.max_temp = self.lim_t_crit
+        limits.derate_start = self.lim_t_derate
+        limits.derate_enabled = self.derate_enabled
+
+        self.send_command(("SET_LIMITS", limits.to_command_dict()))
 
     def toggle_heatmap(self):
         if self.heatmap_window is None:
-            self.heatmap_window = HeatmapWindow()
+            self.heatmap_window = HeatmapWindow(
+                self.config.pack.series_count, self.config.pack.parallel_count)
 
         if self.heatmap_window.isVisible():
             self.heatmap_window.hide()
@@ -483,10 +835,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.csv_file = open(filename, 'w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
 
+            series = self.config.pack.series_count
+            parallel = self.config.pack.parallel_count
+
             headers = ["Timestamp", "Pack_V", "Amps", "Power_kW", "Max_Temp", "SOC_Est", "FSM_State", "Target_Res"]
-            headers.extend([f"Cell_{i + 1}_V" for i in range(12)])
-            for s in range(1, 13):
-                for p in range(1, 5):
+            headers.extend([f"Cell_{i + 1}_V" for i in range(series)])
+            for s in range(1, series + 1):
+                for p in range(1, parallel + 1):
                     headers.append(f"S{s}_T{p}")
 
             self.csv_writer.writerow(headers)
@@ -555,8 +910,10 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.lbl_soc.setText(f"SOC: {true_soc:.1f}% ({rem_ah:.1f} Ah)")
 
             valid_cells = [c for c in cells if c > 1.0]
-            for i, cell_v in enumerate(cells):
-                self.lbl_cells[i].setText(f"Cell {i + 1:>2}: {cell_v:.2f} V")
+            # zip() bounds the loop to whichever is shorter: a pack configured
+            # with a different series count than the DAQ reports must not raise.
+            for i, (lbl, cell_v) in enumerate(zip(self.lbl_cells, cells)):
+                lbl.setText(f"Cell {i + 1:>2}: {cell_v:.2f} V")
 
             delta_v = (max(valid_cells) - min(valid_cells)) if valid_cells else 0.0
             self.lbl_delta_v.setText(f"ΔV: {delta_v:.3f} V")
@@ -597,20 +954,35 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                     round(true_soc, 1), fsm_state, round(latest_data.get('target_resistance', 0.0), 2)
                 ]
 
-                row_data.extend([round(v, 3) for v in cells])
+                # Pad/truncate to the configured pack size so every row matches
+                # the header width even if the hardware reports a different count.
+                series = self.config.pack.series_count
+                sensor_count = series * self.config.pack.parallel_count
+
+                cell_row = [round(v, 3) for v in cells][:series]
+                cell_row += [0.0] * (series - len(cell_row))
+                row_data.extend(cell_row)
+
                 flat_temps = []
                 for bus in temps:
                     flat_temps.extend(bus)
 
-                if len(flat_temps) == 48:
-                    row_data.extend([round(t, 1) for t in flat_temps])
-                else:
-                    row_data.extend([0.0] * 48)
+                temp_row = [round(t, 1) for t in flat_temps][:sensor_count]
+                temp_row += [0.0] * (sensor_count - len(temp_row))
+                row_data.extend(temp_row)
 
                 self.csv_writer.writerow(row_data)
 
     def closeEvent(self, event):
         self.stop_event.set()
+
+        # Persist limits so hand-edited thresholds survive a restart. A failure
+        # here must never block shutdown -- the E-STOP path runs through close.
+        try:
+            self.config.save()
+        except Exception as exc:
+            print(f"[GUI] Could not save configuration on exit: {exc}")
+
         if self.csv_file:
             self.csv_file.close()
         if self.heatmap_window:

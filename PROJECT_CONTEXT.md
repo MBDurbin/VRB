@@ -37,6 +37,7 @@ hardware_manager ──────────> control_logic ─────�
 | Module | Role |
 |---|---|
 | `main_v2.py` | Entry point. Probes COM ports for a `SIL_KEY` dongle; if present runs SIL mode, otherwise starts the real DAQ process. |
+| `rig_config.py` | Vehicle model, pack spec and safety limits, with JSON persistence. Everything a future team retargets lives here. |
 | `hardware_manager.py` | Reads NI cDAQ (current + 12 cumulative cell voltages) and the temperature Arduino (6 OneWire buses × 8 DS18B20 = 48 sensors). Self-healing watchdog thread re-detects unplugged Arduinos. Falls back to simulated data if no NI-DAQ is present. |
 | `control_logic.py` | The safety-critical process. FSM, safety trips, lap physics, coulomb counting, resistor bank serial commands. |
 | `gui_layout.py` | PyQt6 telemetry UI — live voltage/current plots, 12S cell voltages, 48-sensor thermal heatmap, threshold controls, CSV recording. |
@@ -70,11 +71,53 @@ Guards live in `is_valid_transition()`. `ARM` only from `IDLE`, `RUN` only from
 Both Arduinos and the SIL dongle are discovered by COM-port sweep using the
 `?WHOAMI` handshake — no fixed port assignments.
 
+## Retargeting the rig for a new car or new cells
+
+**Start here if you have inherited this rig.** Click **⚙ CONFIGURE** in the GUI.
+Nothing below requires editing Python.
+
+The dialog has two tabs. **Vehicle** describes the car — mass, aero, tyres,
+drivetrain. **Battery Pack** takes the numbers straight off your cell's
+datasheet plus your series/parallel counts. Pack limits are *derived* from those
+values, so entering `45 A` continuous and `4P` produces a 180 A pack rating
+automatically; you should never be hand-computing a pack limit.
+
+A live panel shows the derived pack figures and the resulting trip points as you
+type, and warns in red if a limit would exceed what the cells are rated for.
+Settings persist to `rig_config.json` beside the source, so they survive
+restarts and travel with the repo.
+
+One safety rule is enforced in the derivation: **the E-STOP fires at
+`max_amps + amp_buffer`, so the buffer is taken out of the cell rating, not
+added on top of it.** With a 180 A pack and a 5 A buffer the operating limit
+derives to 175 A and the trip lands exactly on 180 A. Deriving the limit as the
+raw rating would put the real trip at 185 A — above the cells — which is exactly
+the bug that shipped originally as 182 A / 187 A.
+
+Hand-editing a threshold in the sidebar sets `derive_from_pack = False`, so your
+override is not silently reverted the next time the config loads. Re-enable
+derivation by editing that flag in `rig_config.json`.
+
+### What retargeting does NOT cover
+
+- **DAQ channel mapping.** `hardware_manager.py` has a hardcoded list of 12
+  voltage channels. A pack with a different series count needs that list
+  updated, and possibly more cDAQ modules.
+- **Temperature sensor addresses.** The Arduino sketch hardcodes 48 DS18B20
+  ROM addresses across 6 buses. A different sensor count means re-flashing.
+- **Resistor bank hardware.** 8 relays, 0.25 Ω resolution, 63.75 Ω max are
+  physical properties of the bank.
+
+The GUI adapts its cell list, thermal map grid and CSV log columns to the
+configured series/parallel counts, so it will render a different pack correctly
+once the hardware layers above are updated to match.
+
 ## Vehicle model
 
 All road-load parameters live in the `VehicleParams` dataclass in
-`control_logic.py` — nothing physics-related is hardcoded in the maths any more.
-Retune by mutating `DEFAULT_VEHICLE`, or pass a variant per call:
+`rig_config.py` (re-exported from `control_logic` for convenience) — nothing
+physics-related is hardcoded in the maths any more. Edit these from the GUI's
+Configure dialog, or pass a variant per call:
 
 ```python
 fast = VehicleParams(drag_coefficient=0.55, rotational_mass_factor=1.08)
@@ -158,7 +201,7 @@ Layer 3 is the backstop when layer 1 is stalled (see Open Questions).
 python -m pytest
 ```
 
-48 unit tests, no hardware required. They cover the pure decision logic extracted
+98 unit tests, no hardware required. They cover the pure decision logic extracted
 from the control loop: trip thresholds at/around boundaries, FSM transition
 guards, coulomb counting and SOC clamping, the thermal derate curve, road-load
 power, and the E-STOP command dispatch path.

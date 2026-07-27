@@ -49,8 +49,10 @@ if __name__ == '__main__':
     if is_sil_mode:
         # --- DESKTOP SIL MODE ---
         # Note: We run the SIL window in the same process as the Main GUI to keep PyQt6 happy
+        from gui_layout import apply_theme
+
         app = QtWidgets.QApplication(sys.argv)
-        app.setStyle("Fusion")
+        apply_theme(app)
 
         # To link the SIL to the logic, we route the SIL telemetry to both queues
         # (Since SIL replaces the DAQ entirely)

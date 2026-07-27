@@ -37,8 +37,9 @@ hardware_manager ──────────> control_logic ─────�
 | Module | Role |
 |---|---|
 | `main_v2.py` | Entry point. Probes COM ports for a `SIL_KEY` dongle; if present runs SIL mode, otherwise starts the real DAQ process. |
-| `rig_config.py` | Vehicle model, pack spec and safety limits, with JSON persistence. Everything a future team retargets lives here. |
-| `hardware_manager.py` | Reads NI cDAQ (current + 12 cumulative cell voltages) and the temperature Arduino (6 OneWire buses × 8 DS18B20 = 48 sensors). Self-healing watchdog thread re-detects unplugged Arduinos. Falls back to simulated data if no NI-DAQ is present. |
+| `rig_config.py` | Vehicle model, pack spec, DAQ mapping and safety limits, with JSON persistence. Everything a future team retargets lives here. |
+| `theme.py` | Colour, type and spacing for the whole interface. One global stylesheet; widgets carry a `variant` property rather than inline CSS. |
+| `hardware_manager.py` | Reads NI cDAQ (current + cumulative cell voltage taps) and the temperature Arduino (OneWire buses of DS18B20s). Channel map and sensor layout come from config. Self-healing watchdog thread re-detects unplugged Arduinos. Falls back to simulated data, sized to the configured pack, if no NI-DAQ is present. |
 | `control_logic.py` | The safety-critical process. FSM, safety trips, lap physics, coulomb counting, resistor bank serial commands. |
 | `gui_layout.py` | PyQt6 telemetry UI — live voltage/current plots, 12S cell voltages, 48-sensor thermal heatmap, threshold controls, CSV recording. |
 | `sil_simulator.py` | Desk-test plant model. Replaces the DAQ entirely with operator-driven sliders (load, temperature, pack OCV) plus a hardware-fault toggle. |
@@ -71,6 +72,29 @@ Guards live in `is_valid_transition()`. `ARM` only from `IDLE`, `RUN` only from
 Both Arduinos and the SIL dongle are discovered by COM-port sweep using the
 `?WHOAMI` handshake — no fixed port assignments.
 
+## Interface conventions
+
+All styling lives in `theme.py` and is applied as one global stylesheet via
+`apply_theme(app)`. Widgets declare intent with a `variant` property
+(`primary`, `success`, `warning`, `danger`, `card`, `section`, `caption`,
+`mono`) instead of carrying their own CSS, so the look stays coherent as the
+interface grows. Three conventions are worth preserving:
+
+- **Colour carries meaning.** Red is a fault or a hard limit, amber is a warning
+  or an armed-but-not-running state, green is healthy or active. Nothing
+  decorative uses those three, so an operator can trust what a colour means.
+- **Live numbers are monospaced.** Proportional digits change width as values
+  update, which makes readouts visibly twitch. Metric cards also hold a fixed
+  width and static captions for the same reason — a caption that grows with its
+  value makes the card reflow mid-run.
+- **The E-STOP is deliberately the loudest control on screen** and sits apart
+  from the routine controls, so it cannot be hit while reaching for Run or
+  Reset. Do not tone it down for visual balance.
+
+The thermal map ramp (`theme.HEAT_STOPS`) routes cool → teal → amber → red
+rather than interpolating blue straight to red, which passes through a muddy
+purple midpoint and makes mid-range cells impossible to rank.
+
 ## Retargeting the rig for a new car or new cells
 
 **Start here if you have inherited this rig.** Click **⚙ CONFIGURE** in the GUI.
@@ -98,19 +122,32 @@ Hand-editing a threshold in the sidebar sets `derive_from_pack = False`, so your
 override is not silently reverted the next time the config loads. Re-enable
 derivation by editing that flag in `rig_config.json`.
 
+The **DAQ / Sensors** tab holds the channel mapping and sensor layout: which
+cDAQ channel reads current, the ordered list of cumulative voltage taps, divider
+and transducer scaling, analog input range, OneWire bus/sensor counts, and the
+loop period. These describe physical wiring, so they cannot be *derived* from
+S/P counts — but they must agree with them, and the dialog says so in red when
+they do not (e.g. "12 voltage channels configured but the pack is 14S").
+
+DAQ changes only take effect on restart, because the NI task and sensor buffers
+are built once at process start. The GUI tells you this after saving rather than
+letting you believe a rewiring change is already live.
+
 ### What retargeting does NOT cover
 
-- **DAQ channel mapping.** `hardware_manager.py` has a hardcoded list of 12
-  voltage channels. A pack with a different series count needs that list
-  updated, and possibly more cDAQ modules.
-- **Temperature sensor addresses.** The Arduino sketch hardcodes 48 DS18B20
-  ROM addresses across 6 buses. A different sensor count means re-flashing.
+- **Arduino firmware.** The temperature sketch hardcodes 48 DS18B20 ROM
+  addresses across 6 buses. A different sensor count means editing and
+  re-flashing the sketch — the Python side will read whatever layout you
+  configure, but the addresses themselves live in firmware.
 - **Resistor bank hardware.** 8 relays, 0.25 Ω resolution, 63.75 Ω max are
   physical properties of the bank.
+- **Physically rewiring the DAQ.** Configuring 14 channels does not create them;
+  you need the modules and the taps.
 
-The GUI adapts its cell list, thermal map grid and CSV log columns to the
-configured series/parallel counts, so it will render a different pack correctly
-once the hardware layers above are updated to match.
+Everything on the Python side now follows the config: the DAQ derives cell
+voltages by differencing however many taps are configured, sizes its temperature
+grid from the bus/sensor counts, and the GUI adapts its cell list, thermal map
+and CSV columns to match.
 
 ## Vehicle model
 
@@ -201,7 +238,7 @@ Layer 3 is the backstop when layer 1 is stalled (see Open Questions).
 python -m pytest
 ```
 
-98 unit tests, no hardware required. They cover the pure decision logic extracted
+124 unit tests, no hardware required. They cover the pure decision logic extracted
 from the control loop: trip thresholds at/around boundaries, FSM transition
 guards, coulomb counting and SOC clamping, the thermal derate curve, road-load
 power, and the E-STOP command dispatch path.

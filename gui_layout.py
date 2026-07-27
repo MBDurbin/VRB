@@ -7,11 +7,54 @@ from queue import Empty, Full
 from multiprocessing import Queue, Event
 
 from rig_config import (
-    RigConfig, VehicleParams, PackConfig,
-    VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, field_label,
+    RigConfig, VehicleParams, PackConfig, DaqConfig,
+    VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, DAQ_FIELD_LABELS, field_label,
 )
+from control_logic import DEFAULT_LAP_CSV
+import theme
 from PyQt6 import QtWidgets, QtCore
 import pyqtgraph as pg
+
+
+class MetricCard(QtWidgets.QFrame):
+    """A captioned numeric readout.
+
+    The value renders monospaced so the card does not reflow as digits change --
+    a proportional font makes live telemetry visibly twitch.
+    """
+
+    def __init__(self, caption, initial="--", colour=None):
+        super().__init__()
+        self.setProperty("variant", "card")
+        # Equal, non-shrinking widths. Captions must stay static for this to
+        # hold: a caption that grows with its value makes the card reflow mid-run.
+        self.setMinimumWidth(150)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Fixed)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(theme.GAP_MD, theme.GAP_SM, theme.GAP_MD, theme.GAP_SM)
+        layout.setSpacing(2)
+
+        self.caption = QtWidgets.QLabel(caption.upper())
+        self.caption.setProperty("variant", "caption")
+
+        self.value = QtWidgets.QLabel(initial)
+        self.value.setStyleSheet(
+            f"font-family: {theme.FONT_MONO}; font-size: 21px; font-weight: 700; "
+            f"color: {colour or theme.TEXT}; background: transparent; border: none;"
+        )
+
+        layout.addWidget(self.caption)
+        layout.addWidget(self.value)
+
+    def set_value(self, text, colour=None):
+        self.value.setText(text)
+        if colour:
+            self.value.setStyleSheet(
+                f"font-family: {theme.FONT_MONO}; font-size: 21px; font-weight: 700; "
+                f"color: {colour}; background: transparent; border: none;"
+            )
 
 
 # ================= COMMAND DISPATCH =================
@@ -69,14 +112,20 @@ class ConfigDialog(QtWidgets.QDialog):
     def __init__(self, config: RigConfig, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Rig Configuration")
-        self.resize(760, 700)
-        self.setStyleSheet("background-color: #1e1e1e; color: white; font-size: 13px;")
+        self.resize(780, 720)
 
         self.config = config
         self.vehicle_widgets = {}
         self.pack_widgets = {}
+        self.daq_widgets = {}
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(theme.GAP_LG, theme.GAP_LG, theme.GAP_LG, theme.GAP_LG)
+        layout.setSpacing(theme.GAP_MD)
+
+        heading = QtWidgets.QLabel("RIG CONFIGURATION")
+        heading.setProperty("variant", "section")
+        layout.addWidget(heading)
 
         intro = QtWidgets.QLabel(
             "Retarget this rig for a different car or a different cell. Pack limits "
@@ -84,31 +133,33 @@ class ConfigDialog(QtWidgets.QDialog):
             "cell is rated for and the pack numbers follow automatically."
         )
         intro.setWordWrap(True)
-        intro.setStyleSheet("color: #aaa; font-style: italic; padding-bottom: 8px;")
+        intro.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: {theme.SIZE_SMALL}px;")
         layout.addWidget(intro)
 
         tabs = QtWidgets.QTabWidget()
-        tabs.setStyleSheet(
-            "QTabBar::tab { background: #333; color: white; padding: 8px 16px; }"
-            "QTabBar::tab:selected { background: #0055ff; }"
-        )
         tabs.addTab(self._build_vehicle_tab(), "Vehicle")
         tabs.addTab(self._build_pack_tab(), "Battery Pack")
-        layout.addWidget(tabs)
+        tabs.addTab(self._build_daq_tab(), "DAQ / Sensors")
+        # The tab area absorbs spare height: the derived and warning panels have
+        # large text sizeHints and would otherwise squeeze the form down to a few
+        # visible rows.
+        layout.addWidget(tabs, 1)
 
         self.lbl_derived = QtWidgets.QLabel()
         self.lbl_derived.setWordWrap(True)
         self.lbl_derived.setStyleSheet(
-            "background-color: #262626; border: 1px solid #444; padding: 10px; "
-            "font-family: Consolas; font-size: 12px;"
+            f"background-color: {theme.SURFACE}; border: 1px solid {theme.BORDER_SUBTLE}; "
+            f"border-radius: {theme.RADIUS}px; padding: {theme.GAP_MD}px; "
+            f"font-family: {theme.FONT_MONO}; font-size: 11px; color: {theme.TEXT_DIM};"
         )
         layout.addWidget(self.lbl_derived)
 
         self.lbl_warnings = QtWidgets.QLabel()
         self.lbl_warnings.setWordWrap(True)
         self.lbl_warnings.setStyleSheet(
-            "background-color: #3a1111; border: 1px solid #a33; color: #ff9999; "
-            "padding: 10px; font-size: 12px;"
+            f"background-color: rgba(248, 81, 73, 0.10); border: 1px solid {theme.DANGER_DIM}; "
+            f"border-radius: {theme.RADIUS}px; color: {theme.DANGER}; "
+            f"padding: {theme.GAP_MD}px; font-size: {theme.SIZE_SMALL}px;"
         )
         self.lbl_warnings.setVisible(False)
         layout.addWidget(self.lbl_warnings)
@@ -118,12 +169,9 @@ class ConfigDialog(QtWidgets.QDialog):
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
             | QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults
         )
-        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Save).setStyleSheet(
-            "background-color: darkgreen; color: white; font-weight: bold; padding: 8px 20px;")
-        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setStyleSheet(
-            "background-color: #555; color: white; padding: 8px 20px;")
-        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.RestoreDefaults).setStyleSheet(
-            "background-color: #444; color: white; padding: 8px 20px;")
+        buttons.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Save
+        ).setProperty("variant", "success")
 
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -138,6 +186,14 @@ class ConfigDialog(QtWidgets.QDialog):
 
     def _make_editor(self, value):
         """Build an input widget appropriate to the value's type."""
+        if isinstance(value, list):
+            # Channel lists edit as comma-separated text; order is meaningful
+            # (channel i reads the cumulative tap for series group i).
+            w = QtWidgets.QLineEdit(", ".join(str(v) for v in value))
+            w.setProperty('is_list', True)
+            w.editingFinished.connect(self.refresh_derived)
+            return w
+
         if isinstance(value, bool):
             w = QtWidgets.QCheckBox()
             w.setChecked(value)
@@ -161,32 +217,34 @@ class ConfigDialog(QtWidgets.QDialog):
             w = QtWidgets.QLineEdit(str(value))
             w.editingFinished.connect(self.refresh_derived)
 
-        w.setStyleSheet(
-            "background-color: #333; color: white; border: 1px solid #555; "
-            "padding: 4px; font-family: Consolas;"
-        )
         return w
 
     def _build_form(self, instance, labels, widget_store):
         container = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(container)
-        form.setContentsMargins(15, 15, 15, 15)
-        form.setSpacing(8)
+        form.setContentsMargins(theme.GAP_LG, theme.GAP_LG, theme.GAP_LG, theme.GAP_LG)
+        form.setSpacing(theme.GAP_MD)
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight |
+                               QtCore.Qt.AlignmentFlag.AlignVCenter)
 
         for f in fields(instance):
             value = getattr(instance, f.name)
             label_text, unit = field_label(f.name, labels)
-            if unit:
-                label_text = f"{label_text}  [{unit}]"
+
+            label = QtWidgets.QLabel(
+                f"{label_text}"
+                + (f" <span style='color:{theme.TEXT_MUTED}; font-size:10px;'>{unit}</span>"
+                   if unit else "")
+            )
+            label.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: {theme.SIZE_SMALL}px;")
 
             editor = self._make_editor(value)
             widget_store[f.name] = editor
-            form.addRow(label_text + ":", editor)
+            form.addRow(label, editor)
 
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(container)
-        scroll.setStyleSheet("border: none;")
         return scroll
 
     def _build_vehicle_tab(self):
@@ -195,6 +253,9 @@ class ConfigDialog(QtWidgets.QDialog):
     def _build_pack_tab(self):
         return self._build_form(self.config.pack, PACK_FIELD_LABELS, self.pack_widgets)
 
+    def _build_daq_tab(self):
+        return self._build_form(self.config.daq, DAQ_FIELD_LABELS, self.daq_widgets)
+
     # --- reading values back ---------------------------------------------
 
     def _read_widget(self, widget):
@@ -202,6 +263,8 @@ class ConfigDialog(QtWidgets.QDialog):
             return widget.isChecked()
         if isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
             return widget.value()
+        if widget.property('is_list'):
+            return [part.strip() for part in widget.text().split(',') if part.strip()]
         return widget.text()
 
     def collect(self) -> RigConfig:
@@ -212,10 +275,13 @@ class ConfigDialog(QtWidgets.QDialog):
         pack = PackConfig(**{
             name: self._read_widget(w) for name, w in self.pack_widgets.items()
         })
+        daq = DaqConfig(**{
+            name: self._read_widget(w) for name, w in self.daq_widgets.items()
+        })
 
         limits = self.config.limits
         limits.apply_pack_derivation(pack)
-        return RigConfig(vehicle=vehicle, pack=pack, limits=limits)
+        return RigConfig(vehicle=vehicle, pack=pack, limits=limits, daq=daq)
 
     # --- live feedback ----------------------------------------------------
 
@@ -247,13 +313,18 @@ class ConfigDialog(QtWidgets.QDialog):
             f"({vehicle.total_mass_kg * vehicle.rotational_mass_factor:.1f} kg effective "
             f"under acceleration)\n"
             f"\n"
+            f"WIRING            {candidate.daq.channel_count} voltage channels "
+            f"for {pack.series_count}S  |  "
+            f"{candidate.daq.temp_bus_count}x{candidate.daq.sensors_per_bus} = "
+            f"{candidate.daq.sensor_count} thermistors for {pack.cell_count} cells\n"
+            f"\n"
             f"RESULTING TRIPS   {candidate.limits.max_amps:.0f} A "
             f"(+{candidate.limits.amp_buffer:.0f} buffer)  |  "
             f"{candidate.limits.max_temp:.0f} C  |  "
             f"{candidate.limits.min_volts:.1f} V"
         )
 
-        warnings = candidate.limits.exceedances(pack)
+        warnings = candidate.validate()
         if warnings:
             self.lbl_warnings.setText("WARNING\n" + "\n".join(f"  - {w}" for w in warnings))
             self.lbl_warnings.setVisible(True)
@@ -276,6 +347,8 @@ class ConfigDialog(QtWidgets.QDialog):
             self._write_widget(w, getattr(defaults.vehicle, name))
         for name, w in self.pack_widgets.items():
             self._write_widget(w, getattr(defaults.pack, name))
+        for name, w in self.daq_widgets.items():
+            self._write_widget(w, getattr(defaults.daq, name))
         self.refresh_derived()
 
     def _write_widget(self, widget, value):
@@ -283,6 +356,8 @@ class ConfigDialog(QtWidgets.QDialog):
             widget.setChecked(bool(value))
         elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
             widget.setValue(value)
+        elif widget.property('is_list'):
+            widget.setText(", ".join(str(v) for v in value))
         else:
             widget.setText(str(value))
 
@@ -296,25 +371,33 @@ class HeatmapWindow(QtWidgets.QWidget):
         self.series_count = series_count
         self.parallel_count = parallel_count
 
-        self.setWindowTitle(f"{series_count}S{parallel_count}P Battery Thermal Map")
-        self.resize(min(1600, 70 * series_count + 60), 90 * parallel_count)
-        self.setStyleSheet("background-color: #121212;")
+        self.setWindowTitle(f"{series_count}S{parallel_count}P Thermal Map")
+        self.resize(min(1600, 62 * series_count + 80), 82 * parallel_count + 80)
 
         main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(theme.GAP_LG, theme.GAP_MD, theme.GAP_LG, theme.GAP_LG)
         main_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 
-        self.CELL_SIZE = 55
+        self.CELL_SIZE = 52
         self.RADIUS = self.CELL_SIZE // 2
+
+        caption = QtWidgets.QLabel(
+            f"CELL TEMPERATURES · {series_count}S × {parallel_count}P")
+        caption.setProperty("variant", "section")
+        main_layout.addWidget(caption)
 
         label_layout = QtWidgets.QHBoxLayout()
         label_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
-        label_layout.setContentsMargins(15, 0, 0, 10)
+        label_layout.setContentsMargins(0, 0, 0, theme.GAP_XS)
+        label_layout.setSpacing(3)
 
         for i in range(series_count):
             lbl = QtWidgets.QLabel(f"S{i + 1}")
-            lbl.setFixedSize(self.CELL_SIZE, 20)
+            lbl.setFixedSize(self.CELL_SIZE, 18)
             lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color: #888; font-weight: bold; font-size: 14px;")
+            lbl.setStyleSheet(
+                f"color: {theme.TEXT_MUTED}; font-weight: 700; font-size: 10px; "
+                f"letter-spacing: 0.5px;")
             label_layout.addWidget(lbl)
 
         main_layout.addLayout(label_layout)
@@ -325,33 +408,32 @@ class HeatmapWindow(QtWidgets.QWidget):
             row_layout = QtWidgets.QHBoxLayout()
             row_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
             row_layout.setContentsMargins(0, 0, 0, 0)
-
-            if row % 2 != 0:
-                row_layout.addSpacing(self.RADIUS)
+            row_layout.setSpacing(3)
 
             for col in range(self.series_count):
-                lbl = QtWidgets.QLabel("0.0")
+                lbl = QtWidgets.QLabel("--")
                 lbl.setFixedSize(self.CELL_SIZE, self.CELL_SIZE)
                 lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-
-                lbl.setStyleSheet(
-                    f"background-color: blue; color: white; "
-                    f"font-weight: bold; font-size: 13px; "
-                    f"border-radius: {self.RADIUS}px; border: 2px solid #222;"
-                )
+                lbl.setStyleSheet(self._cell_style(theme.SURFACE_HIGH, theme.TEXT_MUTED))
 
                 row_layout.addWidget(lbl)
                 self.cell_labels[row][col] = lbl
 
             main_layout.addLayout(row_layout)
-            main_layout.addSpacing(-10)
 
-    def get_color(self, temp, max_t):
-        min_t = 20.0
-        ratio = max(0.0, min(1.0, (temp - min_t) / (max_t - min_t)))
-        r = int(ratio * 255)
-        b = int((1.0 - ratio) * 255)
-        return f"#{r:02x}00{b:02x}"
+        swatches = "".join(
+            f"<span style='color:{hexcode}'>■</span>" for _, hexcode in theme.HEAT_STOPS)
+        legend = QtWidgets.QLabel(f"cool &nbsp;{swatches}&nbsp; at limit")
+        legend.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
+        main_layout.addSpacing(theme.GAP_SM)
+        main_layout.addWidget(legend)
+
+    def _cell_style(self, bg, fg):
+        return (
+            f"background-color: {bg}; color: {fg}; font-family: {theme.FONT_MONO}; "
+            f"font-weight: 700; font-size: 12px; border-radius: {theme.RADIUS_SM}px; "
+            f"border: 1px solid {theme.BORDER_SUBTLE};"
+        )
 
     def update_temps(self, temp_array, current_max_safe_temp):
         flat_temps = []
@@ -364,15 +446,14 @@ class HeatmapWindow(QtWidgets.QWidget):
 
                 if sensor_idx < len(flat_temps):
                     t = flat_temps[sensor_idx]
-                    color = self.get_color(t, current_max_safe_temp)
-                    text_color = "white" if (t < 25 or t > (current_max_safe_temp - 10)) else "black"
+                    colour, ratio = theme.heat_colour(t, current_max_safe_temp)
+                    # Keep text legible across the whole ramp: dark on the bright
+                    # mid-range, white at both cool and hot extremes.
+                    text_colour = "#ffffff" if (ratio < 0.35 or ratio > 0.75) else "#14171c"
 
-                    self.cell_labels[row][col].setText(f"{t:.1f}")
+                    self.cell_labels[row][col].setText(f"{t:.0f}")
                     self.cell_labels[row][col].setStyleSheet(
-                        f"background-color: {color}; color: {text_color}; "
-                        f"font-weight: bold; font-size: 13px; "
-                        f"border-radius: {self.RADIUS}px; border: 2px solid #222;"
-                    )
+                        self._cell_style(colour, text_colour))
 
 
 # ================= MAIN TELEMETRY GUI =================
@@ -423,115 +504,124 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         central_widget = QtWidgets.QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(theme.GAP_LG, theme.GAP_MD, theme.GAP_LG, theme.GAP_MD)
+        main_layout.setSpacing(theme.GAP_MD)
 
-        # 1. TOP BAR (Critical Metrics & Controls)
-        top_layout = QtWidgets.QHBoxLayout()
+        # ---------- ROW 1: STATE BANNER + LIVE METRICS ----------
+        # Status and controls are separated into their own rows. Interleaving
+        # them, as this previously did across 14 widgets in a single row, buries
+        # the state banner and the E-STOP among the routine controls.
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.setSpacing(theme.GAP_SM)
 
         self.lbl_fsm_state = QtWidgets.QLabel("DISCONNECTED")
         self.lbl_fsm_state.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.lbl_fsm_state.setStyleSheet(
-            "background-color: #333; color: #777; font-size: 24px; font-weight: bold; border-radius: 5px; padding: 10px;")
+        self.lbl_fsm_state.setMinimumWidth(300)
+        self.lbl_fsm_state.setStyleSheet(theme.fsm_style("DISCONNECTED"))
 
-        self.lbl_pack_v = self.create_metric_label("0.0 V", "yellow")
-        self.lbl_current = self.create_metric_label("0.0 A", "cyan")
-        self.lbl_soc = self.create_metric_label("SOC: 0.0% (0.0 Ah)", "green")
+        self.card_voltage = MetricCard("Pack Voltage", "--- V", theme.TRACE_VOLTAGE)
+        self.card_current = MetricCard("Current", "--- A", theme.TRACE_CURRENT)
+        self.card_power = MetricCard("Power", "--- kW", theme.TEXT)
+        self.card_temp = MetricCard("Max Temp", "--- °C", theme.TEXT)
+        self.card_soc = MetricCard("Charge", "--- %", theme.SUCCESS)
+        self.card_lap = MetricCard("Lap", "-- / --", theme.TEXT_DIM)
 
-        # Lap Control Section
-        lbl_laps = QtWidgets.QLabel("Target Laps:")
-        lbl_laps.setStyleSheet("color: white; font-weight: bold; font-size: 14px; margin-left: 10px;")
+        status_row.addWidget(self.lbl_fsm_state, stretch=3)
+        for card in (self.card_voltage, self.card_current, self.card_power,
+                     self.card_temp, self.card_soc, self.card_lap):
+            status_row.addWidget(card, stretch=2)
+        main_layout.addLayout(status_row)
+
+        # ---------- ROW 2: CONTROLS ----------
+        control_row = QtWidgets.QHBoxLayout()
+        control_row.setSpacing(theme.GAP_SM)
+
+        self.btn_config = QtWidgets.QPushButton("Configure")
+        self.btn_config.setToolTip("Set up this rig for a different car or a different cell")
+        self.btn_config.clicked.connect(self.open_config_dialog)
+
+        self.btn_load_csv = QtWidgets.QPushButton("Load Profile")
+        self.btn_load_csv.setToolTip("Load a lap telemetry CSV")
+        self.btn_load_csv.clicked.connect(self.load_csv_dialog)
+
+        lbl_laps = QtWidgets.QLabel("LAPS")
+        lbl_laps.setProperty("variant", "caption")
 
         self.spin_laps = QtWidgets.QSpinBox()
         self.spin_laps.setRange(1, 999)
         self.spin_laps.setValue(1)
-        self.spin_laps.setStyleSheet(
-            "background-color: #333; color: white; font-size: 16px; font-weight: bold; padding: 5px; border: 1px solid #555;")
+        self.spin_laps.setKeyboardTracking(False)
+        self.spin_laps.setFixedWidth(78)
 
-        # FSM Command Buttons
-        self.btn_config = QtWidgets.QPushButton("⚙ CONFIGURE")
-        self.btn_config.setToolTip("Set up this rig for a different car or a different cell")
-        self.btn_config.setStyleSheet(
-            "background-color: #444; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
-        self.btn_config.clicked.connect(self.open_config_dialog)
-
-        self.btn_load_csv = QtWidgets.QPushButton("📂 LOAD CSV")
-        self.btn_load_csv.setStyleSheet(
-            "background-color: #444; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
-        self.btn_load_csv.clicked.connect(self.load_csv_dialog)
-
-        self.btn_arm = QtWidgets.QPushButton("ARM")
-        self.btn_arm.setStyleSheet(
-            "background-color: darkorange; color: black; font-weight: bold; font-size: 14px; padding: 10px;")
+        self.btn_arm = QtWidgets.QPushButton("Arm")
+        self.btn_arm.setProperty("variant", "warning")
         self.btn_arm.clicked.connect(lambda: self.send_command("ARM"))
 
-        self.btn_run = QtWidgets.QPushButton("▶ RUN")
-        self.btn_run.setStyleSheet(
-            "background-color: darkgreen; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+        self.btn_run = QtWidgets.QPushButton("Run")
+        self.btn_run.setProperty("variant", "success")
         self.btn_run.clicked.connect(lambda: self.send_command(("RUN", self.spin_laps.value())))
 
-        self.btn_stop = QtWidgets.QPushButton("🛑 E-STOP")
-        self.btn_stop.setStyleSheet(
-            "background-color: red; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+        self.btn_stop = QtWidgets.QPushButton("E-STOP")
+        self.btn_stop.setProperty("variant", "danger")
+        self.btn_stop.setToolTip("Immediately shed all load and latch a fault")
         self.btn_stop.clicked.connect(lambda: self.send_command("STOP"))
 
-        self.btn_reset = QtWidgets.QPushButton("RESET")
-        self.btn_reset.setStyleSheet(
-            "background-color: #555; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+        self.btn_reset = QtWidgets.QPushButton("Reset")
+        self.btn_reset.setToolTip("Clear a latched fault and return to idle")
         self.btn_reset.clicked.connect(lambda: self.send_command("RESET"))
 
-        self.btn_heatmap = QtWidgets.QPushButton("SHOW HEATMAP")
-        self.btn_heatmap.setStyleSheet(
-            "background-color: #0055ff; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+        self.btn_heatmap = QtWidgets.QPushButton("Thermal Map")
         self.btn_heatmap.clicked.connect(self.toggle_heatmap)
 
-        self.btn_record = QtWidgets.QPushButton("START RECORDING")
+        self.btn_record = QtWidgets.QPushButton("Record")
         self.btn_record.setCheckable(True)
-        self.btn_record.setStyleSheet(
-            "background-color: darkred; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
         self.btn_record.clicked.connect(self.toggle_logging)
 
-        # Assemble Top Row
-        top_layout.addWidget(self.lbl_fsm_state, stretch=2)
-        top_layout.addWidget(self.lbl_pack_v)
-        top_layout.addWidget(self.lbl_current)
-        top_layout.addWidget(self.lbl_soc)
-        top_layout.addWidget(self.btn_config)
-        top_layout.addWidget(self.btn_load_csv)
-        top_layout.addWidget(lbl_laps)
-        top_layout.addWidget(self.spin_laps)
-        top_layout.addWidget(self.btn_arm)
-        top_layout.addWidget(self.btn_run)
-        top_layout.addWidget(self.btn_stop)
-        top_layout.addWidget(self.btn_reset)
-        top_layout.addWidget(self.btn_heatmap)
-        top_layout.addWidget(self.btn_record)
-        main_layout.addLayout(top_layout)
+        control_row.addWidget(self.btn_config)
+        control_row.addWidget(self.btn_load_csv)
+        control_row.addWidget(self._divider())
+        control_row.addWidget(lbl_laps)
+        control_row.addWidget(self.spin_laps)
+        control_row.addWidget(self.btn_arm)
+        control_row.addWidget(self.btn_run)
+        control_row.addStretch()
+        # E-STOP sits alone on the right, clear of the routine controls, so it
+        # cannot be hit by accident while reaching for Run or Reset.
+        control_row.addWidget(self.btn_stop)
+        control_row.addWidget(self.btn_reset)
+        control_row.addWidget(self._divider())
+        control_row.addWidget(self.btn_heatmap)
+        control_row.addWidget(self.btn_record)
+        main_layout.addLayout(control_row)
 
-        # 1B. SUB-TOP BAR (File Name and Lap Progress)
+        # ---------- ROW 3: CONTEXT STRIP ----------
         sub_top_layout = QtWidgets.QHBoxLayout()
-        self.lbl_active_csv = QtWidgets.QLabel("Profile: Default (Speed and Time 1 Lap.csv)")
-        self.lbl_active_csv.setStyleSheet("color: #aaa; font-style: italic; font-size: 14px; margin-left: 10px;")
+        sub_top_layout.setSpacing(theme.GAP_MD)
+
+        self.lbl_active_csv = QtWidgets.QLabel(f"Profile: {DEFAULT_LAP_CSV}")
+        self.lbl_active_csv.setProperty("variant", "mono")
+        self.lbl_active_csv.setStyleSheet(f"color: {theme.TEXT_DIM};")
 
         # Always-visible statement of which car and which pack is loaded, so an
         # operator can never be unsure what the rig is currently modelling.
         self.lbl_active_config = QtWidgets.QLabel()
-        self.lbl_active_config.setStyleSheet("color: #66aaff; font-size: 14px; margin-left: 20px;")
+        self.lbl_active_config.setProperty("variant", "mono")
+        self.lbl_active_config.setStyleSheet(f"color: {theme.ACCENT};")
         self.refresh_config_label()
 
-        self.lbl_lap_progress = QtWidgets.QLabel("Lap: -- / --")
-        self.lbl_lap_progress.setStyleSheet("color: #0f0; font-weight: bold; font-size: 18px; margin-right: 20px;")
-
         sub_top_layout.addWidget(self.lbl_active_csv)
+        sub_top_layout.addWidget(self._divider())
         sub_top_layout.addWidget(self.lbl_active_config)
         sub_top_layout.addStretch()
-        sub_top_layout.addWidget(self.lbl_lap_progress)
         main_layout.addLayout(sub_top_layout)
 
         # 2. STATUS PILLS
         hw_layout = QtWidgets.QHBoxLayout()
-        hw_layout.setContentsMargins(0, 0, 0, 10)
+        hw_layout.setContentsMargins(0, 0, 0, theme.GAP_XS)
+        hw_layout.setSpacing(theme.GAP_SM)
 
-        hw_label = QtWidgets.QLabel("HARDWARE LINKS:")
-        hw_label.setStyleSheet("color: #888; font-weight: bold; font-size: 14px; margin-right: 10px;")
+        hw_label = QtWidgets.QLabel("HARDWARE LINKS")
+        hw_label.setProperty("variant", "caption")
 
         self.lbl_stat_daq = self.create_status_pill("NI DAQ")
         self.lbl_stat_temp = self.create_status_pill("TEMP SENSOR")
@@ -548,19 +638,28 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         mid_layout = QtWidgets.QHBoxLayout()
         graph_layout = QtWidgets.QVBoxLayout()
 
-        pg.setConfigOptions(antialias=True, background='#121212', foreground='w')
+        pg.setConfigOptions(antialias=True, background=theme.SURFACE, foreground=theme.TEXT_DIM)
         self.plot_widget = pg.GraphicsLayoutWidget()
+        self.plot_widget.setStyleSheet(
+            f"border: 1px solid {theme.BORDER_SUBTLE}; border-radius: {theme.RADIUS}px;")
         graph_layout.addWidget(self.plot_widget)
 
-        # Voltage Plot
-        self.p_voltage = self.plot_widget.addPlot(title="Pack Voltage (V)")
-        self.p_voltage.showGrid(x=True, y=True, alpha=0.3)
-        self.p_voltage.setMouseEnabled(x=False, y=True)
-        self.curve_voltage = self.p_voltage.plot(pen=pg.mkPen('y', width=2))
+        title_css = {'color': theme.TEXT, 'size': '11pt', 'bold': True}
+        grid_alpha = 0.15  # subtle: the trace should dominate, not the grid
 
-        self.warn_line_v = pg.InfiniteLine(angle=0, pen=pg.mkPen('y', width=2, style=QtCore.Qt.PenStyle.DashLine))
+        # Voltage Plot
+        self.p_voltage = self.plot_widget.addPlot(title="Pack Voltage")
+        self.p_voltage.setTitle("Pack Voltage", **title_css)
+        self.p_voltage.showGrid(x=True, y=True, alpha=grid_alpha)
+        self.p_voltage.setMouseEnabled(x=False, y=True)
+        self.p_voltage.getAxis('left').setLabel("Volts", color=theme.TEXT_MUTED)
+        self.curve_voltage = self.p_voltage.plot(pen=pg.mkPen(theme.TRACE_VOLTAGE, width=2))
+
+        self.warn_line_v = pg.InfiniteLine(
+            angle=0, pen=pg.mkPen(theme.WARNING, width=1, style=QtCore.Qt.PenStyle.DashLine))
         self.warn_line_v.setValue(self.lim_v_warn)
-        self.crit_line_v = pg.InfiniteLine(angle=0, pen=pg.mkPen('r', width=2, style=QtCore.Qt.PenStyle.DashLine))
+        self.crit_line_v = pg.InfiniteLine(
+            angle=0, pen=pg.mkPen(theme.DANGER, width=2, style=QtCore.Qt.PenStyle.DashLine))
         self.crit_line_v.setValue(self.lim_v_crit)
         self.p_voltage.addItem(self.warn_line_v)
         self.p_voltage.addItem(self.crit_line_v)
@@ -568,68 +667,100 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.plot_widget.nextRow()
 
         # Current Plot
-        self.p_current = self.plot_widget.addPlot(title="Current Draw (A)")
-        self.p_current.showGrid(x=True, y=True, alpha=0.3)
+        self.p_current = self.plot_widget.addPlot(title="Current Draw")
+        self.p_current.setTitle("Current Draw", **title_css)
+        self.p_current.showGrid(x=True, y=True, alpha=grid_alpha)
         self.p_current.setMouseEnabled(x=False, y=True)
-        self.curve_current = self.p_current.plot(pen=pg.mkPen('c', width=2))
+        self.p_current.getAxis('left').setLabel("Amps", color=theme.TEXT_MUTED)
+        self.p_current.getAxis('bottom').setLabel("Elapsed (s)", color=theme.TEXT_MUTED)
+        self.curve_current = self.p_current.plot(pen=pg.mkPen(theme.TRACE_CURRENT, width=2))
 
-        self.crit_line_c = pg.InfiniteLine(angle=0, pen=pg.mkPen('r', width=2, style=QtCore.Qt.PenStyle.DashLine))
+        self.crit_line_c = pg.InfiniteLine(
+            angle=0, pen=pg.mkPen(theme.DANGER, width=2, style=QtCore.Qt.PenStyle.DashLine))
         self.crit_line_c.setValue(self.lim_c_crit)
         self.p_current.addItem(self.crit_line_c)
 
         mid_layout.addLayout(graph_layout, stretch=4)
 
         # Right Sidebar: Cell Voltages & Live Threshold Controls
-        cell_layout = QtWidgets.QVBoxLayout()
-        cell_label = QtWidgets.QLabel(f"{self.config.pack.series_count}S Cell Voltages")
-        cell_label.setStyleSheet("font-size: 16px; font-weight: bold; color: white;")
-        cell_layout.addWidget(cell_label)
+        sidebar = QtWidgets.QWidget()
+        sidebar.setFixedWidth(268)
+        cell_layout = QtWidgets.QVBoxLayout(sidebar)
+        cell_layout.setContentsMargins(0, 0, 0, 0)
+        cell_layout.setSpacing(theme.GAP_SM)
+
+        cells_card = QtWidgets.QFrame()
+        cells_card.setProperty("variant", "card")
+        cells_inner = QtWidgets.QVBoxLayout(cells_card)
+        cells_inner.setContentsMargins(theme.GAP_MD, theme.GAP_MD, theme.GAP_MD, theme.GAP_MD)
+        cells_inner.setSpacing(3)
+
+        cell_label = QtWidgets.QLabel(f"{self.config.pack.series_count}S CELL VOLTAGES")
+        cell_label.setProperty("variant", "section")
+        cells_inner.addWidget(cell_label)
 
         self.lbl_cells = []
         for i in range(self.config.pack.series_count):
-            lbl = QtWidgets.QLabel(f"Cell {i + 1:>2}: 0.00 V")
-            lbl.setStyleSheet("font-family: Consolas; font-size: 14px;")
+            lbl = QtWidgets.QLabel(f"{i + 1:>2}   ----  V")
+            lbl.setStyleSheet(
+                f"font-family: {theme.FONT_MONO}; font-size: {theme.SIZE_SMALL}px; "
+                f"color: {theme.TEXT}; background: transparent; border: none;")
             self.lbl_cells.append(lbl)
-            cell_layout.addWidget(lbl)
+            cells_inner.addWidget(lbl)
 
-        self.lbl_delta_v = QtWidgets.QLabel("ΔV: 0.00 V")
+        self.lbl_delta_v = QtWidgets.QLabel("ΔV   0.000 V")
         self.lbl_delta_v.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.lbl_delta_v.setStyleSheet(
-            "font-size: 18px; font-weight: bold; background-color: #222; margin-top: 10px; padding: 5px;")
-        cell_layout.addWidget(self.lbl_delta_v)
+        self.lbl_delta_v.setStyleSheet(theme.delta_v_style(0.0))
+        cells_inner.addSpacing(theme.GAP_XS)
+        cells_inner.addWidget(self.lbl_delta_v)
+        cell_layout.addWidget(cells_card)
 
         # --- LIVE SIDEBAR CONTROLS SECTION ---
-        limits_label = QtWidgets.QLabel("Safety Thresholds")
-        limits_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-top: 20px; color: #ffaa00;")
-        cell_layout.addWidget(limits_label)
+        limits_card = QtWidgets.QFrame()
+        limits_card.setProperty("variant", "card")
+        limits_inner = QtWidgets.QVBoxLayout(limits_card)
+        limits_inner.setContentsMargins(theme.GAP_MD, theme.GAP_MD, theme.GAP_MD, theme.GAP_MD)
+        limits_inner.setSpacing(theme.GAP_SM)
+
+        limits_label = QtWidgets.QLabel("SAFETY THRESHOLDS")
+        limits_label.setProperty("variant", "section")
+        limits_inner.addWidget(limits_label)
 
         form_layout = QtWidgets.QFormLayout()
-        form_layout.setContentsMargins(0, 5, 0, 5)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+        form_layout.setSpacing(theme.GAP_SM)
+        form_layout.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight |
+                                      QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-        self.sb_v_warn = self.create_sidebar_spinbox(self.lim_v_warn, 0.0, 100.0)
-        self.sb_v_crit = self.create_sidebar_spinbox(self.lim_v_crit, 0.0, 100.0)
-        self.sb_c_crit = self.create_sidebar_spinbox(self.lim_c_crit, 0.0, 500.0)
-        self.sb_c_buffer = self.create_sidebar_spinbox(self.lim_c_buffer, 0.0, 50.0)
+        self.sb_v_warn = self.create_sidebar_spinbox(self.lim_v_warn, 0.0, 1000.0)
+        self.sb_v_crit = self.create_sidebar_spinbox(self.lim_v_crit, 0.0, 1000.0)
+        self.sb_c_crit = self.create_sidebar_spinbox(self.lim_c_crit, 0.0, 2000.0)
+        self.sb_c_buffer = self.create_sidebar_spinbox(self.lim_c_buffer, 0.0, 100.0)
 
-        self.chk_derate = QtWidgets.QCheckBox("Enable Thermal Derate")
-        self.chk_derate.setStyleSheet("color: white; font-size: 13px; font-weight: bold;")
+        self.sb_v_warn.setToolTip("Display-only line on the voltage plot. Does not trip a fault.")
+        self.sb_v_crit.setToolTip("Undervoltage trip point. Keep above the pack's absolute cutoff "
+                                  "to leave room for IR sag under load.")
+        self.sb_c_crit.setToolTip("Continuous operating limit. The E-STOP fires at this plus the buffer.")
+        self.sb_c_buffer.setToolTip("Headroom above the operating limit before the over-current trip fires.")
+
+        self.chk_derate = QtWidgets.QCheckBox("Thermal derate")
         self.chk_derate.setChecked(self.derate_enabled)
+        self.chk_derate.setToolTip("Progressively reduce the current limit between "
+                                   "derate start and max temp.")
 
-        self.sb_t_derate = self.create_sidebar_spinbox(self.lim_t_derate, 20.0, 150.0)
-        self.sb_t_crit = self.create_sidebar_spinbox(self.lim_t_crit, 20.0, 150.0)
+        self.sb_t_derate = self.create_sidebar_spinbox(self.lim_t_derate, 0.0, 200.0)
+        self.sb_t_crit = self.create_sidebar_spinbox(self.lim_t_crit, 0.0, 200.0)
 
-        form_layout.addRow("V Warn [V] (display):", self.sb_v_warn)
-        form_layout.addRow("V Crit [V] (trip):", self.sb_v_crit)
-        form_layout.addRow("Max Amp [A]:", self.sb_c_crit)
-        form_layout.addRow("E-Stop Buffer [A]:", self.sb_c_buffer)
-        form_layout.addRow(self.chk_derate)
-        form_layout.addRow("Derate Start [°C]:", self.sb_t_derate)
-        form_layout.addRow("Max Temp [°C]:", self.sb_t_crit)
+        form_layout.addRow(self._field_label("V warn", "display only"), self.sb_v_warn)
+        form_layout.addRow(self._field_label("V crit", "trip"), self.sb_v_crit)
+        form_layout.addRow(self._field_label("Max current", "A"), self.sb_c_crit)
+        form_layout.addRow(self._field_label("E-stop buffer", "A"), self.sb_c_buffer)
+        form_layout.addRow(self._field_label("Derate start", "°C"), self.sb_t_derate)
+        form_layout.addRow(self._field_label("Max temp", "°C"), self.sb_t_crit)
 
-        limits_container = QtWidgets.QWidget()
-        limits_container.setLayout(form_layout)
-        limits_container.setStyleSheet("color: white; font-size: 13px; font-weight: bold;")
-        cell_layout.addWidget(limits_container)
+        limits_inner.addLayout(form_layout)
+        limits_inner.addWidget(self.chk_derate)
+        cell_layout.addWidget(limits_card)
 
         self.sb_v_warn.valueChanged.connect(self.handle_limit_change)
         self.sb_v_crit.valueChanged.connect(self.handle_limit_change)
@@ -640,24 +771,29 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.chk_derate.stateChanged.connect(self.handle_limit_change)
 
         cell_layout.addStretch()
-        mid_layout.addLayout(cell_layout, stretch=1)
+        mid_layout.addWidget(sidebar)
         main_layout.addLayout(mid_layout)
 
     def send_command(self, cmd):
         return send_command_nonblocking(self.gui_cmd_queue, cmd)
 
-    def create_metric_label(self, text, color):
-        lbl = QtWidgets.QLabel(text)
-        lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet(
-            f"font-size: 18px; font-weight: bold; color: {color}; background-color: #222; border-radius: 5px; padding: 5px;")
+    def _divider(self):
+        """Thin vertical rule used to group related controls."""
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        line.setStyleSheet(f"color: {theme.BORDER}; background-color: {theme.BORDER}; max-width: 1px;")
+        return line
+
+    def _field_label(self, name, unit):
+        """Sidebar form label: name in body text, unit in muted small text."""
+        lbl = QtWidgets.QLabel(f"{name} <span style='color:{theme.TEXT_MUTED}; font-size:10px;'>{unit}</span>")
+        lbl.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: {theme.SIZE_SMALL}px;")
         return lbl
 
     def create_status_pill(self, text):
-        lbl = QtWidgets.QLabel(f"{text}: OFFLINE")
+        lbl = QtWidgets.QLabel(f"○  {text}")
         lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet(
-            "background-color: darkred; color: white; font-weight: bold; font-size: 12px; border-radius: 4px; padding: 4px 10px; margin-right: 5px;")
+        lbl.setStyleSheet(theme.pill_style(False))
         return lbl
 
     def create_sidebar_spinbox(self, val, min_val, max_val):
@@ -670,19 +806,14 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         # logic process as the live safety limit, instantly tripping OVERTEMP.
         # Off means the value is only committed on Enter/arrows/focus-out.
         sb.setKeyboardTracking(False)
-        sb.setStyleSheet(
-            "background-color: #333; color: white; border: 1px solid #555; padding: 2px; font-size: 13px; font-family: Consolas;")
+        sb.setFixedWidth(92)
         return sb
 
     def update_status_pill(self, lbl, name, is_connected):
-        if is_connected:
-            lbl.setText(f"{name}: ONLINE")
-            lbl.setStyleSheet(
-                "background-color: green; color: white; font-weight: bold; font-size: 12px; border-radius: 4px; padding: 4px 10px; margin-right: 5px;")
-        else:
-            lbl.setText(f"{name}: OFFLINE")
-            lbl.setStyleSheet(
-                "background-color: darkred; color: white; font-weight: bold; font-size: 12px; border-radius: 4px; padding: 4px 10px; margin-right: 5px;")
+        # Filled dot for a live link, hollow for a dead one -- readable without
+        # relying on the colour alone.
+        lbl.setText(f"{'●' if is_connected else '○'}  {name}")
+        lbl.setStyleSheet(theme.pill_style(is_connected))
 
     def load_csv_dialog(self):
         filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -717,12 +848,14 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 self, "Invalid configuration", f"Could not apply configuration:\n\n{exc}")
             return
 
-        warnings = new_config.limits.exceedances(new_config.pack)
+        daq_changed = new_config.daq != self.config.daq
+
+        warnings = new_config.validate()
         if warnings:
             body = "\n".join(f"  - {w}" for w in warnings)
             confirm = QtWidgets.QMessageBox.warning(
-                self, "Limits exceed cell ratings",
-                f"This configuration exceeds what the cells are rated for:\n\n{body}\n\n"
+                self, "Configuration problems",
+                f"This configuration has problems:\n\n{body}\n\n"
                 "Apply anyway?",
                 QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
                 QtWidgets.QMessageBox.StandardButton.No,
@@ -743,6 +876,18 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 f"Configuration applied for this session but not saved to disk:\n\n{exc}")
 
         self.send_command(("SET_CONFIG", self.config.to_dict()))
+
+        if daq_changed:
+            # The DAQ process builds its nidaqmx task and sensor buffers once at
+            # startup, so channel and sensor-layout changes cannot take effect
+            # live. Say so plainly rather than letting the operator believe a
+            # rewiring change is already active.
+            QtWidgets.QMessageBox.information(
+                self, "Restart required",
+                "DAQ channel or sensor settings changed.\n\n"
+                "These are applied when the DAQ process starts, so restart the "
+                "application for them to take effect. Vehicle, pack and limit "
+                "changes are already live.")
 
     def apply_config_to_widgets(self):
         """Push config-derived limits into the sidebar spinboxes.
@@ -815,21 +960,17 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         if self.heatmap_window.isVisible():
             self.heatmap_window.hide()
-            self.btn_heatmap.setText("SHOW HEATMAP")
-            self.btn_heatmap.setStyleSheet(
-                "background-color: #0055ff; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+            self.btn_heatmap.setText("Thermal Map")
+            theme.restyle(self.btn_heatmap, None)
         else:
             self.heatmap_window.show()
-            self.btn_heatmap.setText("HIDE HEATMAP")
-            self.btn_heatmap.setStyleSheet(
-                "background-color: #555; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+            self.btn_heatmap.setText("Hide Thermal Map")
+            theme.restyle(self.btn_heatmap, "primary")
 
     def toggle_logging(self):
         if self.btn_record.isChecked():
             self.is_logging = True
-            self.btn_record.setText("STOP RECORDING")
-            self.btn_record.setStyleSheet(
-                "background-color: red; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+            self.btn_record.setText("● Recording")
 
             filename = f"telemetry_{time.strftime('%Y%m%d_%H%M%S')}.csv"
             self.csv_file = open(filename, 'w', newline='')
@@ -847,9 +988,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.csv_writer.writerow(headers)
         else:
             self.is_logging = False
-            self.btn_record.setText("START RECORDING")
-            self.btn_record.setStyleSheet(
-                "background-color: darkred; color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+            self.btn_record.setText("Record")
             if self.csv_file:
                 self.csv_file.close()
 
@@ -881,51 +1020,48 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.update_status_pill(self.lbl_stat_temp, "TEMP SENSOR", hw_status.get('temp_arduino', False))
             self.update_status_pill(self.lbl_stat_res, "RESISTOR CTRL", hw_status.get('res_arduino', False))
 
-            fsm_state = latest_data.get('fsm_state', 'WAITING/MONITORING')
-            if "FAULT" in fsm_state or "KILLED" in fsm_state:
-                self.lbl_fsm_state.setStyleSheet(
-                    "background-color: red; color: white; font-size: 24px; font-weight: bold; border-radius: 5px;")
-            elif fsm_state == "ARMED":
-                self.lbl_fsm_state.setStyleSheet(
-                    "background-color: #ffaa00; color: black; font-size: 24px; font-weight: bold; border-radius: 5px;")
-            elif fsm_state == "RUNNING":
-                self.lbl_fsm_state.setStyleSheet(
-                    "background-color: #00aa00; color: white; font-size: 24px; font-weight: bold; border-radius: 5px;")
-            else:
-                self.lbl_fsm_state.setStyleSheet(
-                    "background-color: #333; color: #0f0; font-size: 24px; font-weight: bold; border-radius: 5px;")
-            self.lbl_fsm_state.setText(f"STATE: {fsm_state}")
+            fsm_state = latest_data.get('fsm_state', 'DISCONNECTED')
+            self.lbl_fsm_state.setStyleSheet(theme.fsm_style(fsm_state))
+            self.lbl_fsm_state.setText(fsm_state)
 
             cur_lap = latest_data.get('current_lap', 0)
             tot_laps = latest_data.get('total_laps', 0)
             if fsm_state == "RUNNING":
-                self.lbl_lap_progress.setText(f"Lap: {cur_lap} / {tot_laps}")
+                self.card_lap.set_value(f"{cur_lap} / {tot_laps}", theme.SUCCESS)
             else:
-                self.lbl_lap_progress.setText("Lap: -- / --")
+                self.card_lap.set_value("-- / --", theme.TEXT_DIM)
 
-            self.lbl_pack_v.setText(f"{volts:.1f} V")
-            self.lbl_current.setText(f"{amps:.1f} A")
+            self.card_voltage.set_value(f"{volts:.1f} V")
+            self.card_current.set_value(f"{amps:.1f} A")
+            self.card_power.set_value(f"{latest_data.get('power_kw', 0.0):.2f} kW")
 
-            # Apply Coulomb Counting update to UI label
-            self.lbl_soc.setText(f"SOC: {true_soc:.1f}% ({rem_ah:.1f} Ah)")
+            # Temperature and SOC change colour as they approach their limits, so
+            # a glance at the card is enough to know whether the pack is happy.
+            temp_colour = theme.TEXT
+            if max_t >= self.lim_t_crit:
+                temp_colour = theme.DANGER
+            elif max_t >= self.lim_t_derate:
+                temp_colour = theme.WARNING
+            self.card_temp.set_value(f"{max_t:.1f} °C", temp_colour)
+
+            soc_colour = theme.SUCCESS
+            if true_soc <= 10.0:
+                soc_colour = theme.DANGER
+            elif true_soc <= 25.0:
+                soc_colour = theme.WARNING
+            self.card_soc.set_value(f"{true_soc:.0f} %", soc_colour)
+            self.card_soc.setToolTip(f"{rem_ah:.2f} Ah remaining of "
+                                     f"{self.config.pack.capacity_ah:.1f} Ah nameplate")
 
             valid_cells = [c for c in cells if c > 1.0]
             # zip() bounds the loop to whichever is shorter: a pack configured
             # with a different series count than the DAQ reports must not raise.
             for i, (lbl, cell_v) in enumerate(zip(self.lbl_cells, cells)):
-                lbl.setText(f"Cell {i + 1:>2}: {cell_v:.2f} V")
+                lbl.setText(f"{i + 1:>2}   {cell_v:5.2f} V")
 
             delta_v = (max(valid_cells) - min(valid_cells)) if valid_cells else 0.0
-            self.lbl_delta_v.setText(f"ΔV: {delta_v:.3f} V")
-            if delta_v > 0.3:
-                self.lbl_delta_v.setStyleSheet(
-                    "font-size: 18px; font-weight: bold; background-color: red; color: white; margin-top: 10px; padding: 5px;")
-            elif delta_v > 0.15:
-                self.lbl_delta_v.setStyleSheet(
-                    "font-size: 18px; font-weight: bold; background-color: #ffaa00; color: black; margin-top: 10px; padding: 5px;")
-            else:
-                self.lbl_delta_v.setStyleSheet(
-                    "font-size: 18px; font-weight: bold; background-color: #222; color: #0f0; margin-top: 10px; padding: 5px;")
+            self.lbl_delta_v.setText(f"ΔV   {delta_v:.3f} V")
+            self.lbl_delta_v.setStyleSheet(theme.delta_v_style(delta_v))
 
             if self.heatmap_window and self.heatmap_window.isVisible() and temps:
                 self.heatmap_window.update_temps(temps, self.lim_t_crit)
@@ -990,9 +1126,15 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         event.accept()
 
 
+def apply_theme(app):
+    """Apply the shared look. Call once per QApplication, before showing windows."""
+    app.setStyle("Fusion")
+    app.setStyleSheet(theme.app_stylesheet())
+
+
 def run_gui_process(telemetry_queue: Queue, gui_cmd_queue: Queue, stop_event: Event):
     app = QtWidgets.QApplication(sys.argv)
-    app.setStyle("Fusion")
+    apply_theme(app)
     window = TelemetryGUI(telemetry_queue, gui_cmd_queue, stop_event)
     window.show()
     sys.exit(app.exec())

@@ -18,6 +18,7 @@ from rig_config import (
     VehicleParams,
     PackConfig,
     SafetyLimits,
+    DaqConfig,
     RigConfig,
     field_label,
 )
@@ -245,7 +246,78 @@ class TestPersistence:
             RigConfig.defaults().save(path)
             with open(path) as fh:
                 raw = json.load(fh)
-        assert set(raw) == {'vehicle', 'pack', 'limits'}
+        assert set(raw) == {'vehicle', 'pack', 'limits', 'daq'}
+
+
+# ================= DAQ CONFIG =================
+
+class TestDaqConfig:
+    def test_defaults_match_the_12s_wiring(self):
+        d = DaqConfig()
+        assert d.channel_count == 12
+        assert d.sensor_count == 48        # 6 buses x 8 sensors
+        assert d.temp_fields_per_line == 9  # bus number + 8 readings
+
+    def test_default_wiring_validates_against_default_pack(self):
+        assert DaqConfig().validate(PackConfig()) == []
+
+    def test_channel_count_mismatch_is_reported(self):
+        # 12 channels wired, but the pack was reconfigured to 14S.
+        problems = DaqConfig().validate(PackConfig(series_count=14))
+        assert any("voltage channels" in p for p in problems)
+
+    def test_sensor_count_mismatch_is_reported(self):
+        # 48 thermistors cannot cover a 14S5P (70 cell) pack.
+        problems = DaqConfig(voltage_channels=[f"ch{i}" for i in range(14)]).validate(
+            PackConfig(series_count=14, parallel_count=5))
+        assert any("thermistors" in p for p in problems)
+
+    def test_current_channel_colliding_with_voltage_is_reported(self):
+        d = DaqConfig(current_channel="cDAQ1Mod8/ai1")
+        assert any("also listed" in p for p in d.validate(PackConfig()))
+
+    def test_duplicate_voltage_channels_are_reported(self):
+        chans = list(DaqConfig().voltage_channels)
+        chans[5] = chans[0]
+        assert any("Duplicate" in p for p in DaqConfig(voltage_channels=chans).validate(PackConfig()))
+
+    def test_non_positive_sample_period_is_reported(self):
+        assert any("Sample period" in p for p in DaqConfig(sample_period_s=0.0).validate(PackConfig()))
+
+    def test_matching_custom_wiring_validates_clean(self):
+        # A future team's 14S5P rig, correctly wired: 14 taps, 70 thermistors.
+        pack = PackConfig(series_count=14, parallel_count=5)
+        daq = DaqConfig(
+            voltage_channels=[f"cDAQ1Mod{1 + i // 4}/ai{i % 4}" for i in range(14)],
+            temp_bus_count=10, sensors_per_bus=7,
+        )
+        assert daq.validate(pack) == []
+        assert daq.sensor_count == pack.cell_count
+
+    def test_default_factory_does_not_share_state(self):
+        # A mutable default would let one config's edits leak into another.
+        a, b = DaqConfig(), DaqConfig()
+        a.voltage_channels.append("cDAQ1Mod9/ai0")
+        assert len(b.voltage_channels) == 12
+
+    def test_channel_list_survives_round_trip(self):
+        cfg = RigConfig.defaults()
+        cfg.daq.voltage_channels = ["a/ai0", "b/ai1", "c/ai2"]
+        loaded = RigConfig.from_dict(cfg.to_dict())
+        assert loaded.daq.voltage_channels == ["a/ai0", "b/ai1", "c/ai2"]
+
+    def test_config_without_daq_section_gets_defaults(self):
+        # Configs written before the DAQ section existed must still load.
+        loaded = RigConfig.from_dict({'pack': {'series_count': 12}})
+        assert loaded.daq.channel_count == 12
+
+    def test_top_level_validate_covers_limits_and_daq(self):
+        cfg = RigConfig.defaults()
+        cfg.pack.series_count = 14      # now disagrees with the 12 channels
+        cfg.limits.max_temp = 999.0     # and exceeds the cell rating
+        problems = cfg.validate()
+        assert any("voltage channels" in p for p in problems)
+        assert any("discharge ceiling" in p for p in problems)
 
 
 # ================= GUI FIELD LABELS =================

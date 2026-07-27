@@ -5,21 +5,75 @@ import time
 import threading
 from multiprocessing import Queue, Event
 
+from rig_config import RigConfig
+
 # ================= CONFIGURATION =================
-TEMP_BAUD_RATE = 115200
+# Channel mapping, scaling and sensor layout all come from rig_config.json --
+# see DaqConfig in rig_config.py. Only the resistor-bank baud rate stays here
+# because it is fixed by the Arduino sketch, not by the pack.
 RESISTOR_BAUD_RATE = 9600
 
-CURRENT_CHANNEL = "cDAQ1Mod8/ai0"
-VOLTAGE_CHANNELS = [
-    "cDAQ1Mod8/ai1", "cDAQ1Mod8/ai2", "cDAQ1Mod8/ai3",
-    "cDAQ1Mod7/ai0", "cDAQ1Mod7/ai1", "cDAQ1Mod7/ai2", "cDAQ1Mod7/ai3",
-    "cDAQ1Mod6/ai0", "cDAQ1Mod6/ai1", "cDAQ1Mod6/ai2", "cDAQ1Mod6/ai3",
-    "cDAQ1Mod5/ai0"
-]
-VOLTAGE_MULTIPLIER = 11.0
+
+def derive_cell_voltages(cumulative_voltages):
+    """Difference cumulative tap readings into per-cell voltages.
+
+    Channel i reads the sum of cells 1..i+1, so cell i is tap i minus tap i-1.
+    Driven by the length of the input rather than a fixed count, so a pack with
+    a different series count cannot raise an IndexError here.
+    """
+    if not cumulative_voltages:
+        return [], 0.0
+
+    cells = [cumulative_voltages[0]]
+    for i in range(1, len(cumulative_voltages)):
+        cells.append(cumulative_voltages[i] - cumulative_voltages[i - 1])
+    return cells, cumulative_voltages[-1]
 
 
-def run_daq_process(telemetry_queue: Queue, stop_event: Event):
+def parse_temperature_line(line, sensors_per_bus, bus_count):
+    """Parse one CSV line from the temperature Arduino.
+
+    Format is "<bus number>,<t1>,...,<tN>". Returns (bus_index, {i: temp}) or
+    None if the line is malformed, truncated, or names a bus outside the
+    configured layout -- serial noise must never take down the DAQ loop.
+    """
+    parts = line.split(',')
+    if len(parts) != sensors_per_bus + 1:
+        return None
+
+    try:
+        bus_idx = int(parts[0]) - 1
+    except ValueError:
+        return None
+
+    if not (0 <= bus_idx < bus_count):
+        return None
+
+    readings = {}
+    for i in range(sensors_per_bus):
+        raw = parts[i + 1]
+        if raw == "ERR":
+            continue
+        try:
+            readings[i] = float(raw)
+        except ValueError:
+            continue
+
+    return bus_idx, readings
+
+
+def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig = None):
+    config = config if config is not None else RigConfig.load()
+    daq_cfg = config.daq
+    pack = config.pack
+
+    print(f"[DAQ] Pack {pack.series_count}S{pack.parallel_count}P | "
+          f"{daq_cfg.channel_count} voltage channels | "
+          f"{daq_cfg.temp_bus_count}x{daq_cfg.sensors_per_bus} = "
+          f"{daq_cfg.sensor_count} thermistors")
+    for problem in daq_cfg.validate(pack):
+        print(f"[DAQ WARNING] {problem}")
+
     hardware_state = {
         'temp_ser': None,
         'res_port': None
@@ -52,7 +106,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event):
 
                     found = False
                     # FIX 1: Try both baud rates to catch both Arduinos
-                    for baud in [115200, 9600]:
+                    for baud in [daq_cfg.temp_baud_rate, RESISTOR_BAUD_RATE]:
                         if found: break
                         try:
                             ser = serial.Serial(port.device, baud, timeout=2)
@@ -86,16 +140,19 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event):
     watchdog = threading.Thread(target=connection_watchdog, daemon=True)
     watchdog.start()
 
-    battery_temps = [[0.0] * 8 for _ in range(6)]
+    battery_temps = [[0.0] * daq_cfg.sensors_per_bus for _ in range(daq_cfg.temp_bus_count)]
 
     # --- FIX 3: NI-DAQ DESK TEST BYPASS ---
     ni_daq_active = False
     task = None
     try:
         task = nidaqmx.Task()
-        task.ai_channels.add_ai_voltage_chan(CURRENT_CHANNEL, min_val=-10.0, max_val=10.0)
-        for ch in VOLTAGE_CHANNELS:
-            task.ai_channels.add_ai_voltage_chan(ch, min_val=-10.0, max_val=10.0)
+        task.ai_channels.add_ai_voltage_chan(
+            daq_cfg.current_channel,
+            min_val=daq_cfg.ai_min_volts, max_val=daq_cfg.ai_max_volts)
+        for ch in daq_cfg.voltage_channels:
+            task.ai_channels.add_ai_voltage_chan(
+                ch, min_val=daq_cfg.ai_min_volts, max_val=daq_cfg.ai_max_volts)
         ni_daq_active = True
         print("[DAQ] Hardware NI-DAQ initialized.")
     except Exception as e:
@@ -110,19 +167,19 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event):
             # --- A. Read Voltages and Current ---
             if ni_daq_active:
                 daq_data = task.read()
-                current = daq_data[0] * 100.0
+                current = daq_data[0] * daq_cfg.current_amps_per_volt
                 raw_daq_voltages = daq_data[1:]
-                actual_cumulative_voltages = [v * VOLTAGE_MULTIPLIER for v in raw_daq_voltages]
+                actual_cumulative_voltages = [
+                    v * daq_cfg.voltage_multiplier for v in raw_daq_voltages]
             else:
-                # SIMULATION DATA (Desk Test Mode)
+                # SIMULATION DATA (Desk Test Mode): a healthy pack at rest, sized
+                # to the configured series count rather than a fixed 12S.
                 current = 15.0
-                actual_cumulative_voltages = [4.1 * (i + 1) for i in range(12)]  # Perfect 4.1V cells
+                sim_cell_v = pack.cell_nominal_voltage + 0.5
+                actual_cumulative_voltages = [
+                    sim_cell_v * (i + 1) for i in range(pack.series_count)]
 
-            cell_voltages = [0.0] * 12
-            cell_voltages[0] = actual_cumulative_voltages[0]
-            for i in range(1, 12):
-                cell_voltages[i] = actual_cumulative_voltages[i] - actual_cumulative_voltages[i - 1]
-            total_pack_voltage = actual_cumulative_voltages[-1]
+            cell_voltages, total_pack_voltage = derive_cell_voltages(actual_cumulative_voltages)
 
             # --- B. Read Temperatures ---
             with state_lock:
@@ -135,22 +192,22 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event):
                         lines = current_temp_ser.readlines()
                         for line in lines:
                             decoded_line = line.decode('utf-8', errors='ignore').strip()
-                            data = decoded_line.split(',')
-                            if len(data) == 9:
-                                try:
-                                    bus_idx = int(data[0]) - 1
-                                    for i in range(8):
-                                        if data[i + 1] != "ERR":
-                                            battery_temps[bus_idx][i] = float(data[i + 1])
-                                except ValueError:
-                                    pass
+                            parsed = parse_temperature_line(
+                                decoded_line, daq_cfg.sensors_per_bus, daq_cfg.temp_bus_count)
+                            if parsed is None:
+                                continue
+                            bus_idx, readings = parsed
+                            for i, temp_c in readings.items():
+                                battery_temps[bus_idx][i] = temp_c
                 except serial.SerialException:
                     print("\n[DAQ ERROR] Temperature Sensor LOST! Watchdog engaging...")
                     current_temp_ser.close()
                     with state_lock:
                         hardware_state['temp_ser'] = None
 
-            max_t = max(max(bus) for bus in battery_temps)
+            # Guard the empty case: a misconfigured zero-bus layout must not
+            # raise on max() of an empty sequence.
+            max_t = max((max(bus) for bus in battery_temps if bus), default=0.0)
 
             # --- C. Package Data and Send to Queue ---
             data_packet = {
@@ -172,8 +229,8 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event):
             telemetry_queue.put(data_packet)
 
             elapsed = time.time() - loop_start
-            if elapsed < 0.1:
-                time.sleep(0.1 - elapsed)
+            if elapsed < daq_cfg.sample_period_s:
+                time.sleep(daq_cfg.sample_period_s - elapsed)
 
     except Exception as e:
         print(f"\n[DAQ CRITICAL ERROR]: {e}")

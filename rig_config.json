@@ -35,5 +35,30 @@
     "warn_volts": 38.0,
     "derate_enabled": false,
     "derate_start": 55.0
+  },
+  "daq": {
+    "current_channel": "cDAQ1Mod8/ai0",
+    "voltage_channels": [
+      "cDAQ1Mod8/ai1",
+      "cDAQ1Mod8/ai2",
+      "cDAQ1Mod8/ai3",
+      "cDAQ1Mod7/ai0",
+      "cDAQ1Mod7/ai1",
+      "cDAQ1Mod7/ai2",
+      "cDAQ1Mod7/ai3",
+      "cDAQ1Mod6/ai0",
+      "cDAQ1Mod6/ai1",
+      "cDAQ1Mod6/ai2",
+      "cDAQ1Mod6/ai3",
+      "cDAQ1Mod5/ai0"
+    ],
+    "voltage_multiplier": 11.0,
+    "current_amps_per_volt": 100.0,
+    "ai_min_volts": -10.0,
+    "ai_max_volts": 10.0,
+    "temp_bus_count": 6,
+    "sensors_per_bus": 8,
+    "temp_baud_rate": 115200,
+    "sample_period_s": 0.1
   }
 }

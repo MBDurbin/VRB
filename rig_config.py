@@ -19,7 +19,8 @@ Design intent for inheriting teams:
 """
 import json
 import os
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, field, fields
+from typing import List
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rig_config.json")
 
@@ -191,6 +192,113 @@ PACK_FIELD_LABELS = {
 }
 
 
+# ================= DATA ACQUISITION =================
+
+DEFAULT_VOLTAGE_CHANNELS = [
+    "cDAQ1Mod8/ai1", "cDAQ1Mod8/ai2", "cDAQ1Mod8/ai3",
+    "cDAQ1Mod7/ai0", "cDAQ1Mod7/ai1", "cDAQ1Mod7/ai2", "cDAQ1Mod7/ai3",
+    "cDAQ1Mod6/ai0", "cDAQ1Mod6/ai1", "cDAQ1Mod6/ai2", "cDAQ1Mod6/ai3",
+    "cDAQ1Mod5/ai0",
+]
+
+
+@dataclass
+class DaqConfig:
+    """NI-DAQ channel mapping, scaling, and temperature bus layout.
+
+    Channel names and sensor counts describe physical wiring, so they cannot be
+    derived from the pack's series/parallel counts -- but they must AGREE with
+    them. validate() reports any disagreement; the DAQ process prints those
+    warnings at startup rather than failing silently or crashing on an index.
+
+    One voltage channel per series group, wired cumulatively: channel i reads
+    the sum of cells 1..i+1, so per-cell voltages come from differencing.
+    """
+
+    # --- Channel mapping ---
+    current_channel: str = "cDAQ1Mod8/ai0"
+    voltage_channels: List[str] = field(
+        default_factory=lambda: list(DEFAULT_VOLTAGE_CHANNELS))
+
+    # --- Scaling ---
+    # Resistor divider on each tap: a 10:1 divider means multiply by 11.
+    voltage_multiplier: float = 11.0
+    # Current transducer output, amps per volt at the DAQ input.
+    current_amps_per_volt: float = 100.0
+
+    # --- Analog input range ---
+    ai_min_volts: float = -10.0
+    ai_max_volts: float = 10.0
+
+    # --- Temperature sensor layout ---
+    # DS18B20s on OneWire buses. The Arduino emits one CSV line per bus:
+    # "<bus number>,<t1>,...,<tN>", so a line carries sensors_per_bus + 1 fields.
+    temp_bus_count: int = 6
+    sensors_per_bus: int = 8
+    temp_baud_rate: int = 115200
+
+    # --- Loop timing ---
+    sample_period_s: float = 0.1
+
+    @property
+    def channel_count(self) -> int:
+        return len(self.voltage_channels)
+
+    @property
+    def sensor_count(self) -> int:
+        return self.temp_bus_count * self.sensors_per_bus
+
+    @property
+    def temp_fields_per_line(self) -> int:
+        return self.sensors_per_bus + 1
+
+    def validate(self, pack: PackConfig):
+        """Report mismatches between the wiring and the configured pack."""
+        problems = []
+
+        if self.channel_count != pack.series_count:
+            problems.append(
+                f"{self.channel_count} voltage channels configured but the pack is "
+                f"{pack.series_count}S. Cell voltages will be read for "
+                f"{self.channel_count} groups only -- add or remove channels in "
+                f"rig_config.json to match."
+            )
+        if self.sensor_count != pack.cell_count:
+            problems.append(
+                f"{self.temp_bus_count} buses x {self.sensors_per_bus} sensors = "
+                f"{self.sensor_count} thermistors, but the pack has "
+                f"{pack.cell_count} cells ({pack.series_count}S{pack.parallel_count}P). "
+                f"The thermal map will not cover every cell."
+            )
+        if self.current_channel in self.voltage_channels:
+            problems.append(
+                f"Current channel {self.current_channel} is also listed as a voltage "
+                f"channel; one of them is wrong."
+            )
+        duplicates = {c for c in self.voltage_channels
+                      if self.voltage_channels.count(c) > 1}
+        if duplicates:
+            problems.append(f"Duplicate voltage channels: {', '.join(sorted(duplicates))}.")
+        if self.sample_period_s <= 0:
+            problems.append("Sample period must be greater than zero.")
+
+        return problems
+
+
+DAQ_FIELD_LABELS = {
+    'current_channel':       ("Current channel", ""),
+    'voltage_channels':      ("Voltage channels", "comma separated"),
+    'voltage_multiplier':    ("Divider multiplier", "x"),
+    'current_amps_per_volt': ("Current transducer", "A/V"),
+    'ai_min_volts':          ("Analog input min", "V"),
+    'ai_max_volts':          ("Analog input max", "V"),
+    'temp_bus_count':        ("OneWire bus count", "buses"),
+    'sensors_per_bus':       ("Sensors per bus", "sensors"),
+    'temp_baud_rate':        ("Temp sensor baud", "baud"),
+    'sample_period_s':       ("DAQ sample period", "s"),
+}
+
+
 # ================= SAFETY LIMITS =================
 
 @dataclass
@@ -282,19 +390,26 @@ class RigConfig:
     vehicle: VehicleParams
     pack: PackConfig
     limits: SafetyLimits
+    daq: DaqConfig
 
     @staticmethod
     def defaults():
         pack = PackConfig()
         limits = SafetyLimits().apply_pack_derivation(pack)
-        return RigConfig(vehicle=VehicleParams(), pack=pack, limits=limits)
+        return RigConfig(vehicle=VehicleParams(), pack=pack, limits=limits,
+                         daq=DaqConfig())
 
     def to_dict(self):
         return {
             'vehicle': asdict(self.vehicle),
             'pack': asdict(self.pack),
             'limits': asdict(self.limits),
+            'daq': asdict(self.daq),
         }
+
+    def validate(self):
+        """All cross-cutting consistency problems, as human-readable strings."""
+        return self.limits.exceedances(self.pack) + self.daq.validate(self.pack)
 
     @staticmethod
     def from_dict(raw):
@@ -314,6 +429,7 @@ class RigConfig:
             vehicle=build(VehicleParams, raw.get('vehicle')),
             pack=pack,
             limits=limits,
+            daq=build(DaqConfig, raw.get('daq')),
         )
 
     def save(self, path=CONFIG_PATH):

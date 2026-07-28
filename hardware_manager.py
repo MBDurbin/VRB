@@ -142,6 +142,12 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
 
     battery_temps = [[0.0] * daq_cfg.sensors_per_bus for _ in range(daq_cfg.temp_bus_count)]
 
+    # When the temperature link drops, battery_temps keeps its last values and
+    # would otherwise be republished forever as if fresh. Timestamping it lets
+    # the logic process refuse stale readings instead of trusting a frozen
+    # temperature while the cells keep heating.
+    last_temp_rx = time.time()
+
     # --- FIX 3: NI-DAQ DESK TEST BYPASS ---
     ni_daq_active = False
     task = None
@@ -199,6 +205,8 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                             bus_idx, readings = parsed
                             for i, temp_c in readings.items():
                                 battery_temps[bus_idx][i] = temp_c
+                            if readings:
+                                last_temp_rx = time.time()
                 except serial.SerialException:
                     print("\n[DAQ ERROR] Temperature Sensor LOST! Watchdog engaging...")
                     current_temp_ser.close()
@@ -217,6 +225,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 'power_kw': (current * total_pack_voltage) / 1000.0,
                 'temperatures': battery_temps,
                 'max_temp': max_t,
+                'temp_age_s': time.time() - last_temp_rx,
                 'hardware_status': {
                     'temp_arduino': current_temp_ser is not None,
                     'res_arduino': res_status,

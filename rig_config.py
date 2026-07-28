@@ -105,6 +105,18 @@ class PackConfig:
     series_count: int = 12
     parallel_count: int = 4
 
+    # Modules wired in series to form the car's complete battery.
+    #
+    # The BENCH loads exactly one module: the DAQ reads its series_count taps and
+    # the resistor bank is wired across it alone (~50 V). This number describes
+    # the CAR, and exists so the lap physics -- which computes whole-vehicle power
+    # off a ~450 V battery -- can be translated into the right duty for the single
+    # module on the bench. See compute_target_resistance().
+    #
+    # Series modules all carry the same current, so every current limit below is
+    # a per-module AND whole-battery figure at once, and does not scale with this.
+    modules_in_series: int = 9
+
     # Straight off the cell datasheet
     cell_capacity_ah: float = 4.5           # typical; see usable_capacity_ah note
     cell_capacity_min_ah: float = 4.3       # minimum / worst case
@@ -151,8 +163,36 @@ class PackConfig:
 
     @property
     def resistance_ohm(self) -> float:
-        """Pack DC internal resistance: series adds, parallel divides."""
+        """Module DC internal resistance: series adds, parallel divides."""
         return (self.cell_dc_milliohm / 1000.0) * self.series_count / self.parallel_count
+
+    # --- Whole-battery values (the car's full pack) ---
+    # Reference figures for the vehicle the bench is standing in for. The rig
+    # itself never sees these -- the bank is across one module only.
+
+    @property
+    def battery_cell_count(self) -> int:
+        return self.cell_count * self.modules_in_series
+
+    @property
+    def battery_max_voltage(self) -> float:
+        return self.max_voltage * self.modules_in_series
+
+    @property
+    def battery_nominal_voltage(self) -> float:
+        return self.nominal_voltage * self.modules_in_series
+
+    @property
+    def battery_min_voltage(self) -> float:
+        return self.min_voltage * self.modules_in_series
+
+    @property
+    def battery_resistance_ohm(self) -> float:
+        return self.resistance_ohm * self.modules_in_series
+
+    @property
+    def battery_energy_wh(self) -> float:
+        return self.energy_wh * self.modules_in_series
 
     @property
     def energy_wh(self) -> float:
@@ -178,8 +218,9 @@ class PackConfig:
 
 PACK_FIELD_LABELS = {
     'cell_model':            ("Cell model", ""),
-    'series_count':          ("Series count (S)", "cells"),
+    'series_count':          ("Series count (S)", "cells per module"),
     'parallel_count':        ("Parallel count (P)", "cells"),
+    'modules_in_series':     ("Modules in series", "per battery"),
     'cell_capacity_ah':      ("Cell capacity (typical)", "Ah"),
     'cell_capacity_min_ah':  ("Cell capacity (minimum)", "Ah"),
     'cell_max_continuous_a': ("Cell max continuous current", "A"),
@@ -317,6 +358,21 @@ class SafetyLimits:
     min_volts: float = 36.0
     warn_volts: float = 38.0
 
+    # Per-cell undervoltage trip. A module-total trip cannot see one weak cell:
+    # eleven cells at 3.40 V plus one at 1.00 V totals 38.4 V, comfortably above
+    # a 36.0 V module trip, while that one cell is destroyed.
+    min_cell_volts: float = 2.70
+
+    # Any cell reading below this is treated as a broken sense connection rather
+    # than a real measurement -- a genuinely 0 V cell and an unplugged sense lead
+    # look identical, and both must stop the run.
+    cell_sense_floor: float = 0.50
+
+    # Temperature readings older than this are refused. Without it, losing the
+    # temperature link freezes the last reading and the overtemp trip can never
+    # fire while the cells keep heating.
+    temp_stale_timeout_s: float = 3.0
+
     derate_enabled: bool = False
     derate_start: float = 55.0
 
@@ -334,6 +390,9 @@ class SafetyLimits:
         self.max_temp = pack.cell_max_temp_c
         self.min_volts = pack.suggested_min_voltage()
         self.warn_volts = self.min_volts + (2.0 / 12.0) * pack.series_count
+        # A margin above the absolute cutoff so an outlier cell trips before it
+        # is damaged, not after.
+        self.min_cell_volts = pack.cell_min_voltage + 0.20
         # Keep derate start below the ceiling so the derate range stays positive.
         self.derate_start = min(self.derate_start, self.max_temp - 5.0)
         return self
@@ -364,6 +423,17 @@ class SafetyLimits:
                 f"{pack.min_voltage:.1f} V absolute cutoff -- cells would be "
                 f"damaged before the trip fires."
             )
+        if self.min_cell_volts < pack.cell_min_voltage:
+            warnings.append(
+                f"Per-cell trip {self.min_cell_volts:.2f} V is below the cell's "
+                f"{pack.cell_min_voltage:.2f} V cutoff -- a cell would be damaged "
+                f"before the trip fires."
+            )
+        if self.temp_stale_timeout_s <= 0:
+            warnings.append(
+                "Temperature staleness timeout must be positive, or a lost "
+                "temperature link will never be detected."
+            )
         if self.derate_enabled and self.derate_start >= self.max_temp:
             warnings.append(
                 f"Derate start {self.derate_start:.1f} C is not below max temp "
@@ -378,6 +448,9 @@ class SafetyLimits:
             'amp_buffer': self.amp_buffer,
             'max_temp': self.max_temp,
             'min_volts': self.min_volts,
+            'min_cell_volts': self.min_cell_volts,
+            'cell_sense_floor': self.cell_sense_floor,
+            'temp_stale_timeout': self.temp_stale_timeout_s,
             'derate_en': self.derate_enabled,
             'derate_start': self.derate_start,
         }

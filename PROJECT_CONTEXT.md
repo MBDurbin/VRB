@@ -4,16 +4,18 @@ Self-contained summary of the system, its validated constants, and its open
 questions. Written to be dropped into a Claude Project (or read cold by anyone
 new to the repo).
 
-Last updated: 2026-07-25. Reflects `master` through the vehicle-model
-parameterisation commit.
+Last updated: 2026-07-25. Reflects `master` through the cell-level and
+sensor-integrity safety work.
 
 ---
 
 ## What this system does
 
-An FSAE electrical-load test rig. It discharges a 12S4P lithium pack through a
-relay-switched resistor bank, following a recorded lap speed profile, so the
-pack can be characterized under realistic race loads without a car.
+An FSAE electrical-load test rig. It discharges **one 12S4P module** through a
+relay-switched resistor bank, following a recorded lap speed profile, so that
+module can be characterized under realistic race loads without a car. The car
+itself carries nine such modules in series; the rig reproduces what one of them
+would experience. See Battery topology below — this distinction matters.
 
 The lap profile drives a road-load physics model (drag, downforce, rolling
 resistance, translational and rotational inertia, drivetrain loss) to compute
@@ -59,9 +61,12 @@ Guards live in `is_valid_transition()`. `ARM` only from `IDLE`, `RUN` only from
 
 ## Hardware
 
-- **Pack**: 12S4P Molicel INR-21700-P45B, 48 cells.
-- **Resistor bank**: 8 relay-switched banks (1 × 0.25 Ω + 7 binary-weighted),
-  0.25 Ω resolution, 63.75 Ω max = 255 steps in an 8-bit word.
+- **Module under test**: 12S4P Molicel INR-21700-P45B, 48 cells, ~50 V. This is
+  what the bench actually loads.
+- **Car's battery** (reference only): 9 modules in series, 432 cells, ~450 V.
+- **Resistor bank**: binary ladder of 8 relay-switched steps —
+  0.25, 0.5, 1, 2, 4, 8, 16, 32 Ω. 0.25 Ω resolution, 63.75 Ω total, 255 steps
+  in an 8-bit word. Wired across the module under test.
 - **Resistor Arduino**: 9600 baud, answers `RESISTOR_CTRL` to `?WHOAMI`. Has an
   independent 2 s serial watchdog that opens the main contactor and sheds all
   load if the host goes quiet.
@@ -217,14 +222,68 @@ has to leave room for sag or it only fires after damage.
 
 At 180 A the pack is at a **10 C** discharge rate.
 
+## Battery topology — read this before touching the physics
+
+**The bench loads ONE module. The car has nine of them in series.** Almost every
+mistake in this codebase has come from conflating the two.
+
+- A module is `series_count` × `parallel_count` cells (default 12S4P, ~50 V).
+- The car's battery is `modules_in_series` (default 9) of those in series, ~450 V.
+- The DAQ reads taps on **one** module, and the resistor bank is wired across
+  **that one module only**. So `voltage` in the telemetry packet is ~50 V, and
+  the bank never sees 450 V.
+- Series modules all carry the same current, so **180 A is simultaneously the
+  per-module limit and the whole-battery limit**. Current limits do not scale
+  with module count.
+
+The lap physics computes power for the **whole car**, drawn from the 450 V
+battery. Reproducing that on one module means reproducing its **current**:
+
+```
+I_car = P_car / V_battery = P_car / (N · V_module)
+R     = V_module / I_car  = N · V_module² / P_car
+```
+
+So the module count enters the power term **linearly**, and both current clamps
+divide the **module** voltage, because that is what is actually across the bank.
+
+This was the source of a real bug. The term read `(voltage * 9) ** 2` — N²
+rather than N, which is the resistance for a bank spanning the entire battery.
+On a single-module bench that **under-loaded by a factor of 9** across the whole
+lap: an 81 kW demand drew 20 A instead of 180 A, and no plausible car power could
+reach the ladder's 0.25 Ω step (it would have needed 810 kW). With the fix, 81 kW
+lands at 180 A and 0.278 Ω — just above the smallest step, which is what the
+hardware was sized for.
+
+Sanity check any change here against the ladder: 0.25 Ω ↔ 200 A ↔ ~90 kW.
+
 ## Safety layers
 
 Three independent layers. They must all be verified separately.
 
-1. **Software trips** (`check_safety_trip` in `control_logic.py`) — over-temp,
-   over-current, undervoltage. Evaluated in that priority order so the reported
-   cause is deterministic. Sends `KILL` to the resistor Arduino and latches
+1. **Software trips** (`evaluate_safety` in `control_logic.py`) — over-temp,
+   over-current, module undervoltage, **per-cell undervoltage**, cell sense
+   fault, and **temperature data staleness**. Measured dangers are reported
+   ahead of data-integrity faults, so an over-current with a dead thermal link
+   reports the current. Sends `KILL` to the resistor Arduino and latches
    `FAULT`, which only a manual `RESET` clears.
+
+   Two of these exist because pack-level checks alone were not enough:
+
+   - **Per-cell undervoltage.** Eleven cells at 3.40 V plus one at 1.00 V totals
+     38.4 V — above a 36.0 V module trip — while that one cell is destroyed. A
+     module-total trip cannot see it. Readings below `cell_sense_floor` report
+     as a sense fault rather than undervoltage, because a flat cell and an
+     unplugged sense lead are indistinguishable and both must stop the run.
+   - **Temperature staleness.** The DAQ republishes its last temperature array
+     when the sensor link drops, so a dead sensor looks like a steady pack. A
+     link lost at 52 °C froze the reading at 52 °C and the overtemp trip could
+     never fire while the cells kept heating. Readings now carry an age and are
+     refused past `temp_stale_timeout_s`.
+
+   Sensor-integrity checks apply only in `ARMED`/`RUNNING`. In `IDLE` a missing
+   thermal link is a not-connected-yet condition, and latching a fault for it
+   would make the rig impossible to bring up.
 2. **Operator E-STOP** — GUI button, routes through `send_command_nonblocking()`
    so a backed-up command queue can never freeze it.
 3. **Arduino serial watchdog** — 2 s of host silence opens the main contactor
@@ -238,7 +297,7 @@ Layer 3 is the backstop when layer 1 is stalled (see Open Questions).
 python -m pytest
 ```
 
-124 unit tests, no hardware required. They cover the pure decision logic extracted
+156 unit tests, no hardware required. They cover the pure decision logic extracted
 from the control loop: trip thresholds at/around boundaries, FSM transition
 guards, coulomb counting and SOC clamping, the thermal derate curve, road-load
 power, and the E-STOP command dispatch path.
@@ -271,14 +330,7 @@ capacity is meaningfully lower. Quantifying the second needs the datasheet's
 Discharge Rate Characteristics curve, which is a plotted graph — the values have
 to be read off by eye.
 
-**2. The `(voltage * 9) ** 2` term in `compute_target_resistance()` is
-unexplained.** Standard road-load would be `R = V² / P`. The ×9 implies a
-voltage nine times pack voltage. This may be correct for the bank's actual
-topology, but nothing in the code documents why. Worth confirming — it changes
-target resistance by 81×. The current-limit clamp bounds the downside, so it has
-not caused a visible failure.
-
-**2b. The regen branch of the power model is currently inert.**
+**2. The regen branch of the power model is currently inert.**
 `compute_target_resistance()` maps any `req_power <= 0` to `MAX_RESISTANCE`, so
 braking power of −51.7 kW and −52.2 kW command the same 63.75 Ω — the bank is
 purely dissipative and cannot recover energy. The braking efficiency correction

@@ -47,6 +47,18 @@ plant-model window and the main telemetry GUI appear.
 | B6 | RESET, then drag SIL **Pack OCV** down to 3.00 V/cell | `FAULT`, console logs `UNDERVOLTAGE ALARM!` |
 | B7 | RESET, set OCV to 3.20 V/cell, then raise current to ~150 A | `FAULT` on sag alone — pack reads 31.65 V under load despite 38.4 V at rest |
 | B8 | With all three faults possible at once (hot + high amps + low OCV) | Console reports `OVERTEMP` — priority is temp > current > voltage |
+| B9 | RESET, ARM, then tick **Simulate hardware interlock fault** | `FAULT` logging `TEMP LINK LOST` — losing thermal monitoring while armed is itself a fault |
+| B10 | Untick the fault, RESET, stay in `IDLE`, tick it again | **No** fault — sensor checks apply only in ARMED/RUNNING, so the rig can still be brought up |
+| B11 | RESET, ARM, then set OCV so one cell would read below **Cell min** (2.70 V) | `FAULT` logging `CELL UNDERVOLTAGE` |
+
+**Not reachable from the SIL sliders** — the plant model generates uniform cells
+and always-fresh timestamps, so these need either a unit test or real hardware:
+
+- `CELL SENSE FAULT` (one cell reading below `cell_sense_floor`, i.e. a pulled
+  sense lead). Covered by `test_implausibly_low_reading_is_a_sense_fault_not_undervoltage`.
+- `TEMP DATA STALE` (link reports connected but stops sending). B9 exercises the
+  link-lost path only. On the bench, pull the temp Arduino's TX line while
+  leaving it enumerated to reach this. Covered by `test_stale_data_trips`.
 
 ## C. FSM transition guards
 

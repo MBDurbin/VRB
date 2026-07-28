@@ -84,6 +84,79 @@ def check_safety_trip(max_temp, amps, voltage, max_safe_temp, max_safe_current,
         return True, "UNDERVOLTAGE"
     return False, None
 
+
+def check_cell_safety(cell_voltages, min_cell_voltage, sense_floor=0.5):
+    """Per-cell undervoltage. Returns (is_fault, reason).
+
+    A module-total trip cannot see a single weak cell: eleven cells at 3.40 V
+    plus one at 1.00 V totals 38.4 V, above a 36.0 V module trip, while that one
+    cell is destroyed.
+
+    Readings below sense_floor are reported as CELL SENSE FAULT rather than
+    undervoltage. A genuinely flat cell and an unplugged sense lead look
+    identical from here, so neither is ever treated as healthy -- but naming them
+    differently tells the operator where to look.
+    """
+    if not cell_voltages:
+        return False, None
+
+    lowest = min(cell_voltages)
+    if lowest < sense_floor:
+        return True, "CELL SENSE FAULT"
+    if lowest <= min_cell_voltage:
+        return True, "CELL UNDERVOLTAGE"
+    return False, None
+
+
+def check_sensor_health(temp_age_s, temp_link_ok, stale_timeout_s):
+    """Temperature data integrity. Returns (is_fault, reason).
+
+    The DAQ republishes its last temperature array when the sensor link drops,
+    so a dead sensor is indistinguishable from a steady pack. Without this check
+    a link lost at 52 C freezes the reading at 52 C and the overtemp trip can
+    never fire while the cells keep heating.
+    """
+    if not temp_link_ok:
+        return True, "TEMP LINK LOST"
+    if stale_timeout_s > 0 and temp_age_s > stale_timeout_s:
+        return True, "TEMP DATA STALE"
+    return False, None
+
+
+def evaluate_safety(data, limits, check_sensors=True):
+    """All safety checks against one telemetry packet. Returns (is_fault, reason).
+
+    Measured dangers are reported ahead of data-integrity faults: if the pack is
+    genuinely over-current AND the temperature link has dropped, the operator
+    needs to hear about the current first.
+
+    check_sensors is False outside the armed/running states, where a missing
+    temperature link is an ordinary not-connected-yet condition rather than a
+    fault to latch.
+    """
+    fault, reason = check_safety_trip(
+        data.get('max_temp', 0.0), data.get('amps', 0.0), data.get('voltage', 0.0),
+        limits['max_temp'], limits['max_amps'], limits['amp_buffer'], limits['min_volts'],
+    )
+    if fault:
+        return True, reason
+
+    fault, reason = check_cell_safety(
+        data.get('cell_voltages', []), limits['min_cell_volts'], limits['cell_sense_floor'])
+    if fault:
+        return True, reason
+
+    if check_sensors:
+        fault, reason = check_sensor_health(
+            data.get('temp_age_s', 0.0),
+            data.get('hardware_status', {}).get('temp_arduino', False),
+            limits['temp_stale_timeout'],
+        )
+        if fault:
+            return True, reason
+
+    return False, None
+
 #Double Checked
 def coulomb_step(amps, dt, remaining_ah, total_capacity_ah):
     """Advances coulomb counting by dt seconds. Returns (new_remaining_ah, true_soc_pct)."""
@@ -169,12 +242,36 @@ def compute_required_power(velocity_ms, acceleration, params=None):
 
 
 def compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
-                               derate_enabled, derate_start_temp, max_safe_temp):
-    """Resistance needed to hit req_power, clamped for current limit and thermal derate."""
+                               derate_enabled, derate_start_temp, max_safe_temp,
+                               modules_in_series=1):
+    """Resistance needed to reproduce the car's duty on ONE module.
+
+    The bench loads a single module (`voltage` is the measured module voltage,
+    ~50 V), but `req_power` is the whole car's demand, drawn from all
+    `modules_in_series` modules in series (~450 V). Matching the module's real
+    duty means matching its CURRENT, since series modules all carry the same one:
+
+        I_car = req_power / V_battery = req_power / (N * voltage)
+        R     = voltage / I_car       = N * voltage^2 / req_power
+
+    Equivalently, this is 1/N of the resistance a bank across the whole battery
+    would need -- the bank sees a ninth of the voltage, so it needs a ninth of
+    the resistance to pull the same current.
+
+    Both current clamps below divide the MODULE voltage, because that is what is
+    actually across the bank.
+
+    This previously read `(voltage * 9) ** 2`, i.e. N^2 rather than N. That is
+    the resistance for a bank spanning the entire battery, so on a single-module
+    bench it under-loaded by a factor of N: an 81 kW lap demand drew 20 A instead
+    of 180 A, and no plausible car power could reach the ladder's 0.25 ohm step.
+    """
+    modules = max(1, modules_in_series)
+
     if req_power <= 0:
         req_r = MAX_RESISTANCE
     else:
-        req_r = min(MAX_RESISTANCE, ((voltage * 9) ** 2) / req_power)
+        req_r = min(MAX_RESISTANCE, (modules * voltage ** 2) / req_power)
 
     clamp_min_r = voltage / max(max_safe_current, 1.0)
     if req_r < clamp_min_r:
@@ -228,19 +325,22 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     pack = config.pack
     vehicle = config.vehicle
 
-    max_safe_current = config.limits.max_amps
-    current_buffer = config.limits.amp_buffer
-    max_safe_temp = config.limits.max_temp
-    min_safe_voltage = config.limits.min_volts
+    # Single dict rather than a row of parallel variables: SET_LIMITS then updates
+    # one thing, and there is no way for a new limit to be added to the config and
+    # silently never reach the safety checks.
+    limits = config.limits.to_command_dict()
 
-    derate_enabled = config.limits.derate_enabled
-    derate_start_temp = config.limits.derate_start
-
-    print(f"[LOGIC] Pack: {pack.cell_model} {pack.series_count}S{pack.parallel_count}P "
-          f"-> {pack.capacity_ah:.1f} Ah, {pack.max_current_a:.0f} A, "
-          f"{pack.min_voltage:.1f}-{pack.max_voltage:.1f} V, {pack.resistance_ohm * 1000:.0f} mOhm")
-    print(f"[LOGIC] Trips: {max_safe_current:.0f} A (+{current_buffer:.0f} buffer) | "
-          f"{max_safe_temp:.0f} C | {min_safe_voltage:.1f} V")
+    print(f"[LOGIC] Battery: {pack.modules_in_series} x {pack.cell_model} "
+          f"{pack.series_count}S{pack.parallel_count}P "
+          f"= {pack.battery_cell_count} cells, "
+          f"{pack.battery_min_voltage:.0f}-{pack.battery_max_voltage:.0f} V total")
+    print(f"[LOGIC] Module: {pack.capacity_ah:.1f} Ah, {pack.max_current_a:.0f} A, "
+          f"{pack.min_voltage:.1f}-{pack.max_voltage:.1f} V, "
+          f"{pack.resistance_ohm * 1000:.0f} mOhm")
+    print(f"[LOGIC] Trips: {limits['max_amps']:.0f} A (+{limits['amp_buffer']:.0f}) | "
+          f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V module | "
+          f"{limits['min_cell_volts']:.2f} V/cell | "
+          f"temp stale > {limits['temp_stale_timeout']:.1f} s")
     for warning in config.limits.exceedances(pack):
         print(f"[LOGIC WARNING] {warning}")
 
@@ -294,15 +394,13 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 cmd = gui_cmd_queue.get_nowait()
 
                 if isinstance(cmd, tuple) and cmd[0] == "SET_LIMITS":
-                    limits = cmd[1]
-                    max_safe_current = limits.get('max_amps', max_safe_current)
-                    current_buffer = limits.get('amp_buffer', current_buffer)
-                    max_safe_temp = limits.get('max_temp', max_safe_temp)
-                    min_safe_voltage = limits.get('min_volts', min_safe_voltage)
-                    derate_enabled = limits.get('derate_en', derate_enabled)
-                    derate_start_temp = limits.get('derate_start', derate_start_temp)
-                    print(
-                        f"[LOGIC] Limits Updated -> Max A:{max_safe_current} | Max T:{max_safe_temp} | Min V:{min_safe_voltage} | Derate:{derate_enabled}")
+                    # Merge rather than replace, so a partial payload cannot drop
+                    # a limit and leave that check running on a missing key.
+                    limits.update(cmd[1])
+                    print(f"[LOGIC] Limits updated -> {limits['max_amps']:.0f} A | "
+                          f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V | "
+                          f"{limits['min_cell_volts']:.2f} V/cell | "
+                          f"derate={limits['derate_en']}")
 
                 elif isinstance(cmd, tuple) and cmd[0] == "SET_CONFIG":
                     # Full config push from the GUI's Configure dialog: new car,
@@ -317,12 +415,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             pack = config.pack
                             vehicle = config.vehicle
 
-                            max_safe_current = config.limits.max_amps
-                            current_buffer = config.limits.amp_buffer
-                            max_safe_temp = config.limits.max_temp
-                            min_safe_voltage = config.limits.min_volts
-                            derate_enabled = config.limits.derate_enabled
-                            derate_start_temp = config.limits.derate_start
+                            limits = config.limits.to_command_dict()
 
                             # Capacity change invalidates the running coulomb
                             # count, so rebaseline rather than carry a stale Ah.
@@ -384,10 +477,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 break
 
         # --- D. Safety Monitors ---
-        is_fault, trigger_reason = check_safety_trip(
-            data['max_temp'], data['amps'], data['voltage'],
-            max_safe_temp, max_safe_current, current_buffer, min_safe_voltage
-        )
+        # Sensor-integrity checks only apply once the bank can actually be driven.
+        # In IDLE a missing temperature link is a not-connected-yet condition, and
+        # latching a fault for it would make the rig impossible to bring up.
+        is_fault, trigger_reason = evaluate_safety(
+            data, limits, check_sensors=fsm_state in ("ARMED", "RUNNING"))
 
         if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
             fsm_state = "FAULT"
@@ -429,8 +523,9 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         current_max_temp = data['max_temp']
 
                         req_r = compute_target_resistance(
-                            voltage, req_power, max_safe_current, current_max_temp,
-                            derate_enabled, derate_start_temp, max_safe_temp
+                            voltage, req_power, limits['max_amps'], current_max_temp,
+                            limits['derate_en'], limits['derate_start'], limits['max_temp'],
+                            modules_in_series=pack.modules_in_series
                         )
 
                         target_res = req_r

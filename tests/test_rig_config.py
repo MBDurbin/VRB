@@ -54,6 +54,23 @@ class TestPackDerivation:
         assert math.isclose(s14.max_voltage, s12.max_voltage * 14 / 12)
         assert math.isclose(s14.max_current_a, s12.max_current_a)
 
+    def test_module_count_scales_battery_voltage_not_current(self):
+        # These describe the CAR's battery. The bench loads one module only --
+        # they are reference figures, not anything the bank sees.
+        p = PackConfig(modules_in_series=9)
+        assert p.battery_cell_count == 48 * 9
+        assert math.isclose(p.battery_max_voltage, p.max_voltage * 9)
+        assert math.isclose(p.battery_min_voltage, p.min_voltage * 9)
+        assert math.isclose(p.battery_resistance_ohm, p.resistance_ohm * 9)
+        assert math.isclose(p.battery_energy_wh, p.energy_wh * 9)
+        # Series modules share current, so the current limit is unchanged.
+        assert math.isclose(p.max_current_a, PackConfig(modules_in_series=1).max_current_a)
+
+    def test_single_module_battery_equals_module(self):
+        p = PackConfig(modules_in_series=1)
+        assert math.isclose(p.battery_max_voltage, p.max_voltage)
+        assert p.battery_cell_count == p.cell_count
+
     def test_internal_resistance_series_adds_parallel_divides(self):
         p = PackConfig(series_count=10, parallel_count=5, cell_dc_milliohm=20.0)
         # 20 mOhm / 5P = 4 mOhm per block, x10S = 40 mOhm
@@ -134,9 +151,31 @@ class TestLimitDerivation:
         assert limits.derate_start < limits.max_temp
 
     def test_command_dict_shape_matches_logic_process(self):
+        # evaluate_safety indexes these directly, so a missing key is a KeyError
+        # inside the safety-critical loop rather than a silently skipped check.
         keys = set(SafetyLimits().to_command_dict())
         assert keys == {'max_amps', 'amp_buffer', 'max_temp', 'min_volts',
+                        'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout',
                         'derate_en', 'derate_start'}
+
+    def test_per_cell_trip_derives_above_cell_cutoff(self):
+        pack = PackConfig()
+        limits = SafetyLimits().apply_pack_derivation(pack)
+        assert limits.min_cell_volts > pack.cell_min_voltage
+
+    def test_per_cell_trip_below_cutoff_is_flagged(self):
+        pack = PackConfig()
+        limits = SafetyLimits(derive_from_pack=False, min_cell_volts=2.0,
+                              amp_buffer=0.0, max_amps=180.0, max_temp=60.0,
+                              min_volts=36.0)
+        assert any("Per-cell trip" in w for w in limits.exceedances(pack))
+
+    def test_non_positive_stale_timeout_is_flagged(self):
+        pack = PackConfig()
+        limits = SafetyLimits(derive_from_pack=False, temp_stale_timeout_s=0.0,
+                              amp_buffer=0.0, max_amps=180.0, max_temp=60.0,
+                              min_volts=36.0, min_cell_volts=2.7)
+        assert any("staleness" in w for w in limits.exceedances(pack))
 
 
 # ================= EXCEEDANCE WARNINGS =================

@@ -15,6 +15,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from control_logic import (
     check_safety_trip,
+    check_cell_safety,
+    check_sensor_health,
+    evaluate_safety,
     coulomb_step,
     compute_lap_physics,
     compute_required_power,
@@ -126,6 +129,137 @@ class TestSafetyTrip:
                                               **self.LIMITS)
         assert is_fault is True
         assert reason == "OVERCURRENT"
+
+
+# ================= PER-CELL UNDERVOLTAGE =================
+
+def _limits(**overrides):
+    """Default limits dict matching SafetyLimits.to_command_dict()."""
+    base = {
+        'max_temp': 60.0, 'max_amps': 175.0, 'amp_buffer': 5.0,
+        'min_volts': 36.0, 'min_cell_volts': 2.70, 'cell_sense_floor': 0.50,
+        'temp_stale_timeout': 3.0, 'derate_en': False, 'derate_start': 55.0,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestCellSafety:
+    def test_healthy_cells_pass(self):
+        fault, reason = check_cell_safety([3.9] * 12, 2.70)
+        assert fault is False
+        assert reason is None
+
+    def test_one_weak_cell_trips_though_module_total_looks_fine(self):
+        # The gap this exists to close: 11 x 3.40 + 1.00 = 38.40 V, above a
+        # 36.0 V module trip, while one cell sits at 1.00 V and is destroyed.
+        cells = [3.40] * 11 + [1.00]
+        assert sum(cells) > 36.0
+        fault, reason = check_cell_safety(cells, 2.70)
+        assert fault is True
+        assert reason == "CELL UNDERVOLTAGE"
+
+    def test_trips_at_the_threshold(self):
+        fault, reason = check_cell_safety([3.9] * 11 + [2.70], 2.70)
+        assert fault is True
+        assert reason == "CELL UNDERVOLTAGE"
+
+    def test_just_above_threshold_passes(self):
+        fault, _ = check_cell_safety([3.9] * 11 + [2.71], 2.70)
+        assert fault is False
+
+    def test_implausibly_low_reading_is_a_sense_fault_not_undervoltage(self):
+        # A flat cell and an unplugged sense lead look identical; both must stop
+        # the run, but naming them apart tells the operator where to look.
+        fault, reason = check_cell_safety([3.9] * 11 + [0.0], 2.70)
+        assert fault is True
+        assert reason == "CELL SENSE FAULT"
+
+    def test_empty_cell_list_does_not_raise(self):
+        fault, reason = check_cell_safety([], 2.70)
+        assert fault is False
+        assert reason is None
+
+
+# ================= SENSOR HEALTH =================
+
+class TestSensorHealth:
+    def test_fresh_and_connected_passes(self):
+        fault, reason = check_sensor_health(0.2, True, 3.0)
+        assert fault is False
+        assert reason is None
+
+    def test_lost_link_trips(self):
+        fault, reason = check_sensor_health(0.0, False, 3.0)
+        assert fault is True
+        assert reason == "TEMP LINK LOST"
+
+    def test_stale_data_trips(self):
+        # Connected but silent: the DAQ keeps republishing its last array.
+        fault, reason = check_sensor_health(5.0, True, 3.0)
+        assert fault is True
+        assert reason == "TEMP DATA STALE"
+
+    def test_just_within_timeout_passes(self):
+        fault, _ = check_sensor_health(2.99, True, 3.0)
+        assert fault is False
+
+    def test_zero_timeout_disables_the_staleness_check(self):
+        fault, _ = check_sensor_health(999.0, True, 0.0)
+        assert fault is False
+
+
+# ================= COMPOSED SAFETY EVALUATION =================
+
+class TestEvaluateSafety:
+    def _packet(self, **overrides):
+        data = {
+            'max_temp': 30.0, 'amps': 50.0, 'voltage': 45.0,
+            'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1,
+            'hardware_status': {'temp_arduino': True},
+        }
+        data.update(overrides)
+        return data
+
+    def test_healthy_packet_passes(self):
+        fault, reason = evaluate_safety(self._packet(), _limits())
+        assert fault is False
+        assert reason is None
+
+    def test_frozen_temperature_no_longer_reads_as_healthy(self):
+        # Sensor died at 52 C. Reading is plausible and below the 60 C limit, so
+        # only the staleness check can catch it.
+        data = self._packet(max_temp=52.0, temp_age_s=30.0)
+        fault, reason = evaluate_safety(data, _limits())
+        assert fault is True
+        assert reason == "TEMP DATA STALE"
+
+    def test_weak_cell_caught_despite_healthy_module_total(self):
+        data = self._packet(voltage=38.4, cell_voltages=[3.40] * 11 + [1.00])
+        fault, reason = evaluate_safety(data, _limits())
+        assert fault is True
+        assert reason == "CELL UNDERVOLTAGE"
+
+    def test_measured_danger_outranks_sensor_fault(self):
+        # Over-current with a dead temperature link: the operator needs to hear
+        # about the current, not the sensor.
+        data = self._packet(amps=500.0, temp_age_s=99.0,
+                            hardware_status={'temp_arduino': False})
+        fault, reason = evaluate_safety(data, _limits())
+        assert fault is True
+        assert reason == "OVERCURRENT"
+
+    def test_sensor_checks_can_be_skipped(self):
+        # In IDLE a missing temperature link is not-connected-yet, not a fault.
+        data = self._packet(hardware_status={'temp_arduino': False})
+        assert evaluate_safety(data, _limits(), check_sensors=False)[0] is False
+        assert evaluate_safety(data, _limits(), check_sensors=True)[0] is True
+
+    def test_missing_keys_fall_back_to_safe_defaults(self):
+        # A malformed packet must not raise inside the safety loop.
+        fault, reason = evaluate_safety({}, _limits())
+        assert fault is True          # 0.0 V reads as undervoltage
+        assert reason == "UNDERVOLTAGE"
 
 
 # ================= FSM TRANSITION GUARDS =================
@@ -272,6 +406,98 @@ class TestResistanceTargeting:
                                             current_max_temp=70.0, derate_enabled=True,
                                             derate_start_temp=65.0, max_safe_temp=60.0)
         assert math.isclose(req_r2, 48.0, rel_tol=1e-6)
+
+
+# ================= MULTI-MODULE BATTERY =================
+
+class TestModulesInSeries:
+    """The bench loads ONE module; req_power is the whole car's demand.
+
+    Matching the module's real duty means matching its current, so
+    R = N * V_module^2 / P_car. The bank sees only the module's ~50 V, so both
+    current clamps divide the module voltage, not the battery voltage.
+    """
+
+    def test_power_term_scales_linearly_with_module_count(self):
+        # N, not N^2: a bank across one module needs 1/N the resistance of one
+        # across the whole battery to pull the same current.
+        # 5 kW keeps BOTH results clear of the clamp and the MAX_RESISTANCE cap;
+        # at higher power the single-module case clamps and this would compare
+        # two clamp values rather than the power term.
+        one = compute_target_resistance(50.0, 5_000.0, 180.0, 25.0, False, 55.0, 60.0,
+                                        modules_in_series=1)
+        nine = compute_target_resistance(50.0, 5_000.0, 180.0, 25.0, False, 55.0, 60.0,
+                                         modules_in_series=9)
+        assert one > 50.0 / 180.0        # clamp not binding
+        assert nine < MAX_RESISTANCE     # cap not binding
+        assert math.isclose(nine / one, 9.0, rel_tol=1e-9)
+
+    def test_module_current_matches_what_the_car_would_draw(self):
+        # The whole point of the rig: the module under test must see the same
+        # current it would carry in the car.
+        modules, v_module, p_car = 9, 50.0, 40_000.0
+        v_battery = v_module * modules
+        i_car = p_car / v_battery
+
+        r = compute_target_resistance(v_module, p_car, 180.0, 25.0, False, 55.0, 60.0,
+                                      modules_in_series=modules)
+        assert math.isclose(v_module / r, i_car, rel_tol=1e-9)
+
+    def test_module_dissipates_its_share_of_car_power(self):
+        modules, v_module, p_car = 9, 50.0, 45_000.0
+        r = compute_target_resistance(v_module, p_car, 180.0, 25.0, False, 55.0, 60.0,
+                                      modules_in_series=modules)
+        assert math.isclose((v_module ** 2) / r, p_car / modules, rel_tol=1e-9)
+
+    def test_peak_car_power_lands_near_the_ladder_minimum(self):
+        # The bank is a binary ladder 0.25..32 ohm. An ~81 kW lap demand should
+        # ask for roughly its smallest step at the 180 A limit -- the rig is
+        # sized for that, and a formula that misses it by a factor of N would put
+        # peak demand nowhere near the hardware's range.
+        r = compute_target_resistance(50.0, 81_000.0, 180.0, 25.0, False, 55.0, 60.0,
+                                      modules_in_series=9)
+        assert 0.25 <= r <= 0.35
+        assert math.isclose(50.0 / r, 180.0, rel_tol=0.02)
+
+    def test_current_clamp_uses_module_voltage(self):
+        # Only the module's voltage is across the bank, so the floor is V_mod/I.
+        r = compute_target_resistance(50.0, 1e12, 180.0, 25.0, False, 55.0, 60.0,
+                                      modules_in_series=9)
+        assert math.isclose(r, 50.0 / 180.0, rel_tol=1e-9)
+        assert math.isclose(50.0 / r, 180.0, rel_tol=1e-9)
+
+    def test_clamp_is_independent_of_module_count(self):
+        # Series modules share one current, so the limit does not scale with N.
+        floors = {compute_target_resistance(50.0, 1e12, 180.0, 25.0, False, 55.0, 60.0,
+                                            modules_in_series=n)
+                  for n in (1, 4, 9, 20)}
+        assert len(floors) == 1
+
+    def test_derate_clamp_also_uses_module_voltage(self):
+        # At full derate the active limit floors at 1 A, so R = V_module / 1.
+        r = compute_target_resistance(50.0, 1e12, 180.0, 60.0, True, 55.0, 60.0,
+                                      modules_in_series=9)
+        assert math.isclose(r, min(MAX_RESISTANCE, 50.0), rel_tol=1e-9)
+
+    def test_defaults_to_single_module(self):
+        explicit = compute_target_resistance(50.0, 20_000.0, 180.0, 25.0, False, 55.0, 60.0,
+                                             modules_in_series=1)
+        implicit = compute_target_resistance(50.0, 20_000.0, 180.0, 25.0, False, 55.0, 60.0)
+        assert math.isclose(explicit, implicit, rel_tol=1e-12)
+
+    def test_zero_or_negative_module_count_treated_as_one(self):
+        baseline = compute_target_resistance(50.0, 20_000.0, 180.0, 25.0, False, 55.0, 60.0,
+                                             modules_in_series=1)
+        for bad in (0, -3):
+            assert math.isclose(
+                compute_target_resistance(50.0, 20_000.0, 180.0, 25.0, False, 55.0, 60.0,
+                                          modules_in_series=bad),
+                baseline, rel_tol=1e-12)
+
+    def test_still_never_exceeds_bank_maximum(self):
+        r = compute_target_resistance(50.0, 0.001, 180.0, 25.0, False, 55.0, 60.0,
+                                      modules_in_series=9)
+        assert r <= MAX_RESISTANCE
 
 
 # ================= REQUIRED POWER =================

@@ -16,6 +16,7 @@
     "cell_model": "Molicel INR-21700-P45B",
     "series_count": 12,
     "parallel_count": 4,
+    "modules_in_series": 9,
     "cell_capacity_ah": 4.5,
     "cell_capacity_min_ah": 4.3,
     "cell_max_continuous_a": 45.0,
@@ -33,6 +34,9 @@
     "max_temp": 60.0,
     "min_volts": 36.0,
     "warn_volts": 38.0,
+    "min_cell_volts": 2.7,
+    "cell_sense_floor": 0.5,
+    "temp_stale_timeout_s": 3.0,
     "derate_enabled": false,
     "derate_start": 55.0
   },

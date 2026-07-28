@@ -480,6 +480,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.lim_c_crit = self.config.limits.max_amps
         self.lim_c_buffer = self.config.limits.amp_buffer
         self.lim_t_crit = self.config.limits.max_temp
+        self.lim_cell_min = self.config.limits.min_cell_volts
 
         # Derate Variables
         self.derate_enabled = self.config.limits.derate_enabled
@@ -737,8 +738,15 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.sb_c_crit = self.create_sidebar_spinbox(self.lim_c_crit, 0.0, 2000.0)
         self.sb_c_buffer = self.create_sidebar_spinbox(self.lim_c_buffer, 0.0, 100.0)
 
+        self.sb_cell_min = self.create_sidebar_spinbox(self.lim_cell_min, 0.0, 10.0)
+        self.sb_cell_min.setDecimals(2)
+        self.sb_cell_min.setSingleStep(0.05)
+        self.sb_cell_min.setToolTip(
+            "Per-cell undervoltage trip. A module-total trip cannot see one weak "
+            "cell: 11 cells at 3.40 V plus one at 1.00 V still totals 38.4 V.")
+
         self.sb_v_warn.setToolTip("Display-only line on the voltage plot. Does not trip a fault.")
-        self.sb_v_crit.setToolTip("Undervoltage trip point. Keep above the pack's absolute cutoff "
+        self.sb_v_crit.setToolTip("Module-total undervoltage trip. Keep above the absolute cutoff "
                                   "to leave room for IR sag under load.")
         self.sb_c_crit.setToolTip("Continuous operating limit. The E-STOP fires at this plus the buffer.")
         self.sb_c_buffer.setToolTip("Headroom above the operating limit before the over-current trip fires.")
@@ -752,7 +760,8 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.sb_t_crit = self.create_sidebar_spinbox(self.lim_t_crit, 0.0, 200.0)
 
         form_layout.addRow(self._field_label("V warn", "display only"), self.sb_v_warn)
-        form_layout.addRow(self._field_label("V crit", "trip"), self.sb_v_crit)
+        form_layout.addRow(self._field_label("V crit", "module trip"), self.sb_v_crit)
+        form_layout.addRow(self._field_label("Cell min", "per-cell trip"), self.sb_cell_min)
         form_layout.addRow(self._field_label("Max current", "A"), self.sb_c_crit)
         form_layout.addRow(self._field_label("E-stop buffer", "A"), self.sb_c_buffer)
         form_layout.addRow(self._field_label("Derate start", "°C"), self.sb_t_derate)
@@ -764,6 +773,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         self.sb_v_warn.valueChanged.connect(self.handle_limit_change)
         self.sb_v_crit.valueChanged.connect(self.handle_limit_change)
+        self.sb_cell_min.valueChanged.connect(self.handle_limit_change)
         self.sb_c_crit.valueChanged.connect(self.handle_limit_change)
         self.sb_c_buffer.valueChanged.connect(self.handle_limit_change)
         self.sb_t_crit.valueChanged.connect(self.handle_limit_change)
@@ -899,6 +909,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         pairs = [
             (self.sb_v_warn, limits.warn_volts),
             (self.sb_v_crit, limits.min_volts),
+            (self.sb_cell_min, limits.min_cell_volts),
             (self.sb_c_crit, limits.max_amps),
             (self.sb_c_buffer, limits.amp_buffer),
             (self.sb_t_crit, limits.max_temp),
@@ -915,6 +926,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         self.lim_v_warn = limits.warn_volts
         self.lim_v_crit = limits.min_volts
+        self.lim_cell_min = limits.min_cell_volts
         self.lim_c_crit = limits.max_amps
         self.lim_c_buffer = limits.amp_buffer
         self.lim_t_crit = limits.max_temp
@@ -928,6 +940,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
     def handle_limit_change(self):
         self.lim_v_warn = self.sb_v_warn.value()
         self.lim_v_crit = self.sb_v_crit.value()
+        self.lim_cell_min = self.sb_cell_min.value()
         self.lim_c_crit = self.sb_c_crit.value()
         self.lim_c_buffer = self.sb_c_buffer.value()
         self.lim_t_crit = self.sb_t_crit.value()
@@ -945,6 +958,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         limits.derive_from_pack = False
         limits.warn_volts = self.lim_v_warn
         limits.min_volts = self.lim_v_crit
+        limits.min_cell_volts = self.lim_cell_min
         limits.max_amps = self.lim_c_crit
         limits.amp_buffer = self.lim_c_buffer
         limits.max_temp = self.lim_t_crit

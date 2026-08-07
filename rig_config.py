@@ -39,15 +39,15 @@ class VehicleParams:
     """
 
     # --- Mass ---
-    mass_car_kg: float = 260.0
-    mass_driver_kg: float = 70.0
+    mass_car_kg: float = 260.0 #kg
+    mass_driver_kg: float = 70.0 #kg
 
     # Rotational inertia of wheels, brake rotors, axles and drivetrain, modelled
     # as extra "virtual" mass. Applies to acceleration ONLY: spinning components
     # resist changes in speed but do not press the tyres into the track, so this
     # must not feed the normal force behind rolling resistance.
     # Typical 1.04-1.10 for an open-wheel/student formula car.
-    rotational_mass_factor: float = 1.05
+    rotational_mass_factor: float = 1.00 # should be =>1
 
     # --- Environment ---
     air_density_kgm3: float = 1.2255  # ISA sea level, 15 C
@@ -67,7 +67,7 @@ class VehicleParams:
     # --- Drivetrain ---
     # Mechanical efficiency between motor shaft and contact patch (chain, gears,
     # bearings). ~0.95 for a well-maintained chain drive.
-    drivetrain_efficiency: float = 0.95
+    drivetrain_efficiency: float = 0.95 #assumed but should be measured
 
     @property
     def total_mass_kg(self) -> float:
@@ -245,6 +245,7 @@ DEFAULT_VOLTAGE_CHANNELS = [
 
 @dataclass
 class DaqConfig:
+    #NOTE: NEED TO VERIFY WHEN BACK IN UTAH
     """NI-DAQ channel mapping, scaling, and temperature bus layout.
 
     Channel names and sensor counts describe physical wiring, so they cannot be
@@ -270,7 +271,7 @@ class DaqConfig:
     # --- Analog input range ---
     ai_min_volts: float = -10.0
     ai_max_volts: float = 10.0
-
+    #NOTE THIS WILL NEED EDITING WHEN WE ADD THE RESISTOR TEMPS AND INBETWEEN TEMPS
     # --- Temperature sensor layout ---
     # DS18B20s on OneWire buses. The Arduino emits one CSV line per bus:
     # "<bus number>,<t1>,...,<tN>", so a line carries sensors_per_bus + 1 fields.

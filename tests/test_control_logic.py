@@ -610,8 +610,15 @@ class TestVehicleParams:
     def test_defaults_match_documented_vehicle(self):
         p = VehicleParams()
         assert p.total_mass_kg == 330.0
-        assert p.rotational_mass_factor == 1.05
-        assert p.drivetrain_efficiency == 0.95
+        assert 0.0 < p.drivetrain_efficiency <= 1.0
+
+    def test_rotational_mass_factor_never_below_one(self):
+        # Physical invariant, not a pinned value: spinning wheels, rotors and
+        # drivetrain can only ADD effective mass under acceleration. Below 1.0
+        # they would make the car easier to accelerate, which is nonsense.
+        # The shipped default sits at exactly 1.0 -- the effect is deliberately
+        # switched off until the real rotational inertia is measured.
+        assert VehicleParams().rotational_mass_factor >= 1.0
 
     def test_drag_coefficient_is_tunable(self):
         slippery = VehicleParams(drag_coefficient=0.3)

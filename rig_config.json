@@ -2,7 +2,7 @@
   "vehicle": {
     "mass_car_kg": 260.0,
     "mass_driver_kg": 70.0,
-    "rotational_mass_factor": 1.05,
+    "rotational_mass_factor": 1.00,
     "air_density_kgm3": 1.2255,
     "gravity_ms2": 9.81,
     "drag_coefficient": 0.6,

@@ -2,7 +2,7 @@
   "vehicle": {
     "mass_car_kg": 260.0,
     "mass_driver_kg": 70.0,
-    "rotational_mass_factor": 1.00,
+    "rotational_mass_factor": 1.0,
     "air_density_kgm3": 1.2255,
     "gravity_ms2": 9.81,
     "drag_coefficient": 0.6,
@@ -37,6 +37,7 @@
     "min_cell_volts": 2.7,
     "cell_sense_floor": 0.5,
     "temp_stale_timeout_s": 3.0,
+    "daq_stale_timeout_s": 1.0,
     "derate_enabled": false,
     "derate_start": 55.0
   },

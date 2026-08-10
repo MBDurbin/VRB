@@ -374,6 +374,12 @@ class SafetyLimits:
     # fire while the cells keep heating.
     temp_stale_timeout_s: float = 3.0
 
+    # Whole-packet staleness. The logic loop keeps running on the last packet
+    # when the DAQ stops feeding it, so every other check would otherwise be
+    # evaluating frozen values that still look plausible. The DAQ samples at
+    # 10 Hz, so 1 s is roughly ten missed cycles.
+    daq_stale_timeout_s: float = 1.0
+
     derate_enabled: bool = False
     derate_start: float = 55.0
 
@@ -480,6 +486,7 @@ class SafetyLimits:
             'min_cell_volts': self.min_cell_volts,
             'cell_sense_floor': self.cell_sense_floor,
             'temp_stale_timeout': self.temp_stale_timeout_s,
+            'daq_stale_timeout': self.daq_stale_timeout_s,
             'derate_en': self.derate_enabled,
             'derate_start': self.derate_start,
         }

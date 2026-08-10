@@ -50,6 +50,10 @@ plant-model window and the main telemetry GUI appear.
 | B9 | RESET, ARM, then tick **Simulate hardware interlock fault** | `FAULT` logging `TEMP LINK LOST` — losing thermal monitoring while armed is itself a fault |
 | B10 | Untick the fault, RESET, stay in `IDLE`, tick it again | **No** fault — sensor checks apply only in ARMED/RUNNING, so the rig can still be brought up |
 | B11 | RESET, ARM, then set OCV so one cell would read below **Cell min** (2.70 V) | `FAULT` logging `CELL UNDERVOLTAGE` |
+| B12 | Start the app with **no battery connected** (0.0 V), leave it in `IDLE` | **No** fault. Voltage checks apply only once armed, so software bring-up is possible without a pack |
+| B13 | From B12, press **ARM** | `FAULT` — arming on a 0.0 V reading must not be silently permitted |
+| B14 | ARM+RUN, then close the SIL window so the plant stops feeding | `FAULT` logging `DAQ DATA STALE` within ~1 s, and the GUI keeps updating rather than freezing |
+| B15 | Repeat B14 but press **E-STOP** while the plant is stopped | E-STOP is still processed — the logic loop no longer skips its body on an empty queue |
 
 **Not reachable from the SIL sliders** — the plant model generates uniform cells
 and always-fresh timestamps, so these need either a unit test or real hardware:

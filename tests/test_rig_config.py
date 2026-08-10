@@ -156,7 +156,7 @@ class TestLimitDerivation:
         keys = set(SafetyLimits().to_command_dict())
         assert keys == {'max_amps', 'amp_buffer', 'max_temp', 'min_volts',
                         'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout',
-                        'derate_en', 'derate_start'}
+                        'daq_stale_timeout', 'derate_en', 'derate_start'}
 
     def test_per_cell_trip_derives_above_cell_cutoff(self):
         pack = PackConfig()

@@ -14,10 +14,14 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from control_logic import (
-    check_safety_trip,
+    check_thermal_and_current,
     check_cell_safety,
     check_sensor_health,
+    check_daq_health,
     evaluate_safety,
+    lap_row_interval,
+    load_lap_profile,
+    NEUTRAL_PACKET,
     coulomb_step,
     compute_lap_physics,
     compute_required_power,
@@ -31,104 +35,83 @@ from control_logic import (
 )
 
 
-# ================= SAFETY TRIP =================
+# ================= THERMAL & CURRENT TRIPS =================
 
-class TestSafetyTrip:
-    """Thresholds here mirror the Molicel INR-21700-P45B v1.2 datasheet for 12S4P:
-    180 A continuous (45 A/cell x 4P), 60 C discharge ceiling, 36.0 V undervoltage
-    trip (3.0 V/cell, above the 30.0 V absolute cutoff).
+class TestThermalAndCurrentTrips:
+    """The two trips that apply in every FSM state, armed or not.
+
+    Thresholds mirror the Molicel INR-21700-P45B v1.2 datasheet for 12S4P:
+    180 A continuous (45 A/cell x 4P) and a 60 C discharge ceiling.
     """
 
-    LIMITS = dict(max_safe_temp=60.0, max_safe_current=180.0,
-                  current_buffer=5.0, min_safe_voltage=36.0)
+    LIMITS = dict(max_safe_temp=60.0, max_safe_current=180.0, current_buffer=5.0)
 
     def test_nominal_no_trip(self):
-        is_fault, reason = check_safety_trip(max_temp=40.0, amps=100.0, voltage=48.0,
-                                              **self.LIMITS)
-        assert is_fault is False
-        assert reason is None
+        assert check_thermal_and_current(40.0, 100.0, **self.LIMITS) == (False, None)
 
     def test_just_under_temp_threshold_no_trip(self):
-        is_fault, _ = check_safety_trip(max_temp=59.99, amps=0.0, voltage=48.0,
-                                         **self.LIMITS)
-        assert is_fault is False
+        assert check_thermal_and_current(59.99, 0.0, **self.LIMITS)[0] is False
 
     def test_at_temp_threshold_trips(self):
-        is_fault, reason = check_safety_trip(max_temp=60.0, amps=0.0, voltage=48.0,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "OVERTEMP"
+        assert check_thermal_and_current(60.0, 0.0, **self.LIMITS) == (True, "OVERTEMP")
 
     def test_over_temp_threshold_trips(self):
-        is_fault, reason = check_safety_trip(max_temp=70.0, amps=0.0, voltage=48.0,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "OVERTEMP"
+        assert check_thermal_and_current(70.0, 0.0, **self.LIMITS) == (True, "OVERTEMP")
 
     def test_current_within_buffer_no_trip(self):
         # max=180, buffer=5 -> trips at 185
-        is_fault, _ = check_safety_trip(max_temp=0.0, amps=184.99, voltage=48.0,
-                                         **self.LIMITS)
-        assert is_fault is False
+        assert check_thermal_and_current(0.0, 184.99, **self.LIMITS)[0] is False
 
     def test_current_at_buffered_limit_trips(self):
-        is_fault, reason = check_safety_trip(max_temp=0.0, amps=185.0, voltage=48.0,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "OVERCURRENT"
+        assert check_thermal_and_current(0.0, 185.0, **self.LIMITS) == (True, "OVERCURRENT")
 
     def test_datasheet_continuous_rating_is_not_exceeded_silently(self):
         # 4P x 45 A/cell = 180 A. Anything at or past limit+buffer must fault.
-        is_fault, reason = check_safety_trip(max_temp=25.0, amps=187.0, voltage=48.0,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "OVERCURRENT"
-
-    # --- Undervoltage (2.5 V/cell = 30.0 V absolute cutoff for 12S) ---
-
-    def test_nominal_voltage_no_trip(self):
-        is_fault, _ = check_safety_trip(max_temp=25.0, amps=50.0, voltage=43.2,
-                                         **self.LIMITS)
-        assert is_fault is False
-
-    def test_just_above_undervoltage_no_trip(self):
-        is_fault, _ = check_safety_trip(max_temp=25.0, amps=50.0, voltage=36.01,
-                                         **self.LIMITS)
-        assert is_fault is False
-
-    def test_at_undervoltage_threshold_trips(self):
-        is_fault, reason = check_safety_trip(max_temp=25.0, amps=50.0, voltage=36.0,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "UNDERVOLTAGE"
-
-    def test_sagged_below_cell_cutoff_trips(self):
-        # 45 mohm pack IR at 187 A sags 8.4 V; a 3.2 V/cell pack lands at 2.499 V/cell.
-        is_fault, reason = check_safety_trip(max_temp=25.0, amps=100.0, voltage=29.99,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "UNDERVOLTAGE"
-
-    def test_zero_voltage_reading_faults_rather_than_running(self):
-        # Lost/failed voltage sensing must fail safe, not be treated as healthy.
-        is_fault, reason = check_safety_trip(max_temp=25.0, amps=0.0, voltage=0.0,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "UNDERVOLTAGE"
-
-    # --- Priority ordering ---
+        assert check_thermal_and_current(25.0, 187.0, **self.LIMITS) == (True, "OVERCURRENT")
 
     def test_temp_outranks_current(self):
-        is_fault, reason = check_safety_trip(max_temp=100.0, amps=300.0, voltage=48.0,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "OVERTEMP"
+        assert check_thermal_and_current(100.0, 300.0, **self.LIMITS) == (True, "OVERTEMP")
+
+
+# ================= MODULE UNDERVOLTAGE =================
+
+class TestModuleUndervoltage:
+    """Undervoltage applies only once armed -- see evaluate_safety's docstring.
+
+    36.0 V trip is 3.0 V/cell for 12S, above the 30.0 V absolute cutoff so there
+    is room for IR sag under load.
+    """
+
+    def _packet(self, **kw):
+        d = {'max_temp': 25.0, 'amps': 50.0, 'voltage': 43.2,
+             'cell_voltages': [3.60] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
+             'hardware_status': {'temp_arduino': True}}
+        d.update(kw)
+        return d
+
+    def test_nominal_voltage_no_trip(self):
+        assert evaluate_safety(self._packet(), _limits())[0] is False
+
+    def test_just_above_threshold_no_trip(self):
+        assert evaluate_safety(self._packet(voltage=36.01), _limits())[0] is False
+
+    def test_at_threshold_trips(self):
+        assert evaluate_safety(self._packet(voltage=36.0), _limits()) == (True, "UNDERVOLTAGE")
+
+    def test_sagged_below_cell_cutoff_trips(self):
+        # 45 mohm module IR at 187 A sags 8.4 V; a 3.2 V/cell pack lands at
+        # 2.499 V/cell, through the absolute cutoff.
+        assert evaluate_safety(self._packet(voltage=29.99, amps=100.0),
+                               _limits()) == (True, "UNDERVOLTAGE")
+
+    def test_zero_voltage_reading_faults_rather_than_running(self):
+        # Lost or failed voltage sensing must fail safe once armed.
+        assert evaluate_safety(self._packet(voltage=0.0, amps=0.0),
+                               _limits(), armed=True)[0] is True
 
     def test_current_outranks_undervoltage(self):
-        is_fault, reason = check_safety_trip(max_temp=25.0, amps=300.0, voltage=20.0,
-                                              **self.LIMITS)
-        assert is_fault is True
-        assert reason == "OVERCURRENT"
+        assert evaluate_safety(self._packet(voltage=20.0, amps=300.0),
+                               _limits()) == (True, "OVERCURRENT")
 
 
 # ================= PER-CELL UNDERVOLTAGE =================
@@ -138,7 +121,8 @@ def _limits(**overrides):
     base = {
         'max_temp': 60.0, 'max_amps': 175.0, 'amp_buffer': 5.0,
         'min_volts': 36.0, 'min_cell_volts': 2.70, 'cell_sense_floor': 0.50,
-        'temp_stale_timeout': 3.0, 'derate_en': False, 'derate_start': 55.0,
+        'temp_stale_timeout': 3.0, 'daq_stale_timeout': 1.0,
+        'derate_en': False, 'derate_start': 55.0,
     }
     base.update(overrides)
     return base
@@ -175,10 +159,105 @@ class TestCellSafety:
         assert fault is True
         assert reason == "CELL SENSE FAULT"
 
-    def test_empty_cell_list_does_not_raise(self):
+    def test_empty_cell_list_fails_closed(self):
+        # No per-cell data at all -- broken harness, empty channel list, parse
+        # failure. Returning "safe" here would run a high-power profile blind to
+        # the very thing this check exists for.
         fault, reason = check_cell_safety([], 2.70)
-        assert fault is False
-        assert reason is None
+        assert fault is True
+        assert reason == "NO CELL DATA"
+
+
+# ================= LAP PROFILE PLAYBACK =================
+
+class TestLapRowInterval:
+    """Playback must follow the profile's own timestamps, not a fixed second."""
+
+    def _profile(self, dt, n=5):
+        return [{'Time (s)': i * dt, 'Speed (mph)': 30.0} for i in range(n)]
+
+    def test_one_hz_profile(self):
+        assert math.isclose(lap_row_interval(self._profile(1.0), 0), 1.0)
+
+    def test_ten_hz_profile(self):
+        # The case the old fixed 1.0 s playback got wrong: ten times too slow,
+        # and each power demand held ten times too long.
+        assert math.isclose(lap_row_interval(self._profile(0.1), 0), 0.1)
+
+    def test_irregular_sampling_is_followed_per_row(self):
+        rows = [{'Time (s)': 0.0}, {'Time (s)': 0.5}, {'Time (s)': 2.5}]
+        assert math.isclose(lap_row_interval(rows, 0), 0.5)
+        assert math.isclose(lap_row_interval(rows, 1), 2.0)
+
+    def test_last_row_falls_back_to_default(self):
+        assert math.isclose(lap_row_interval(self._profile(0.25), 4), 1.0)
+
+    def test_missing_or_bad_timestamps_fall_back(self):
+        assert math.isclose(lap_row_interval([{'Speed (mph)': 10}, {'Speed (mph)': 12}], 0), 1.0)
+        assert math.isclose(lap_row_interval([{'Time (s)': 'x'}, {'Time (s)': 'y'}], 0), 1.0)
+
+    def test_non_monotonic_timestamps_fall_back(self):
+        # A backwards or duplicated stamp must not produce a zero/negative dwell
+        # that would spin the playback loop.
+        assert math.isclose(lap_row_interval([{'Time (s)': 5.0}, {'Time (s)': 5.0}], 0), 1.0)
+        assert math.isclose(lap_row_interval([{'Time (s)': 5.0}, {'Time (s)': 1.0}], 0), 1.0)
+
+    def test_nan_timestamps_fall_back(self):
+        rows = [{'Time (s)': 0.0}, {'Time (s)': float('nan')}]
+        assert math.isclose(lap_row_interval(rows, 0), 1.0)
+
+    def test_empty_profile_does_not_raise(self):
+        assert math.isclose(lap_row_interval([], 0), 1.0)
+
+
+class TestLoadLapProfile:
+    def test_drops_trailing_blank_rows(self, tmp_path):
+        # Exported telemetry commonly has trailing blanks -- the shipped profile
+        # has seven. Left in, they yield NaN power, and NaN loses every
+        # comparison in compute_target_resistance() so the bank quietly sits at
+        # minimum load for the tail of every lap.
+        csv = tmp_path / "lap.csv"
+        csv.write_text("Time (s),Speed (mph)\n0,0\n1,19\n2,24\n,\n,\n")
+        rows, dropped = load_lap_profile(str(csv))
+        assert len(rows) == 3
+        assert dropped == 2
+
+    def test_keeps_a_clean_profile_intact(self, tmp_path):
+        csv = tmp_path / "lap.csv"
+        csv.write_text("Time (s),Speed (mph)\n0,0\n1,19\n2,24\n")
+        rows, dropped = load_lap_profile(str(csv))
+        assert len(rows) == 3
+        assert dropped == 0
+
+    def test_shipped_profile_has_no_unusable_rows_after_load(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "FSAE - ETS - Speed and Time 1 Lap.csv")
+        rows, dropped = load_lap_profile(path)
+        assert dropped > 0, "shipped profile is known to carry trailing blanks"
+        for row in rows:
+            assert math.isfinite(float(row['Speed (mph)']))
+            assert math.isfinite(float(row['Time (s)']))
+
+
+# ================= DAQ HEALTH =================
+
+class TestDaqHealth:
+    def test_fresh_packet_passes(self):
+        assert check_daq_health(0.05, 1.0) == (False, None)
+
+    def test_stale_packet_trips(self):
+        assert check_daq_health(5.0, 1.0) == (True, "DAQ DATA STALE")
+
+    def test_zero_timeout_disables_the_check(self):
+        assert check_daq_health(999.0, 0.0) == (False, None)
+
+    def test_neutral_packet_reads_as_no_data_not_healthy(self):
+        # Used before the first DAQ packet arrives. It must not look like a
+        # healthy pack, or the FSM could be driven on a packet that never was.
+        p = NEUTRAL_PACKET()
+        assert p['voltage'] == 0.0
+        assert p['cell_voltages'] == []
+        assert evaluate_safety(p, _limits(), armed=True)[0] is True
 
 
 # ================= SENSOR HEALTH =================
@@ -215,7 +294,7 @@ class TestEvaluateSafety:
     def _packet(self, **overrides):
         data = {
             'max_temp': 30.0, 'amps': 50.0, 'voltage': 45.0,
-            'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1,
+            'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
             'hardware_status': {'temp_arduino': True},
         }
         data.update(overrides)
@@ -249,11 +328,40 @@ class TestEvaluateSafety:
         assert fault is True
         assert reason == "OVERCURRENT"
 
-    def test_sensor_checks_can_be_skipped(self):
+    def test_unarmed_skips_data_integrity_checks(self):
         # In IDLE a missing temperature link is not-connected-yet, not a fault.
         data = self._packet(hardware_status={'temp_arduino': False})
-        assert evaluate_safety(data, _limits(), check_sensors=False)[0] is False
-        assert evaluate_safety(data, _limits(), check_sensors=True)[0] is True
+        assert evaluate_safety(data, _limits(), armed=False)[0] is False
+        assert evaluate_safety(data, _limits(), armed=True)[0] is True
+
+    def test_unpowered_rig_does_not_lock_out_of_idle(self):
+        # Boot the software before plugging the battery in and the DAQ reports
+        # 0.0 V. Tripping on that in IDLE latched a FAULT that RESET could not
+        # clear -- back to IDLE, instantly re-trips -- locking out bring-up.
+        cold = self._packet(voltage=0.0, cell_voltages=[], max_temp=0.0, amps=0.0,
+                            temp_age_s=float('inf'),
+                            hardware_status={'temp_arduino': False})
+        assert evaluate_safety(cold, _limits(), armed=False)[0] is False
+        # ...but arming on that same reading must not be silently permitted.
+        assert evaluate_safety(cold, _limits(), armed=True)[0] is True
+
+    def test_overtemp_and_overcurrent_apply_even_unarmed(self):
+        # Current flowing or cells hot while not armed means something is wrong
+        # regardless of what the FSM believes.
+        assert evaluate_safety(self._packet(max_temp=99.0), _limits(), armed=False) \
+            == (True, "OVERTEMP")
+        assert evaluate_safety(self._packet(amps=500.0), _limits(), armed=False) \
+            == (True, "OVERCURRENT")
+
+    def test_stale_daq_packet_trips(self):
+        # The loop carries the last packet forward when the queue is empty, so
+        # every reading below still looks plausible. Only the age gives it away.
+        data = self._packet(daq_age_s=5.0)
+        assert evaluate_safety(data, _limits()) == (True, "DAQ DATA STALE")
+
+    def test_missing_cell_data_trips_once_armed(self):
+        data = self._packet(cell_voltages=[])
+        assert evaluate_safety(data, _limits(), armed=True) == (True, "NO CELL DATA")
 
     def test_missing_keys_fall_back_to_safe_defaults(self):
         # A malformed packet must not raise inside the safety loop.
@@ -343,6 +451,102 @@ class TestLapPhysics:
                                                       is_first_row=True, row_idx=3)
         assert velocity_ms == 0.0
         assert t == 3.0  # falls back to row_idx
+
+
+# ================= LAP BOUNDARY =================
+
+class TestLapTransition:
+    """Row 0 of lap 2+ is a continuation, not a standing start.
+
+    Two faults used to collide here. Treating any row_idx == 0 as the first row
+    forced dv to zero, discarding the car's carried velocity. And because the
+    profile's clock restarts each lap, the raw timestamp difference is large and
+    negative, which the non-positive guard silently replaced with 1.0 s.
+    """
+
+    # 20 -> 45 mph across the start/finish line, sampled at 10 Hz.
+    ENTRY_V = 20.0 * 0.44704
+    ROW = {"Speed (mph)": 45.0, "Time (s)": 0.0}
+    LAP_END_T = 60.0
+
+    def test_carried_velocity_is_not_discarded(self):
+        _, accel, _ = compute_lap_physics(
+            self.ROW, prev_velocity_ms=self.ENTRY_V, prev_time_s=self.LAP_END_T,
+            is_first_row=False, row_idx=0, lap_wrap_dt=0.1)
+        assert accel > 0.0
+
+    def test_acceleration_uses_the_supplied_wrap_interval(self):
+        _, accel, _ = compute_lap_physics(
+            self.ROW, prev_velocity_ms=self.ENTRY_V, prev_time_s=self.LAP_END_T,
+            is_first_row=False, row_idx=0, lap_wrap_dt=0.1)
+        expected_dv = (45.0 * 0.44704) - self.ENTRY_V
+        assert math.isclose(accel, expected_dv / 0.1, rel_tol=1e-9)
+
+    def test_wrap_interval_scales_with_the_profile_rate(self):
+        # A 1 Hz profile must not be handed a 10 Hz interval, and vice versa --
+        # the whole reason this is derived rather than a literal.
+        args = dict(prev_velocity_ms=self.ENTRY_V, prev_time_s=self.LAP_END_T,
+                    is_first_row=False, row_idx=0)
+        _, fast, _ = compute_lap_physics(self.ROW, lap_wrap_dt=0.1, **args)
+        _, slow, _ = compute_lap_physics(self.ROW, lap_wrap_dt=1.0, **args)
+        assert math.isclose(fast / slow, 10.0, rel_tol=1e-9)
+
+    def test_without_the_wrap_interval_the_clock_reset_corrupts_dt(self):
+        # Documents what the fix prevents: the raw difference is -60 s, the
+        # guard substitutes 1.0 s, and the result is a real velocity change
+        # divided by a fabricated interval.
+        _, accel, _ = compute_lap_physics(
+            self.ROW, prev_velocity_ms=self.ENTRY_V, prev_time_s=self.LAP_END_T,
+            is_first_row=False, row_idx=0, lap_wrap_dt=None)
+        expected_dv = (45.0 * 0.44704) - self.ENTRY_V
+        assert math.isclose(accel, expected_dv / 1.0, rel_tol=1e-9)
+        # ...which is ten times gentler than the truth at a 10 Hz log rate.
+        _, correct, _ = compute_lap_physics(
+            self.ROW, prev_velocity_ms=self.ENTRY_V, prev_time_s=self.LAP_END_T,
+            is_first_row=False, row_idx=0, lap_wrap_dt=0.1)
+        assert correct > accel * 9
+
+    def test_standing_start_still_has_no_acceleration(self):
+        # Lap 1 row 0 keeps the old behaviour.
+        _, accel, _ = compute_lap_physics(
+            {"Speed (mph)": 0.0, "Time (s)": 0.0}, prev_velocity_ms=0.0, prev_time_s=0.0,
+            is_first_row=True, row_idx=0)
+        assert accel == 0.0
+
+    def test_standing_start_ignores_a_wrap_interval(self):
+        # Belt and braces: the flags cannot both apply, but if they did the
+        # standing start must win rather than differencing against nothing.
+        _, accel, _ = compute_lap_physics(
+            self.ROW, prev_velocity_ms=0.0, prev_time_s=0.0,
+            is_first_row=True, row_idx=0, lap_wrap_dt=0.1)
+        assert accel == 0.0
+
+    def test_braking_across_the_line_gives_negative_acceleration(self):
+        slower = {"Speed (mph)": 10.0, "Time (s)": 0.0}
+        _, accel, _ = compute_lap_physics(
+            slower, prev_velocity_ms=self.ENTRY_V, prev_time_s=self.LAP_END_T,
+            is_first_row=False, row_idx=0, lap_wrap_dt=0.1)
+        assert accel < 0.0
+
+    def test_row_one_of_a_new_lap_differences_normally(self):
+        # prev_time_s was rewritten to the new lap's row 0 stamp, so the wrap is
+        # a single frame and the profile's own timestamps resume immediately.
+        _, accel, _ = compute_lap_physics(
+            {"Speed (mph)": 50.0, "Time (s)": 0.1},
+            prev_velocity_ms=45.0 * 0.44704, prev_time_s=0.0,
+            is_first_row=False, row_idx=1)
+        expected_dv = (50.0 - 45.0) * 0.44704
+        assert math.isclose(accel, expected_dv / 0.1, rel_tol=1e-9)
+
+    def test_standing_start_flag_is_lap_aware(self):
+        # The condition the main loop applies. row_idx == 0 alone was the bug.
+        def standing(lap, idx):
+            return lap == 1 and idx == 0
+
+        assert standing(1, 0) is True
+        assert standing(2, 0) is False
+        assert standing(9, 0) is False
+        assert standing(1, 5) is False
 
 
 # ================= RESISTANCE TARGETING =================

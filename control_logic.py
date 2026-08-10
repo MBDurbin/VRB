@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import serial
@@ -39,9 +40,15 @@ def auto_detect_resistor():
             ser.write(b"?WHOAMI\n")
             response = ser.readline().decode('utf-8').strip()
             if response == "RESISTOR_CTRL":
-                ser.close()
+                # Keep the handle we already have. Closing and reopening toggles
+                # DTR, which hard-resets the Arduino into its bootloader for
+                # ~2 s, and every command sent in that window -- including the
+                # heartbeat that stops its watchdog shedding load -- is lost.
+                # hardware_manager's watchdog already avoids this for the temp
+                # sensor; this is the same trap.
+                ser.timeout = 0.1
                 print(f"[LOGIC] Resistor Bank secured on {port.device}")
-                return serial.Serial(port.device, RESISTOR_BAUD_RATE, timeout=0.1)
+                return ser
             ser.close()
         except Exception:
             pass
@@ -62,26 +69,21 @@ def send_binary_command(ser, steps):
 # Extracted so this logic can be unit-tested without a running GUI,
 # Arduino, or DAQ.
 #Double Checked
-def check_safety_trip(max_temp, amps, voltage, max_safe_temp, max_safe_current,
-                      current_buffer, min_safe_voltage):
-    """Returns (is_fault, reason).
+def check_thermal_and_current(max_temp, amps, max_safe_temp, max_safe_current, current_buffer):
+    """The two trips that apply in every FSM state, armed or not.
 
-    reason is 'OVERTEMP', 'OVERCURRENT', 'UNDERVOLTAGE', or None. Checked in that
-    priority order so the reported cause is deterministic when several trip at once.
+    Returns (is_fault, reason) where reason is 'OVERTEMP', 'OVERCURRENT' or None.
+    Temperature outranks current so the reported cause is deterministic when both
+    trip at once.
 
-    Undervoltage is measured under load, so min_safe_voltage should sit above the
-    cell's absolute cutoff (2.5 V/cell = 30.0 V for 12S) to leave room for IR sag.
+    Undervoltage deliberately lives in evaluate_safety() rather than here: it is
+    only meaningful once the rig is armed, and combining the three in one
+    function meant two places decided the same thresholds.
     """
-    over_temp = max_temp >= max_safe_temp
-    over_current = amps >= (max_safe_current + current_buffer)
-    under_voltage = voltage <= min_safe_voltage
-
-    if over_temp:
+    if max_temp >= max_safe_temp:
         return True, "OVERTEMP"
-    if over_current:
+    if amps >= (max_safe_current + current_buffer):
         return True, "OVERCURRENT"
-    if under_voltage:
-        return True, "UNDERVOLTAGE"
     return False, None
 
 
@@ -98,13 +100,29 @@ def check_cell_safety(cell_voltages, min_cell_voltage, sense_floor=0.5):
     differently tells the operator where to look.
     """
     if not cell_voltages:
-        return False, None
+        # Fail closed. An empty array means the DAQ produced no per-cell data at
+        # all -- a broken harness, an empty channel list, or a parse failure --
+        # and running a high-power profile blind to cell voltage is exactly what
+        # this check exists to prevent.
+        return True, "NO CELL DATA"
 
     lowest = min(cell_voltages)
     if lowest < sense_floor:
         return True, "CELL SENSE FAULT"
     if lowest <= min_cell_voltage:
         return True, "CELL UNDERVOLTAGE"
+    return False, None
+
+
+def check_daq_health(daq_age_s, stale_timeout_s):
+    """Telemetry freshness. Returns (is_fault, reason).
+
+    The logic loop keeps running on the last packet when the DAQ stops feeding
+    it, so without this a hung or crashed DAQ leaves every other check
+    evaluating frozen values that still look plausible.
+    """
+    if stale_timeout_s > 0 and daq_age_s > stale_timeout_s:
+        return True, "DAQ DATA STALE"
     return False, None
 
 
@@ -123,37 +141,58 @@ def check_sensor_health(temp_age_s, temp_link_ok, stale_timeout_s):
     return False, None
 
 
-def evaluate_safety(data, limits, check_sensors=True):
+def evaluate_safety(data, limits, armed=True):
     """All safety checks against one telemetry packet. Returns (is_fault, reason).
 
     Measured dangers are reported ahead of data-integrity faults: if the pack is
     genuinely over-current AND the temperature link has dropped, the operator
     needs to hear about the current first.
 
-    check_sensors is False outside the armed/running states, where a missing
-    temperature link is an ordinary not-connected-yet condition rather than a
-    fault to latch.
+    `armed` should be True only in ARMED/RUNNING. Over-temperature and
+    over-current are always checked -- either means something is wrong no matter
+    what state the FSM thinks it is in. Everything else is gated, because before
+    the rig is armed those readings describe a bench that is not loaded yet:
+
+      * Voltage checks. A rig powered up before the battery is plugged in reads
+        0.0 V, which is below any sane undervoltage trip. Checking it in IDLE
+        latches a FAULT the operator cannot clear -- RESET returns to IDLE and it
+        immediately re-trips -- locking them out of software bring-up entirely.
+      * Cell and sensor data integrity. Missing data before the DAQ has
+        connected is an ordinary not-connected-yet condition, not a fault.
+
+    Once armed, all of them apply, and missing data is a fault rather than a
+    reason to skip a check.
     """
-    fault, reason = check_safety_trip(
-        data.get('max_temp', 0.0), data.get('amps', 0.0), data.get('voltage', 0.0),
-        limits['max_temp'], limits['max_amps'], limits['amp_buffer'], limits['min_volts'],
+    fault, reason = check_thermal_and_current(
+        data.get('max_temp', 0.0), data.get('amps', 0.0),
+        limits['max_temp'], limits['max_amps'], limits['amp_buffer'],
     )
     if fault:
         return True, reason
+
+    if not armed:
+        return False, None
+
+    if data.get('voltage', 0.0) <= limits['min_volts']:
+        return True, "UNDERVOLTAGE"
 
     fault, reason = check_cell_safety(
         data.get('cell_voltages', []), limits['min_cell_volts'], limits['cell_sense_floor'])
     if fault:
         return True, reason
 
-    if check_sensors:
-        fault, reason = check_sensor_health(
-            data.get('temp_age_s', 0.0),
-            data.get('hardware_status', {}).get('temp_arduino', False),
-            limits['temp_stale_timeout'],
-        )
-        if fault:
-            return True, reason
+    fault, reason = check_daq_health(
+        data.get('daq_age_s', 0.0), limits['daq_stale_timeout'])
+    if fault:
+        return True, reason
+
+    fault, reason = check_sensor_health(
+        data.get('temp_age_s', 0.0),
+        data.get('hardware_status', {}).get('temp_arduino', False),
+        limits['temp_stale_timeout'],
+    )
+    if fault:
+        return True, reason
 
     return False, None
 
@@ -166,20 +205,40 @@ def coulomb_step(amps, dt, remaining_ah, total_capacity_ah):
     return new_remaining_ah, true_soc
 
 
-def compute_lap_physics(row, prev_velocity_ms, prev_time_s, is_first_row, row_idx):
-    """Derives velocity/acceleration for the current lap-profile row."""
+def compute_lap_physics(row, prev_velocity_ms, prev_time_s, is_first_row, row_idx,
+                        lap_wrap_dt=None):
+    """Derives velocity/acceleration for the current lap-profile row.
+
+    `is_first_row` means the standing start of the RUN, not the start of a lap.
+    It must be true only for lap 1 row 0. Tying it to `row_idx == 0` alone made
+    every lap after the first begin as a standing start: the car's carried
+    velocity was discarded, dv forced to zero, and the acceleration term dropped
+    out of the power demand for that frame.
+
+    `lap_wrap_dt` covers the frame where a lap repeats. The profile's `Time (s)`
+    restarts at zero while `prev_time_s` still holds the end of the previous lap,
+    so the raw difference is large and negative (0.0 - 60.0 = -60.0 s). The
+    non-positive guard below would catch that and substitute 1.0 s, which is not
+    a failsafe so much as a silently wrong number -- it divides a real velocity
+    change by a fabricated interval. Pass the profile's sampling interval for
+    that one frame instead; the next row differences normally again.
+    """
     speed_mph = float(row.get('Speed (mph)', 0))
     velocity_ms = speed_mph * 0.44704
     current_time_s = float(row.get('Time (s)', row_idx))
 
     if is_first_row:
-        dt_physics = 1.0
-        dv = 0.0
+        # Standing start: nothing to difference against.
+        return velocity_ms, 0.0, current_time_s
+
+    if lap_wrap_dt is not None and math.isfinite(lap_wrap_dt) and lap_wrap_dt > 0:
+        dt_physics = lap_wrap_dt
     else:
         dt_physics = current_time_s - prev_time_s
-        if dt_physics <= 0:
+        if not math.isfinite(dt_physics) or dt_physics <= 0:
             dt_physics = 1.0
-        dv = velocity_ms - prev_velocity_ms
+
+    dv = velocity_ms - prev_velocity_ms
 
     acceleration = dv / dt_physics
     return velocity_ms, acceleration, current_time_s
@@ -296,6 +355,68 @@ def compute_target_resistance(voltage, req_power, max_safe_current, current_max_
     return req_r
 
 
+def NEUTRAL_PACKET():
+    """Stand-in used before the first DAQ packet arrives.
+
+    Deliberately reads as "no data" rather than as a healthy pack: zero volts and
+    no cell readings trip the voltage and cell checks the moment the rig is
+    armed, so the FSM cannot be driven on a packet that never existed.
+    """
+    return {
+        'amps': 0.0, 'voltage': 0.0, 'max_temp': 0.0,
+        'cell_voltages': [], 'temperatures': [], 'power_kw': 0.0,
+        'temp_age_s': float('inf'), 'hardware_status': {},
+    }
+
+
+def load_lap_profile(path):
+    """Read a lap CSV, dropping rows that cannot be used. Returns (rows, dropped).
+
+    Trailing blank rows are common in exported telemetry -- the shipped profile
+    has seven. Left in place they yield NaN speed and time, which propagates
+    through the physics to a NaN power demand. NaN then loses every comparison
+    in compute_target_resistance(), so `min(MAX_RESISTANCE, nan)` quietly returns
+    MAX_RESISTANCE and the bank sits at minimum load for the tail of every lap
+    without anything being reported.
+    """
+    df = pd.read_csv(path)
+    rows = df.to_dict('records')
+
+    usable = []
+    for row in rows:
+        try:
+            speed = float(row.get('Speed (mph)'))
+            stamp = float(row.get('Time (s)'))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(speed) and math.isfinite(stamp):
+            usable.append(row)
+
+    return usable, len(rows) - len(usable)
+
+
+def lap_row_interval(lap_data, idx, default=1.0):
+    """Real seconds to hold row `idx`, taken from the profile's own timestamps.
+
+    The playback used to advance one row per wall-clock second regardless of what
+    the CSV said. That happens to match the shipped 1 Hz profile, but a 10 Hz log
+    would run ten times too slow AND hold each power demand ten times too long,
+    over-draining the pack by the same factor. Since compute_lap_physics()
+    already derives acceleration from these timestamps, playback ignoring them
+    also made the two disagree about how much time a row represents.
+    """
+    try:
+        here = float(lap_data[idx].get('Time (s)'))
+        nxt = float(lap_data[idx + 1].get('Time (s)'))
+    except (IndexError, KeyError, TypeError, ValueError, AttributeError):
+        return default
+
+    dt = nxt - here
+    if math.isfinite(dt) and dt > 0:
+        return dt
+    return default
+
+
 def resistance_to_steps(req_r):
     return int(round(max(RESISTOR_RESOLUTION, req_r) / RESISTOR_RESOLUTION))
 
@@ -365,18 +486,37 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     prev_time_s = 0.0
 
     try:
-        df = pd.read_csv(CSV_FILENAME)
-        lap_data = df.to_dict('records')
+        lap_data, dropped = load_lap_profile(CSV_FILENAME)
         total_rows = len(lap_data)
-        print(f"[LOGIC] Loaded default lap profile: {total_rows} rows.")
+        print(f"[LOGIC] Loaded default lap profile: {total_rows} rows"
+              + (f" ({dropped} unusable rows dropped)." if dropped else "."))
     except Exception as e:
         print(f"[LOGIC WARNING] Failed to load default CSV: {e}")
 
+    # Last packet seen, and when. The loop body must run whether or not the DAQ
+    # is feeding it -- see the comment on the get() below.
+    last_data = None
+    last_daq_rx = time.time()
+    row_interval = 1.0
+
     while not stop_event.is_set():
+        # Never `continue` past the loop body on an empty queue. Doing so skipped
+        # GUI commands (including E-STOP), every safety check, the resistor
+        # heartbeat and telemetry forwarding, so a hung or crashed DAQ left the
+        # logic process paralysed: the operator's E-STOP sat unread in the queue
+        # and the GUI kept displaying RUNNING. The Arduino's own 2 s watchdog
+        # still shed the load, but nothing in software noticed or reported it.
         try:
-            data = daq_queue.get(timeout=0.5)
+            data = daq_queue.get(timeout=0.1)
+            last_data = data
+            last_daq_rx = time.time()
         except Empty:
-            continue
+            # Carry the last packet forward, tagged with its age so the staleness
+            # check can fault on it. Copy it: section G writes FSM fields into
+            # the packet before forwarding.
+            data = dict(last_data) if last_data is not None else NEUTRAL_PACKET()
+
+        data['daq_age_s'] = time.time() - last_daq_rx
 
         if res_ser is None or not res_ser.is_open:
             if fsm_state != "FAULT":
@@ -435,12 +575,15 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV":
                     filepath = cmd[1]
                     try:
-                        df = pd.read_csv(filepath)
-                        lap_data = df.to_dict('records')
+                        lap_data, dropped = load_lap_profile(filepath)
                         total_rows = len(lap_data)
                         current_row_idx = 0
                         print(f"\n[LOGIC] Successfully loaded new lap profile: {filepath}")
-                        print(f"[LOGIC] Total rows: {total_rows}")
+                        print(f"[LOGIC] Total rows: {total_rows}"
+                              + (f" ({dropped} unusable rows dropped)" if dropped else ""))
+                        if total_rows > 1:
+                            span = lap_row_interval(lap_data, 0)
+                            print(f"[LOGIC] Row interval from profile timestamps: {span:.3f} s")
                     except Exception as e:
                         print(f"\n[LOGIC ERROR] Failed to load new CSV: {e}")
 
@@ -456,12 +599,20 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         current_lap = 1
                         prev_velocity_ms = 0.0
                         prev_time_s = 0.0
+                        row_interval = lap_row_interval(lap_data, 0)
 
-                        # Reset Capacity for new run
-                        remaining_ah = total_capacity_ah
+                        # Coulomb count deliberately CARRIES OVER between runs.
+                        # Resetting to full here meant two manually-triggered
+                        # back-to-back laps both started at 100%, so the counter
+                        # forgot everything the first run drew -- overstating
+                        # remaining charge, which is the dangerous direction.
+                        # It rebaselines on a pack/config change or a restart.
                         last_coulomb_time = time.time()
 
-                        print(f"[LOGIC] Lap Simulation STARTED. Target: {total_laps} Laps.")
+                        print(f"[LOGIC] Lap Simulation STARTED. Target: {total_laps} Laps | "
+                              f"row interval {row_interval:.3f} s | "
+                              f"starting SOC {(remaining_ah / total_capacity_ah) * 100:.1f}% "
+                              f"({remaining_ah:.2f} Ah)")
                     else:
                         print("[LOGIC] Cannot RUN: No lap data loaded!")
 
@@ -481,7 +632,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         # In IDLE a missing temperature link is a not-connected-yet condition, and
         # latching a fault for it would make the rig impossible to bring up.
         is_fault, trigger_reason = evaluate_safety(
-            data, limits, check_sensors=fsm_state in ("ARMED", "RUNNING"))
+            data, limits, armed=fsm_state in ("ARMED", "RUNNING"))
 
         if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
             fsm_state = "FAULT"
@@ -507,12 +658,29 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     last_heartbeat = time.time()
 
             elif fsm_state == "RUNNING":
-                if time.time() - last_physics_time >= 1.0:
+                # Dwell on each row for the interval the profile itself declares,
+                # not a fixed second. A 10 Hz log played at 1 row/s would run ten
+                # times too slow and hold every power demand ten times too long.
+                if time.time() - last_physics_time >= row_interval:
                     if current_row_idx < total_rows:
                         row = lap_data[current_row_idx]
 
+                        # Standing start is the start of the RUN, not of a lap:
+                        # lap 2 onwards inherits the car's carried velocity.
+                        standing_start = (current_lap == 1 and current_row_idx == 0)
+
+                        # On a lap repeat the profile's clock restarts, so the
+                        # raw timestamp difference is large and negative. Bridge
+                        # that one frame with the profile's own sampling
+                        # interval rather than a literal, so this stays correct
+                        # whatever rate the loaded CSV was logged at.
+                        wrap_dt = None
+                        if current_row_idx == 0 and current_lap > 1:
+                            wrap_dt = lap_row_interval(lap_data, 0)
+
                         velocity_ms, acceleration, current_time_s = compute_lap_physics(
-                            row, prev_velocity_ms, prev_time_s, current_row_idx == 0, current_row_idx
+                            row, prev_velocity_ms, prev_time_s,
+                            standing_start, current_row_idx, lap_wrap_dt=wrap_dt
                         )
                         prev_velocity_ms = velocity_ms
                         prev_time_s = current_time_s
@@ -533,12 +701,14 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
                         send_binary_command(res_ser, steps)
 
+                        row_interval = lap_row_interval(lap_data, current_row_idx)
                         current_row_idx += 1
                         last_physics_time = time.time()
                     else:
                         if current_lap < total_laps:
                             current_lap += 1
                             current_row_idx = 0
+                            row_interval = lap_row_interval(lap_data, 0)
                             print(f"[LOGIC] Starting Lap {current_lap} of {total_laps}")
                         else:
                             fsm_state = "IDLE"

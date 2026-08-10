@@ -19,9 +19,38 @@ would experience. See Battery topology below — this distinction matters.
 
 The lap profile drives a road-load physics model (drag, downforce, rolling
 resistance, translational and rotational inertia, drivetrain loss) to compute
-required power each second. That power is converted to a target resistance,
+required power for each row. That power is converted to a target resistance,
 quantized to the bank's 0.25 Ω steps, and sent to the resistor Arduino as an
 8-bit binary word.
+
+**Playback follows the profile's own `Time (s)` column**, via
+`lap_row_interval()`. It used to advance one row per wall-clock second
+regardless, which happens to match the shipped 1 Hz profile but would run a
+10 Hz log ten times too slow *and* hold each power demand ten times too long,
+over-draining the pack by the same factor. `compute_lap_physics()` already
+derived acceleration from those timestamps, so fixed playback also made the two
+disagree about how much time a row represents.
+
+**Lap boundaries are continuations, not restarts.** `is_first_row` means the
+standing start of the *run* (lap 1, row 0) — tying it to `row_idx == 0` alone
+made every subsequent lap begin from rest, discarding the car's carried velocity
+and dropping the acceleration term from that frame's power demand. And because
+the profile's `Time (s)` restarts each lap, the raw difference at the boundary
+is large and negative (`0.0 - 60.0`); the non-positive guard silently replaced
+it with 1.0 s, dividing a real velocity change by a fabricated interval. That
+frame now uses `lap_row_interval()` — the profile's own sampling rate, not a
+literal, so it stays correct at any log rate.
+
+Note the shipped profile begins and ends at 0 mph, so its own boundary is
+benign. A multi-lap run on it is N repeats of a stop-to-stop lap rather than a
+continuous stint. The fix matters for profiles that are loop-closed at speed.
+
+`load_lap_profile()` drops rows with non-finite speed or time. Exported
+telemetry commonly carries trailing blanks — the shipped profile has seven — and
+NaN propagates to a NaN power demand, which loses every comparison in
+`compute_target_resistance()` so `min(MAX_RESISTANCE, nan)` quietly returns
+`MAX_RESISTANCE`. The bank sat at minimum load for the tail of every lap with
+nothing reported.
 
 ## Architecture
 
@@ -290,9 +319,26 @@ Three independent layers. They must all be verified separately.
      never fire while the cells kept heating. Readings now carry an age and are
      refused past `temp_stale_timeout_s`.
 
-   Sensor-integrity checks apply only in `ARMED`/`RUNNING`. In `IDLE` a missing
-   thermal link is a not-connected-yet condition, and latching a fault for it
-   would make the rig impossible to bring up.
+   **Over-temperature and over-current are checked in every state.** Everything
+   else — undervoltage, per-cell, and all data-integrity checks — applies only in
+   `ARMED`/`RUNNING`, because before arming those readings describe a bench that
+   is not loaded yet. A rig powered up before the battery is plugged in reads
+   0.0 V; tripping on that in `IDLE` latched a fault `RESET` could not clear
+   (back to `IDLE`, instantly re-trips) and locked the operator out of software
+   bring-up entirely.
+
+   Once armed, missing data is a **fault**, not a reason to skip a check.
+   `check_cell_safety` reports `NO CELL DATA` on an empty array rather than
+   returning safe — a broken harness or empty channel list would otherwise run a
+   high-power profile blind to exactly what that check exists for.
+
+   **The logic loop never skips its body.** It previously did `continue` when the
+   DAQ queue was empty, which jumped past GUI commands, every safety check, the
+   resistor heartbeat and telemetry forwarding. A hung DAQ therefore paralysed
+   the logic process: the operator's E-STOP sat unread in the queue and the GUI
+   kept displaying `RUNNING`. The Arduino's own 2 s watchdog still shed the load,
+   but nothing in software noticed or reported it. The loop now carries the last
+   packet forward tagged with its age, and `DAQ DATA STALE` faults on it.
 2. **Operator E-STOP** — GUI button, routes through `send_command_nonblocking()`
    so a backed-up command queue can never freeze it.
 3. **Arduino serial watchdog** — 2 s of host silence opens the main contactor
@@ -306,7 +352,7 @@ Layer 3 is the backstop when layer 1 is stalled (see Open Questions).
 python -m pytest
 ```
 
-166 unit tests, no hardware required. They cover the pure decision logic extracted
+194 unit tests, no hardware required. They cover the pure decision logic extracted
 from the control loop: trip thresholds at/around boundaries, FSM transition
 guards, coulomb counting and SOC clamping, the thermal derate curve, road-load
 power, and the E-STOP command dispatch path.
@@ -330,6 +376,15 @@ and shutdown hygiene. Requires the SIL dongle; no battery or DAQ needed.
 | Current limit 182 A, temp limit 65 °C | Both exceeded datasheet ratings (180 A / 60 °C). E-STOP only fired at 187 A = 46.75 A/cell, 3.89 % over rated |
 
 ## Open questions and known gaps
+
+**0. Coulomb count carries across runs, and only rebaselines on restart.**
+`RUN` used to reset `remaining_ah` to full, so two manually-triggered
+back-to-back laps both started at 100% and the counter forgot what the first
+drew — overstating remaining charge, the dangerous direction. It now carries
+over, and the starting SOC is printed when a run begins. It rebaselines on a
+pack/config change or a process restart. If you want an explicit "fresh battery"
+reset in the GUI, that is a deliberate affordance someone should add; silently
+doing it on every `RUN` was not.
 
 **1. SOC reads optimistically high.** `coulomb_step` integrates against a fixed
 18.0 Ah nameplate figure. Two problems: it uses *typical* capacity (4500 mAh)

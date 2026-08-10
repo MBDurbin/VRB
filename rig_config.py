@@ -19,7 +19,7 @@ Design intent for inheriting teams:
 """
 import json
 import os
-from dataclasses import dataclass, asdict, field, fields
+from dataclasses import dataclass, asdict, field, fields, replace
 from typing import List
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rig_config.json")
@@ -305,7 +305,7 @@ class DaqConfig:
                 f"{self.channel_count} groups only -- add or remove channels in "
                 f"rig_config.json to match."
             )
-        if self.sensor_count != pack.cell_count:
+        if self.sensor_count != pack.cell_count: #CHANGE THIS WHEN WE ADD THE INBETWEEN SENSORS FOR THE MODULES
             problems.append(
                 f"{self.temp_bus_count} buses x {self.sensors_per_bus} sensors = "
                 f"{self.sensor_count} thermistors, but the pack has "
@@ -397,6 +397,34 @@ class SafetyLimits:
         # Keep derate start below the ceiling so the derate range stays positive.
         self.derate_start = min(self.derate_start, self.max_temp - 5.0)
         return self
+
+    # Fields that apply_pack_derivation() writes. Kept next to it so the two
+    # cannot drift apart.
+    DERIVED_FIELDS = ('max_amps', 'max_temp', 'min_volts', 'warn_volts',
+                      'min_cell_volts', 'derate_start')
+
+    def derivation_conflicts(self, pack: PackConfig):
+        """Values that pack derivation would overwrite, as (field, loaded, derived).
+
+        Derivation is authoritative on purpose -- change the pack and the limits
+        must follow, or a new cell inherits the old one's ceiling. But that means
+        a hand-edited rig_config.json is silently reverted while
+        derive_from_pack is left True, and the reversion can go in the unsafe
+        direction: an engineer derating to 120 A gets 175 A back. Callers use
+        this to say so out loud rather than let it pass unnoticed.
+        """
+        if not self.derive_from_pack:
+            return []
+
+        derived = replace(self)
+        derived.apply_pack_derivation(pack)
+
+        conflicts = []
+        for name in self.DERIVED_FIELDS:
+            loaded, after = getattr(self, name), getattr(derived, name)
+            if abs(loaded - after) > 1e-9:
+                conflicts.append((name, loaded, after))
+        return conflicts
 
     def exceedances(self, pack: PackConfig):
         """Return human-readable warnings where limits exceed cell ratings.
@@ -498,13 +526,20 @@ class RigConfig:
 
         pack = build(PackConfig, raw.get('pack'))
         limits = build(SafetyLimits, raw.get('limits'))
+
+        # Capture what derivation is about to discard, before it discards it.
+        conflicts = limits.derivation_conflicts(pack)
         limits.apply_pack_derivation(pack)
-        return RigConfig(
+
+        cfg = RigConfig(
             vehicle=build(VehicleParams, raw.get('vehicle')),
             pack=pack,
             limits=limits,
             daq=build(DaqConfig, raw.get('daq')),
         )
+        # Plain attribute, not a dataclass field, so it never reaches to_dict().
+        cfg.discarded_limits = conflicts
+        return cfg
 
     def save(self, path=CONFIG_PATH):
         with open(path, 'w', encoding='utf-8') as fh:
@@ -521,10 +556,16 @@ class RigConfig:
             return RigConfig.defaults()
         try:
             with open(path, 'r', encoding='utf-8') as fh:
-                return RigConfig.from_dict(json.load(fh))
+                cfg = RigConfig.from_dict(json.load(fh))
         except Exception as exc:
             print(f"[CONFIG] Could not read {path} ({exc}); using defaults.")
             return RigConfig.defaults()
+
+        for name, loaded, derived in getattr(cfg, 'discarded_limits', []):
+            print(f"[CONFIG WARNING] {name}={loaded:g} in {os.path.basename(path)} was "
+                  f"replaced by the pack-derived {derived:g}. Set "
+                  f"\"derive_from_pack\": false to keep hand-edited limits.")
+        return cfg
 
 
 def field_label(field_name, labels):

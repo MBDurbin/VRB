@@ -124,8 +124,17 @@ raw rating would put the real trip at 185 A — above the cells — which is exa
 the bug that shipped originally as 182 A / 187 A.
 
 Hand-editing a threshold in the sidebar sets `derive_from_pack = False`, so your
-override is not silently reverted the next time the config loads. Re-enable
-derivation by editing that flag in `rig_config.json`.
+override is not reverted the next time the config loads. Re-enable derivation by
+editing that flag in `rig_config.json`.
+
+**Editing `rig_config.json` by hand is different.** If you change a limit there
+and leave `derive_from_pack: true`, derivation still wins — that is deliberate,
+because a pack change must move the limits with it, or new cells inherit the old
+pack's ceiling. What is *not* acceptable is doing it quietly: the reversion can
+run in the unsafe direction, turning a deliberate derate from 120 A back into
+175 A. So every discarded value is now reported on the console at startup and in
+a dialog when the GUI opens. If you meant the edit, set `derive_from_pack` to
+`false`.
 
 The **DAQ / Sensors** tab holds the channel mapping and sensor layout: which
 cDAQ channel reads current, the ordered list of cumulative voltage taps, divider
@@ -297,7 +306,7 @@ Layer 3 is the backstop when layer 1 is stalled (see Open Questions).
 python -m pytest
 ```
 
-156 unit tests, no hardware required. They cover the pure decision logic extracted
+166 unit tests, no hardware required. They cover the pure decision logic extracted
 from the control loop: trip thresholds at/around boundaries, FSM transition
 guards, coulomb counting and SOC clamping, the thermal derate curve, road-load
 power, and the E-STOP command dispatch path.

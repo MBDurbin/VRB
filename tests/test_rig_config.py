@@ -178,6 +178,82 @@ class TestLimitDerivation:
         assert any("staleness" in w for w in limits.exceedances(pack))
 
 
+# ================= DERIVATION CONFLICTS =================
+
+class TestDerivationConflicts:
+    """Derivation is authoritative, but must never discard an edit silently."""
+
+    def test_untouched_config_reports_nothing(self):
+        pack = PackConfig()
+        limits = SafetyLimits().apply_pack_derivation(pack)
+        assert limits.derivation_conflicts(pack) == []
+
+    def test_hand_edited_limit_is_reported(self):
+        pack = PackConfig()
+        limits = SafetyLimits(max_amps=120.0)      # engineer derates
+        conflicts = limits.derivation_conflicts(pack)
+
+        names = {c[0] for c in conflicts}
+        assert 'max_amps' in names
+        loaded, derived = next((lo, d) for n, lo, d in conflicts if n == 'max_amps')
+        assert loaded == 120.0
+        assert derived == 175.0
+
+    def test_reversion_can_be_in_the_unsafe_direction(self):
+        # The reason this warning exists: a deliberate derate coming back higher.
+        pack = PackConfig()
+        limits = SafetyLimits(max_amps=120.0)
+        _, loaded, derived = next(c for c in limits.derivation_conflicts(pack)
+                                  if c[0] == 'max_amps')
+        assert derived > loaded
+
+    def test_nothing_reported_when_derivation_is_off(self):
+        pack = PackConfig()
+        limits = SafetyLimits(derive_from_pack=False, max_amps=120.0)
+        assert limits.derivation_conflicts(pack) == []
+
+    def test_conflicts_do_not_mutate_the_limits(self):
+        # Probing must not apply the derivation as a side effect.
+        pack = PackConfig()
+        limits = SafetyLimits(max_amps=120.0)
+        limits.derivation_conflicts(pack)
+        assert limits.max_amps == 120.0
+
+    def test_every_derived_field_is_covered(self):
+        # If apply_pack_derivation gains a field, DERIVED_FIELDS must too, or
+        # that field would start reverting silently again.
+        pack = PackConfig(series_count=14, parallel_count=6, cell_max_temp_c=55.0,
+                          cell_min_voltage=2.8)
+        limits = SafetyLimits()
+        before = {f: getattr(limits, f) for f in SafetyLimits.DERIVED_FIELDS}
+        limits.apply_pack_derivation(pack)
+
+        changed = {f for f in before if abs(before[f] - getattr(limits, f)) > 1e-9}
+        assert changed, "expected this pack to move several derived limits"
+        assert changed <= set(SafetyLimits.DERIVED_FIELDS)
+
+    def test_load_surfaces_conflicts_on_the_config(self):
+        raw = RigConfig.defaults().to_dict()
+        raw['limits']['max_amps'] = 120.0
+        cfg = RigConfig.from_dict(raw)
+        assert any(c[0] == 'max_amps' for c in cfg.discarded_limits)
+
+    def test_conflicts_never_reach_the_saved_file(self):
+        raw = RigConfig.defaults().to_dict()
+        raw['limits']['max_amps'] = 120.0
+        cfg = RigConfig.from_dict(raw)
+        assert cfg.discarded_limits           # present in memory
+        assert set(cfg.to_dict()) == {'vehicle', 'pack', 'limits', 'daq'}
+
+    def test_pack_change_still_redderives(self):
+        # The behaviour the warning must not regress: a bigger pack still moves
+        # the limits, rather than inheriting the old pack's ceiling.
+        raw = RigConfig.defaults().to_dict()
+        raw['pack']['parallel_count'] = 8
+        cfg = RigConfig.from_dict(raw)
+        assert math.isclose(cfg.limits.max_amps + cfg.limits.amp_buffer, 360.0)
+
+
 # ================= EXCEEDANCE WARNINGS =================
 
 class TestExceedances:

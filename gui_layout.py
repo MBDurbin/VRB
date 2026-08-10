@@ -494,9 +494,26 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         self.init_ui()
 
+        # A hand-edited limit that pack derivation threw away only prints to the
+        # console, which nobody sees when the app is launched from a shortcut.
+        # Deferred so it lands on top of a drawn window rather than a blank one.
+        if getattr(self.config, 'discarded_limits', None):
+            QtCore.QTimer.singleShot(0, self.warn_discarded_limits)
+
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_gui)
         self.timer.start(50)
+
+    def warn_discarded_limits(self):
+        rows = "\n".join(
+            f"  {name}:  {loaded:g}  ->  {derived:g}"
+            for name, loaded, derived in self.config.discarded_limits)
+        QtWidgets.QMessageBox.warning(
+            self, "Hand-edited limits were replaced",
+            f"rig_config.json set these limits, but they were recalculated from "
+            f"the cell datasheet:\n\n{rows}\n\n"
+            f"The rig is running on the recalculated values. To keep your own, "
+            f"set \"derive_from_pack\": false in rig_config.json.")
 
     def init_ui(self):
         self.setWindowTitle("FSAE Resistor Bank Telemetry")

@@ -70,7 +70,7 @@ hardware_manager ──────────> control_logic ─────�
 | `main_v2.py` | Entry point. Probes COM ports for a `SIL_KEY` dongle; if present runs SIL mode, otherwise starts the real DAQ process. |
 | `rig_config.py` | Vehicle model, pack spec, DAQ mapping and safety limits, with JSON persistence. Everything a future team retargets lives here. |
 | `theme.py` | Colour, type and spacing for the whole interface. One global stylesheet; widgets carry a `variant` property rather than inline CSS. |
-| `hardware_manager.py` | Reads NI cDAQ (current + cumulative cell voltage taps) and the temperature Arduino (OneWire buses of DS18B20s). Channel map and sensor layout come from config. Self-healing watchdog thread re-detects unplugged Arduinos. Falls back to simulated data, sized to the configured pack, if no NI-DAQ is present. |
+| `hardware_manager.py` | Reads NI cDAQ (current + cumulative cell voltage taps) and the temperature Arduino (OneWire buses of DS18B20s). Channel map and sensor layout come from config. Self-healing watchdog thread re-detects the temperature Arduino. Falls back to simulated data, sized to the configured pack, if no NI-DAQ is present. |
 | `control_logic.py` | The safety-critical process. FSM, safety trips, lap physics, coulomb counting, resistor bank serial commands. |
 | `gui_layout.py` | PyQt6 telemetry UI — live voltage/current plots, 12S cell voltages, 48-sensor thermal heatmap, threshold controls, CSV recording. |
 | `sil_simulator.py` | Desk-test plant model. Replaces the DAQ entirely with operator-driven sliders (load, temperature, pack OCV) plus a hardware-fault toggle. |
@@ -105,6 +105,16 @@ Guards live in `is_valid_transition()`. `ARM` only from `IDLE`, `RUN` only from
 
 Both Arduinos and the SIL dongle are discovered by COM-port sweep using the
 `?WHOAMI` handshake — no fixed port assignments.
+
+**One process owns each device, and only that process sweeps for it.**
+`control_logic` owns the resistor controller; `hardware_manager` owns the
+temperature Arduino. Both used to hunt for `RESISTOR_CTRL`, which meant
+`hardware_manager` could never claim the port `control_logic` was holding, so
+its "still looking" flag never cleared and the sweep ran every 3 s forever —
+blocking 2 s per baud per port, and DTR-resetting any Arduino it managed to
+open. If a sweep landed inside `control_logic`'s reconnect cooldown it could
+grab the resistor controller and reset it out from under the process driving the
+bank. Keep discovery single-owner.
 
 **[docs/hardware_topology.md](docs/hardware_topology.md) is the physical
 reference**: what each ladder step is actually built from, how the bank is

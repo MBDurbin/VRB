@@ -1,5 +1,5 @@
 // --- Function Prototypes ---
-void turnONAllRESISTORS();
+void shedAllLoad();
 bool isBinary(String str);
 bool isAllZeros(String str);
 void updateOtherRelays(String binaryStr);
@@ -45,7 +45,7 @@ void loop() {
 
   // 1. WATCHDOG CHECK
   if (millis() - lastConnectionTime > TIMEOUT_LIMIT) {
-      turnONAllRESISTORS();
+      shedAllLoad();
   }
 
 // 2. CHECK FOR INCOMING DATA
@@ -75,7 +75,7 @@ void loop() {
 
     // Fixed: Matches Python's uppercase "KILL" command
     if (incomingData == "KILL" || incomingData == "kill") {
-      turnONAllRESISTORS();
+      shedAllLoad();
       return; // Stop processing so it doesn't hit the binary check
     }
 
@@ -131,7 +131,26 @@ void loop() {
 
 // ================= HELPER FUNCTIONS =================
 
-void turnONAllRESISTORS() {
+// Disconnect the bank and return it to its safest state.
+//
+// Called on the 2 s serial timeout and on an explicit KILL. This is the rig's
+// independent hardware safety layer -- it runs whether or not the host is
+// healthy, and it is what protects the bank while the Python side is stalled
+// in a COM-port scan or a hung DAQ.
+//
+// Two distinct things happen here, and the second is the one that matters:
+//
+//   1. Every bank relay is driven RELAY_OPEN, which puts ALL resistors into
+//      circuit -- maximum resistance, 63.75 ohm, so minimum current. Note this
+//      is the opposite sense to what "open" suggests at first glance: an open
+//      relay does not remove a resistor, it stops bypassing it.
+//   2. RELAY_MAIN_PIN is driven open, disconnecting the bank from the battery
+//      entirely. THIS is what actually sheds the load.
+//
+// This function was previously called turnONAllRESISTORS(), which described
+// only step 1 and said nothing about the main contactor -- the safety-critical
+// half. Renamed so the name states the outcome rather than a side effect.
+void shedAllLoad() {
   digitalWrite(BANK_1_RELAY, RELAY_OPEN);
   for (int i = 0; i < numOtherRelays; i++) {
     digitalWrite(otherRelayPins[i], RELAY_OPEN);

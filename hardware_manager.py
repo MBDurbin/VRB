@@ -9,9 +9,11 @@ from rig_config import RigConfig
 
 # ================= CONFIGURATION =================
 # Channel mapping, scaling and sensor layout all come from rig_config.json --
-# see DaqConfig in rig_config.py. Only the resistor-bank baud rate stays here
-# because it is fixed by the Arduino sketch, not by the pack.
-RESISTOR_BAUD_RATE = 9600
+# see DaqConfig in rig_config.py.
+#
+# Nothing about the resistor controller belongs in this module. This process
+# owns the NI-DAQ and the temperature Arduino; control_logic owns the resistor
+# controller, including its baud rate and its port discovery.
 
 
 def derive_cell_voltages(cumulative_voltages):
@@ -76,63 +78,65 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
 
     hardware_state = {
         'temp_ser': None,
-        'res_port': None
     }
     state_lock = threading.Lock()
 
     def connection_watchdog():
-        """Hunts for missing Arduinos and verifies existing ones across multiple baud rates."""
+        """Hunts for the temperature Arduino and reconnects it when it drops.
+
+        This process owns the temperature sensor ONLY. control_logic owns the
+        resistor controller and finds it with its own sweep.
+
+        That split matters. This watchdog used to hunt for RESISTOR_CTRL as well,
+        which was worse than redundant:
+
+          * control_logic holds that port open, so this process could never
+            claim it. res_port therefore stayed None permanently, the
+            "do I still need to find it" condition never went false, and the
+            sweep ran every 3 s for the life of the process instead of stopping
+            once the temperature sensor was connected.
+          * Every one of those sweeps blocked 2 s per baud rate per port, and
+            opening then closing a port toggles DTR, which hard-resets whatever
+            Arduino is on it. When control_logic was between its own reconnect
+            attempts the port was briefly free, so this thread could grab the
+            resistor controller, identify it, close it -- and reset it out from
+            under the process that actually drives the bank.
+          * The result was discarded anyway: control_logic overwrites
+            hardware_status['res_arduino'] on every packet.
+        """
         while not stop_event.is_set():
             with state_lock:
-                current_active_ports = [p.device for p in serial.tools.list_ports.comports()]
-
-                if hardware_state['res_port'] and hardware_state['res_port'] not in current_active_ports:
-                    print("[WATCHDOG] Resistor Controller LOST! Device unplugged.")
-                    hardware_state['res_port'] = None
-
                 needs_temp = hardware_state['temp_ser'] is None
-                needs_res = hardware_state['res_port'] is None
 
-            if needs_temp or needs_res:
+            if needs_temp:
                 ports = serial.tools.list_ports.comports()
                 for port in ports:
                     if stop_event.is_set(): break
 
-                    # Skip ports we already actively own
+                    # Skip the port we already actively own
                     with state_lock:
-                        if (hardware_state['temp_ser'] and hardware_state['temp_ser'].port == port.device) or \
-                                (hardware_state['res_port'] == port.device):
+                        if hardware_state['temp_ser'] and hardware_state['temp_ser'].port == port.device:
                             continue
 
-                    found = False
-                    # FIX 1: Try both baud rates to catch both Arduinos
-                    for baud in [daq_cfg.temp_baud_rate, RESISTOR_BAUD_RATE]:
-                        if found: break
-                        try:
-                            ser = serial.Serial(port.device, baud, timeout=2)
-                            time.sleep(2)  # Wait for Arduino to clear bootloader
-                            ser.reset_input_buffer()
+                    try:
+                        ser = serial.Serial(port.device, daq_cfg.temp_baud_rate, timeout=2)
+                        time.sleep(2)  # Wait for Arduino to clear bootloader
+                        ser.reset_input_buffer()
 
-                            ser.write(b"?WHOAMI\n")
-                            response = ser.readline().decode('utf-8').strip()
+                        ser.write(b"?WHOAMI\n")
+                        response = ser.readline().decode('utf-8').strip()
 
-                            with state_lock:
-                                if response == "TEMP_SENSOR" and hardware_state['temp_ser'] is None:
-                                    # FIX 2: Do NOT close the port! Prevent double-reset.
-                                    ser.timeout = 0.1
-                                    hardware_state['temp_ser'] = ser
-                                    print(f"[WATCHDOG] RECONNECTED: Temp Sensor on {port.device}")
-                                    found = True
-
-                                elif response == "RESISTOR_CTRL" and hardware_state['res_port'] is None:
-                                    hardware_state['res_port'] = port.device
-                                    print(f"[WATCHDOG] RECONNECTED: Resistor Controller on {port.device}")
-                                    ser.close()  # We close this because logic script uses it, not DAQ
-                                    found = True
-                                else:
-                                    ser.close()
-                        except Exception:
-                            pass
+                        with state_lock:
+                            if response == "TEMP_SENSOR" and hardware_state['temp_ser'] is None:
+                                # FIX 2: Do NOT close the port! Prevent double-reset.
+                                ser.timeout = 0.1
+                                hardware_state['temp_ser'] = ser
+                                print(f"[WATCHDOG] RECONNECTED: Temp Sensor on {port.device}")
+                                break
+                            else:
+                                ser.close()
+                    except Exception:
+                        pass
 
             time.sleep(3)
 
@@ -190,7 +194,6 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
             # --- B. Read Temperatures ---
             with state_lock:
                 current_temp_ser = hardware_state['temp_ser']
-                res_status = hardware_state['res_port'] is not None
 
             if current_temp_ser:
                 try:
@@ -228,7 +231,12 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 'temp_age_s': time.time() - last_temp_rx,
                 'hardware_status': {
                     'temp_arduino': current_temp_ser is not None,
-                    'res_arduino': res_status,
+                    # Placeholder only. This process does not talk to the
+                    # resistor controller and cannot know its state;
+                    # control_logic owns that port and overwrites this key on
+                    # every packet before the GUI ever sees it. The key is kept
+                    # so the dict shape is stable for anything reading it early.
+                    'res_arduino': False,
                     'ni_daq': ni_daq_active
                 }
             }

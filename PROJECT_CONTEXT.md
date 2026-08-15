@@ -106,6 +106,13 @@ Guards live in `is_valid_transition()`. `ARM` only from `IDLE`, `RUN` only from
 Both Arduinos and the SIL dongle are discovered by COM-port sweep using the
 `?WHOAMI` handshake — no fixed port assignments.
 
+**[docs/hardware_topology.md](docs/hardware_topology.md) is the physical
+reference**: what each ladder step is actually built from, how the bank is
+arranged for cooling, the DS18B20 ROM address map, and the gaps between what the
+hardware needs and what the software enforces. Two of those gaps matter before
+any run — **there is no fan interlock**, and the bank has **no thermal
+protection of its own**.
+
 ## Interface conventions
 
 All styling lives in `theme.py` and is applied as one global stylesheet via

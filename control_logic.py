@@ -1,5 +1,6 @@
 import math
 import os
+import threading
 import time
 import serial
 import serial.tools.list_ports
@@ -30,7 +31,26 @@ RESISTOR_SCAN_COOLDOWN = 3.0
 DEFAULT_VEHICLE = VehicleParams()
 
 
-def auto_detect_resistor():
+def auto_detect_resistor(discovery_lock=None):
+    """Sweep COM ports for the resistor controller. Blocks ~2 s per port.
+
+    `discovery_lock` serialises probing against hardware_manager, which sweeps
+    the same ports looking for the temperature Arduino. Without it the two
+    processes collide: whichever opens a port second gets an access denial, and
+    each open/close toggles DTR and resets whatever Arduino is on the far end.
+    Held for the whole sweep rather than per port, so a probe cannot land between
+    another process's open and its close.
+
+    NEVER call this from the main loop -- it is slow enough to stall the safety
+    checks and the E-STOP path. run_logic_process runs it on a worker thread.
+    """
+    if discovery_lock is not None:
+        with discovery_lock:
+            return _sweep_for_resistor()
+    return _sweep_for_resistor()
+
+
+def _sweep_for_resistor():
     ports = serial.tools.list_ports.comports()
     for port in ports:
         try:
@@ -434,10 +454,48 @@ def is_valid_transition(current_state, command):
     return False
 
 
-def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Queue, stop_event: Event):
-    res_ser = auto_detect_resistor()
+def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Queue,
+                      stop_event: Event, discovery_lock=None):
     fsm_state = "DISCONNECTED"
     target_res = 0.0
+
+    # --- Resistor controller discovery, off the safety loop ---
+    #
+    # This used to run inline: the first connect blocked startup, and every
+    # reconnect attempt blocked the main loop for ~2 s PER COM PORT. During that
+    # stall nothing was serviced -- not the GUI command queue (so a pressed
+    # E-STOP sat unread), not the safety checks, not telemetry forwarding, so the
+    # display froze too. Relying on the Arduino's watchdog to cover a stall in
+    # the safety-critical process is a structural weakness even when it works.
+    #
+    # Ownership rule that keeps this safe without heavy locking:
+    #   the worker thread only ever ASSIGNS the handle when the slot is empty;
+    #   the main loop only ever CLEARS it.
+    # So the two never contend for the same handle, and the main loop can read
+    # it without holding a lock across a serial write.
+    resistor_slot = {'ser': None}
+    slot_lock = threading.Lock()
+
+    def resistor_discovery_worker():
+        while not stop_event.is_set():
+            with slot_lock:
+                have = resistor_slot['ser'] is not None
+            if not have:
+                found = auto_detect_resistor(discovery_lock)
+                if found is not None:
+                    with slot_lock:
+                        # Re-check: the main loop cannot have filled the slot,
+                        # but it may have signalled shutdown while we probed.
+                        if stop_event.is_set():
+                            found.close()
+                        else:
+                            resistor_slot['ser'] = found
+            stop_event.wait(RESISTOR_SCAN_COOLDOWN)
+
+    discovery = threading.Thread(target=resistor_discovery_worker, daemon=True)
+    discovery.start()
+
+    res_ser = None
 
     # All limits, the pack spec and the vehicle model come from rig_config.json
     # (falling back to the P45B 12S4P defaults). Nothing here is hardcoded, so a
@@ -467,7 +525,6 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
     last_heartbeat = time.time()
     last_physics_time = time.time()
-    last_resistor_scan = time.time()
 
     # --- COULOMB COUNTING VARIABLES ---
     total_capacity_ah = pack.capacity_ah
@@ -518,12 +575,22 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
         data['daq_age_s'] = time.time() - last_daq_rx
 
+        # Pick up whatever the discovery thread has found. Never blocks: if the
+        # slot is empty the thread is still sweeping, and this loop carries on
+        # servicing commands and safety checks in the meantime.
+        if res_ser is None:
+            with slot_lock:
+                res_ser = resistor_slot['ser']
+
         if res_ser is None or not res_ser.is_open:
             if fsm_state != "FAULT":
                 fsm_state = "DISCONNECTED"
-            if time.time() - last_resistor_scan >= RESISTOR_SCAN_COOLDOWN:
-                last_resistor_scan = time.time()
-                res_ser = auto_detect_resistor()
+            if res_ser is not None:
+                # Link died. Clearing the slot is what re-arms the discovery
+                # thread -- it only assigns when the slot is empty.
+                with slot_lock:
+                    resistor_slot['ser'] = None
+                res_ser = None
         else:
             if fsm_state == "DISCONNECTED" and data['hardware_status'].get('temp_arduino', False):
                 fsm_state = "IDLE"
@@ -653,7 +720,13 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 if time.time() - last_heartbeat > 0.5:
                     try:
                         res_ser.write(b"alive\n")
-                    except:
+                    except serial.SerialException:
+                        # Link dropped. Swallowed deliberately: the port check at
+                        # the top of the loop handles reconnection, and the
+                        # Arduino's own 2 s watchdog sheds the load meanwhile.
+                        # Narrowed from a bare except, which also caught
+                        # KeyboardInterrupt and SystemExit and would have made
+                        # this process ignore a shutdown request.
                         pass
                     last_heartbeat = time.time()
 
@@ -730,7 +803,20 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             telemetry_queue.get()
         telemetry_queue.put(data)
 
-    if res_ser and res_ser.is_open:
-        res_ser.write(b"KILL\n")
-        res_ser.close()
+    # Take the handle out of the slot before closing it, so a discovery sweep
+    # that finishes during shutdown cannot hand back a port we are tearing down.
+    with slot_lock:
+        final_ser = resistor_slot['ser'] or res_ser
+        resistor_slot['ser'] = None
+
+    if final_ser and final_ser.is_open:
+        try:
+            final_ser.write(b"KILL\n")
+        except serial.SerialException:
+            pass
+        final_ser.close()
+
+    # The worker is a daemon and waits on stop_event, so it exits on its own;
+    # join briefly so its port handles are released before the process ends.
+    discovery.join(timeout=2.0)
     print("[LOGIC] Process cleanly shutdown.")

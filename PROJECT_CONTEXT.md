@@ -427,9 +427,11 @@ watchdog has already shed load in hardware. **This means load-shedding in that
 window rests entirely on the Arduino watchdog, not on software.** Verify on the
 bench.
 
-**4. The Arduino sketches are not in this repo.** `Arduino_Slave_Code_v3.ino`
-lives under `OneDrive\Documents\Arduino\`. The watchdog contactor fix is
-therefore unversioned and unbacked-up, despite being a safety layer.
+**4. The `SIL_KEY` dongle firmware is not in this repo.** `main_v2.py` probes for
+a device replying `SIL_KEY` to unlock software-in-the-loop mode, and no such
+sketch exists on the development machine. The other three sketches now live in
+`arduino/` — see that folder's README. If the dongle exists, its firmware is
+elsewhere and should join them.
 
 **5. No cross-validation between threshold spinboxes.** Nothing prevents setting
 `V Warn` below `V Crit`, or `Derate Start` above `Max Temp`. The derate case now

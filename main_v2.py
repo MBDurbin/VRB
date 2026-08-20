@@ -2,7 +2,7 @@ import sys
 import serial
 import serial.tools.list_ports
 import time
-from multiprocessing import Queue, Event, Process
+from multiprocessing import Queue, Event, Process, Lock
 
 # Import modules
 from gui_layout import run_gui_process
@@ -39,8 +39,16 @@ if __name__ == '__main__':
     daq_queue = Queue(maxsize=10) #houses voltages, temps, and current
     stop_event = Event() #Kill Switch
 
+    # Serialises COM-port probing between the two processes that do it. Both
+    # sweep every port sending ?WHOAMI -- control_logic looking for the resistor
+    # controller, hardware_manager for the temperature Arduino. Unsynchronised,
+    # whichever opens a port second gets an access denial, and every open/close
+    # toggles DTR and resets the Arduino on the far end, including the other
+    # process's device.
+    discovery_lock = Lock()
+
     # 1. Start the FSM Control Logic Process
-    logic_process = Process(target=run_logic_process, args=(daq_queue, telemetry_queue, gui_cmd_queue, stop_event)) #pakage queues and send to logic in seperate CPU
+    logic_process = Process(target=run_logic_process, args=(daq_queue, telemetry_queue, gui_cmd_queue, stop_event, discovery_lock)) #pakage queues and send to logic in seperate CPU
     logic_process.start() #initialize ^
 
     # 2. Check for the Developer Dongle
@@ -69,7 +77,7 @@ if __name__ == '__main__':
     else:
         # --- PHYSICAL HARDWARE MODE ---
         print("Starting physical DAQ hardware...")
-        daq_process = Process(target=run_daq_process, args=(daq_queue, stop_event))
+        daq_process = Process(target=run_daq_process, args=(daq_queue, stop_event, None, discovery_lock))
         daq_process.start()
 
         # Start the Main GUI in its own process

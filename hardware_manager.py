@@ -64,7 +64,8 @@ def parse_temperature_line(line, sensors_per_bus, bus_count):
     return bus_idx, readings
 
 
-def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig = None):
+def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig = None,
+                    discovery_lock=None):
     config = config if config is not None else RigConfig.load()
     daq_cfg = config.daq
     pack = config.pack
@@ -104,41 +105,56 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
           * The result was discarded anyway: control_logic overwrites
             hardware_status['res_arduino'] on every packet.
         """
+        def sweep():
+            """One pass over every COM port looking for TEMP_SENSOR."""
+            for port in serial.tools.list_ports.comports():
+                if stop_event.is_set():
+                    return
+
+                # Skip the port we already actively own
+                with state_lock:
+                    if hardware_state['temp_ser'] and hardware_state['temp_ser'].port == port.device:
+                        continue
+
+                try:
+                    ser = serial.Serial(port.device, daq_cfg.temp_baud_rate, timeout=2)
+                    time.sleep(2)  # Wait for Arduino to clear bootloader
+                    ser.reset_input_buffer()
+
+                    ser.write(b"?WHOAMI\n")
+                    response = ser.readline().decode('utf-8').strip()
+
+                    with state_lock:
+                        if response == "TEMP_SENSOR" and hardware_state['temp_ser'] is None:
+                            # FIX 2: Do NOT close the port! Prevent double-reset.
+                            ser.timeout = 0.1
+                            hardware_state['temp_ser'] = ser
+                            print(f"[WATCHDOG] RECONNECTED: Temp Sensor on {port.device}")
+                            return
+                        ser.close()
+                except Exception:
+                    pass
+
         while not stop_event.is_set():
             with state_lock:
                 needs_temp = hardware_state['temp_ser'] is None
 
             if needs_temp:
-                ports = serial.tools.list_ports.comports()
-                for port in ports:
-                    if stop_event.is_set(): break
+                # Serialise against control_logic, which sweeps the same ports
+                # looking for the resistor controller. Without this the two
+                # processes collide: whichever opens a port second gets an access
+                # denial, and each open/close toggles DTR and resets whatever
+                # Arduino is on the far end -- including the other process's.
+                # Held across the whole sweep, so a probe cannot land between
+                # another process's open and its close.
+                if discovery_lock is not None:
+                    with discovery_lock:
+                        sweep()
+                else:
+                    sweep()
 
-                    # Skip the port we already actively own
-                    with state_lock:
-                        if hardware_state['temp_ser'] and hardware_state['temp_ser'].port == port.device:
-                            continue
-
-                    try:
-                        ser = serial.Serial(port.device, daq_cfg.temp_baud_rate, timeout=2)
-                        time.sleep(2)  # Wait for Arduino to clear bootloader
-                        ser.reset_input_buffer()
-
-                        ser.write(b"?WHOAMI\n")
-                        response = ser.readline().decode('utf-8').strip()
-
-                        with state_lock:
-                            if response == "TEMP_SENSOR" and hardware_state['temp_ser'] is None:
-                                # FIX 2: Do NOT close the port! Prevent double-reset.
-                                ser.timeout = 0.1
-                                hardware_state['temp_ser'] = ser
-                                print(f"[WATCHDOG] RECONNECTED: Temp Sensor on {port.device}")
-                                break
-                            else:
-                                ser.close()
-                    except Exception:
-                        pass
-
-            time.sleep(3)
+            # wait() rather than sleep() so shutdown is not delayed by up to 3 s.
+            stop_event.wait(3)
 
     print("[DAQ] Booting Self-Healing Watchdog...")
     watchdog = threading.Thread(target=connection_watchdog, daemon=True)

@@ -1126,8 +1126,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 series = self.config.pack.series_count
                 sensor_count = series * self.config.pack.parallel_count
 
+                # Pad short rows with EMPTY fields, not 0.0. A missing sensor and
+                # a sensor genuinely reading 0.0 are different events -- one is a
+                # wiring fault, the other a dead cell -- and writing 0.0 for both
+                # makes them indistinguishable in the log forever after. An empty
+                # CSV field reads back as NaN in pandas and plots as a gap.
                 cell_row = [round(v, 3) for v in cells][:series]
-                cell_row += [0.0] * (series - len(cell_row))
+                cell_row += [''] * (series - len(cell_row))
                 row_data.extend(cell_row)
 
                 flat_temps = []
@@ -1135,7 +1140,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                     flat_temps.extend(bus)
 
                 temp_row = [round(t, 1) for t in flat_temps][:sensor_count]
-                temp_row += [0.0] * (sensor_count - len(temp_row))
+                temp_row += [''] * (sensor_count - len(temp_row))
                 row_data.extend(temp_row)
 
                 self.csv_writer.writerow(row_data)

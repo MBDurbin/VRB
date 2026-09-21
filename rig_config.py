@@ -219,7 +219,7 @@ VEHICLE_FIELD_LABELS = {
 class PackConfig:
     """Per-cell datasheet values plus pack topology. Pack limits derive from these.
 
-    Defaults describe the Molicel INR-21700-P45B in 12S4P, taken from Product
+    Defaults describe the Reliance RS50 21700 5000mAh 70A in 12S4P, taken from Product
     Data Sheet v1.2. Replace with your own cell's numbers.
 
     THE RULE FOR THIS CLASS: every field is a number you can read directly off a
@@ -232,7 +232,7 @@ class PackConfig:
     # Free-text cell part number. Purely informational -- it appears in startup
     # logs and the GUI's status strip so an operator can confirm at a glance
     # which cell the software thinks is installed. Nothing computes with it.
-    cell_model: str = "Molicel INR-21700-P45B"
+    cell_model: str = "Reliance INR21700-RS50"
 
     # Cells in SERIES within one module. Multiplies voltage: 12S of a 4.2 V cell
     # gives a 50.4 V module. Also determines how many DAQ voltage taps are
@@ -260,19 +260,19 @@ class PackConfig:
     # Typical capacity of one cell. "Typical" means the average a good cell
     # delivers; individual cells vary. Used for coulomb counting unless
     # use_minimum_capacity is set below.
-    cell_capacity_ah: float = 4.5           # typical; see usable_capacity_ah note
+    cell_capacity_ah: float = 5.0           # typical; see usable_capacity_ah note
 
     # Guaranteed-minimum capacity of one cell -- the worst-case figure the
     # manufacturer commits to. Lower than typical (4.3 vs 4.5 here, a 4.65%
     # difference across the pack). Selecting this is the conservative choice
     # because overstating remaining charge is the dangerous direction.
-    cell_capacity_min_ah: float = 4.3       # minimum / worst case
+    cell_capacity_min_ah: float = 4.95       # minimum / worst case
 
     # Maximum sustained discharge current for ONE cell. This is the single most
     # safety-critical number in this file: it sets the over-current trip for the
     # whole rig via max_current_a below. Check the datasheet carefully -- many
     # cells quote a higher "pulse" rating that must NOT be used here.
-    cell_max_continuous_a: float = 45.0
+    cell_max_continuous_a: float = 70
 
     # Fully-charged resting voltage of one cell. Sets the top of the pack's
     # voltage range. Not a trip threshold; it is a reference for the GUI's plot
@@ -295,13 +295,13 @@ class PackConfig:
     # lower than the cut-off temperature quoted alongside a current rating -- the
     # P45B lists 60 C operating but an 80 C cut-off for its 45 A test, and 60 is
     # the correct one to use here.
-    cell_max_temp_c: float = 60.0           # discharge operating ceiling
+    cell_max_temp_c: float = 80.0           # discharge operating ceiling
 
     # DC internal resistance of one cell, in milliohms, measured at 50% state of
     # charge. Drives the sag calculations: series adds and parallel divides, so
     # 15 mOhm in 12S4P gives a 45 mOhm module. This is why the undervoltage trip
     # sits well above the absolute cutoff -- at 180 A this module sags over 8 V.
-    cell_dc_milliohm: float = 15.0          # DC impedance at 50% SOC
+    cell_dc_milliohm: float = 4.0         # DC impedance at 50% SOC
 
     # Use minimum rather than typical capacity for SOC. Conservative: a worst-case
     # pack really does hold less, and overstating SOC is the dangerous direction.

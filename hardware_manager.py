@@ -23,8 +23,8 @@ def derive_cell_voltages(cumulative_voltages):
     Driven by the length of the input rather than a fixed count, so a pack with
     a different series count cannot raise an IndexError here.
     """
-    if not cumulative_voltages:
-        return [], 0.0
+    if not cumulative_voltages: #if the list is empty
+        return [], 0.0 #return an empty list and 0 voltage
 
     cells = [cumulative_voltages[0]]
     for i in range(1, len(cumulative_voltages)):
@@ -41,18 +41,18 @@ def parse_temperature_line(line, sensors_per_bus, bus_count):
     """
     parts = line.split(',')
     if len(parts) != sensors_per_bus + 1:
-        return None
+        return None #if the bus ID and temps dont add up then something is wrong and this data should be dicarded
 
     try:
-        bus_idx = int(parts[0]) - 1
-    except ValueError:
+        bus_idx = int(parts[0]) - 1 #convert the bus number into an index
+    except ValueError: #if its not an int thats fine just pass it since its likely noise
         return None
 
-    if not (0 <= bus_idx < bus_count):
+    if not (0 <= bus_idx < bus_count): #if the bus number is not in the ranges of expected bus numbers get rid of it
         return None
 
-    readings = {}
-    for i in range(sensors_per_bus):
+    readings = {} #create a dictionary
+    for i in range(sensors_per_bus): #i = sensor index
         raw = parts[i + 1]
         if raw == "ERR":
             continue
@@ -70,7 +70,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     daq_cfg = config.daq
     pack = config.pack
 
-    print(f"[DAQ] Pack {pack.series_count}S{pack.parallel_count}P | "
+    print(f"[DAQ] Pack {pack.series_count}S{pack.parallel_count}P | " #print current config file loaded
           f"{daq_cfg.channel_count} voltage channels | "
           f"{daq_cfg.temp_bus_count}x{daq_cfg.sensors_per_bus} = "
           f"{daq_cfg.sensor_count} thermistors")

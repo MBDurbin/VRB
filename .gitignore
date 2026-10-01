@@ -8,3 +8,7 @@ __pycache__/
 
 # Generated telemetry logs
 telemetry_*.csv
+
+# Python environemnts
+.venv/
+venv/

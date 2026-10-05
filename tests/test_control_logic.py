@@ -29,7 +29,12 @@ from control_logic import (
     compute_required_power,
     compute_road_load_forces,
     compute_target_resistance,
+    command_steps,
+    bank_power_floor,
+    check_bank_power,
     resistance_to_steps,
+    VRB_MAX_POWER_W,
+    RESISTOR_TOLERANCE,
     is_valid_transition,
     heartbeat_due,
     HEARTBEAT_INTERVAL_S,
@@ -670,10 +675,12 @@ class TestResistanceTargeting:
 
     def test_never_drops_below_current_limit_clamp(self):
         # Huge power demand should be clamped by max current, not driven to a tiny resistance.
-        req_r = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=180.0,
+        # 120 A keeps the current limit the binding floor: at 48 V it is 5.8 kW,
+        # under the bank's 8 kW cap.
+        req_r = compute_target_resistance(voltage=48.0, req_power=1_000_000.0, max_safe_current=120.0,
                                            current_max_temp=25.0, derate_enabled=False,
                                            derate_start_temp=55.0, max_safe_temp=60.0)
-        expected_floor = 48.0 / 180.0
+        expected_floor = 48.0 / 120.0
         assert math.isclose(req_r, expected_floor, rel_tol=1e-6)
 
     def test_derate_disabled_ignores_high_temp(self):
@@ -758,21 +765,23 @@ class TestModulesInSeries:
         assert math.isclose((v_module ** 2) / r, p_car / modules, rel_tol=1e-9)
 
     def test_peak_car_power_lands_near_the_ladder_minimum(self):
-        # The bank is a binary ladder 0.25..32 ohm. An ~81 kW lap demand should
-        # ask for roughly its smallest step at the 180 A limit -- the rig is
-        # sized for that, and a formula that misses it by a factor of N would put
-        # peak demand nowhere near the hardware's range.
+        # The bank is a binary ladder 0.25..32 ohm. An ~81 kW lap demand asks
+        # for 9 * 50^2 / 81000 = 0.28 ohm, the bottom of the ladder. A formula
+        # that missed by a factor of N would put peak demand nowhere near the
+        # hardware's range. At 50 V that is 9 kW, so the bank's 8 kW cap is what
+        # sets the floor, not the 180 A current limit.
         r = compute_target_resistance(50.0, 81_000.0, 180.0, 25.0, False, 55.0, 60.0,
                                       modules_in_series=9)
         assert 0.25 <= r <= 0.35
-        assert math.isclose(50.0 / r, 180.0, rel_tol=0.02)
+        assert math.isclose(r, bank_power_floor(50.0), rel_tol=1e-9)
 
     def test_current_clamp_uses_module_voltage(self):
         # Only the module's voltage is across the bank, so the floor is V_mod/I.
-        r = compute_target_resistance(50.0, 1e12, 180.0, 25.0, False, 55.0, 60.0,
+        # 120 A rather than 180 A so the bank's 8 kW cap does not bind instead.
+        r = compute_target_resistance(50.0, 1e12, 120.0, 25.0, False, 55.0, 60.0,
                                       modules_in_series=9)
-        assert math.isclose(r, 50.0 / 180.0, rel_tol=1e-9)
-        assert math.isclose(50.0 / r, 180.0, rel_tol=1e-9)
+        assert math.isclose(r, 50.0 / 120.0, rel_tol=1e-9)
+        assert math.isclose(50.0 / r, 120.0, rel_tol=1e-9)
 
     def test_clamp_is_independent_of_module_count(self):
         # Series modules share one current, so the limit does not scale with N.
@@ -806,6 +815,106 @@ class TestModulesInSeries:
         r = compute_target_resistance(50.0, 0.001, 180.0, 25.0, False, 55.0, 60.0,
                                       modules_in_series=9)
         assert r <= MAX_RESISTANCE
+
+
+# ================= BANK POWER CAP =================
+
+def _worst_case_bank_watts(voltage, steps):
+    """Bank power at `steps` with an element at the low end of its tolerance."""
+    return voltage ** 2 / (steps * RESISTOR_RESOLUTION * (1.0 - RESISTOR_TOLERANCE))
+
+
+class TestBankPowerCap:
+    """The bank is rated 8 kW whatever the cells can deliver.
+
+    The RS50 cells derive a 275 A limit, which at 50 V is ~14 kW. Nothing in the
+    config or the GUI may let the bank be commanded past its rating.
+    """
+
+    MAX_DEMAND = dict(req_power=1e12, current_max_temp=25.0, derate_enabled=False,
+                      derate_start_temp=55.0, max_safe_temp=60.0, modules_in_series=9)
+
+    def test_rating_is_8_kw(self):
+        assert VRB_MAX_POWER_W == 8000.0
+
+    def test_never_commanded_past_8_kw_at_any_voltage_or_current_limit(self):
+        # Sweep the module from cutoff to full charge, with current limits up to
+        # far beyond anything a config could hold.
+        for tenth_volts in range(300, 505):
+            v = tenth_volts / 10.0
+            for max_amps in (100.0, 175.0, 275.0, 1000.0, 1e9):
+                steps = command_steps(v, max_safe_current=max_amps, **self.MAX_DEMAND)
+                assert _worst_case_bank_watts(v, steps) <= VRB_MAX_POWER_W, (v, max_amps, steps)
+
+    def test_full_module_loses_the_bottom_step(self):
+        # 50.4 V across 0.25 ohm is ~10 kW, so the floor is the 0.5 ohm step.
+        assert command_steps(50.4, max_safe_current=275.0, **self.MAX_DEMAND) == 2
+
+    def test_bottom_step_returns_once_the_module_sags(self):
+        # sqrt(0.25 * 0.95 * 8000) = 43.6 V. Below that 0.25 ohm is within rating.
+        assert command_steps(43.5, max_safe_current=275.0, **self.MAX_DEMAND) == 1
+        assert command_steps(43.7, max_safe_current=275.0, **self.MAX_DEMAND) == 2
+
+    def test_cap_ignores_the_configured_current_limit(self):
+        # Raising max_amps from the GUI must not move the cap.
+        low = command_steps(50.4, max_safe_current=200.0, **self.MAX_DEMAND)
+        absurd = command_steps(50.4, max_safe_current=1e9, **self.MAX_DEMAND)
+        assert low == absurd == 2
+
+    def test_floor_is_rounded_up_not_to_nearest(self):
+        # A 175 A limit at 50.4 V floors at 0.288 ohm. Rounding to nearest used to
+        # send the 0.25 ohm step: ~192 A even after the pack's own sag, through
+        # the limit it was meant to hold.
+        steps = command_steps(50.4, max_safe_current=175.0, **self.MAX_DEMAND)
+        assert 50.4 / (steps * RESISTOR_RESOLUTION) <= 175.0
+
+    def test_unclamped_demand_still_rounds_to_nearest(self):
+        # Well above every floor (0.46 ohm at 46 V and 100 A), the request still
+        # rounds to the nearest step, down as well as up -- only the floor
+        # rounds up.
+        def steps_for(ohms):
+            return command_steps(46.0, 46.0 ** 2 / ohms, 100.0, 25.0, False, 55.0, 60.0,
+                                 modules_in_series=1)
+        assert steps_for(1.37) == 5     # 5.48 steps -> 1.25 ohm
+        assert steps_for(1.40) == 6     # 5.60 steps -> 1.50 ohm
+
+    def test_power_floor_uses_worst_case_tolerance(self):
+        assert math.isclose(bank_power_floor(50.0),
+                            50.0 ** 2 / (VRB_MAX_POWER_W * (1.0 - RESISTOR_TOLERANCE)))
+
+
+class TestBankOverpowerTrip:
+    def _packet(self, **kw):
+        d = {'max_temp': 30.0, 'amps': 50.0, 'voltage': 46.0,
+             'cell_voltages': [3.83] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
+             'temp_sensor_ages_s': _fresh_sensor_ages(),
+             'hardware_status': {'temp_arduino': True}}
+        d.update(kw)
+        return d
+
+    def test_trips_above_8_kw_even_with_a_275_a_limit(self):
+        # 46 V x 180 A = 8.28 kW, well inside the cells' 275 A limit.
+        data = self._packet(amps=180.0)
+        assert evaluate_safety(data, _limits(max_amps=275.0)) == (True, "BANK OVERPOWER")
+
+    def test_just_under_8_kw_passes(self):
+        data = self._packet(amps=7990.0 / 46.0)
+        assert evaluate_safety(data, _limits(max_amps=275.0)) == (False, None)
+
+    def test_applies_unarmed(self):
+        # Like overcurrent: 8 kW into the bank while idle means something is wrong.
+        data = self._packet(amps=180.0)
+        assert evaluate_safety(data, _limits(max_amps=275.0), armed=False) \
+            == (True, "BANK OVERPOWER")
+
+    def test_overcurrent_reported_first(self):
+        data = self._packet(amps=300.0)
+        assert evaluate_safety(data, _limits(max_amps=275.0)) == (True, "OVERCURRENT")
+
+    def test_cannot_be_raised_through_the_limits_dict(self):
+        # SET_LIMITS replaces these keys wholesale; none of them is the bank cap.
+        assert not any('power' in key or 'kw' in key for key in _limits())
+        assert check_bank_power(46.0, 180.0) == (True, "BANK OVERPOWER")
 
 
 # ================= REQUIRED POWER =================
@@ -991,3 +1100,13 @@ class TestResistanceToSteps:
 
     def test_max_resistance_step_count(self):
         assert resistance_to_steps(MAX_RESISTANCE) == round(MAX_RESISTANCE / RESISTOR_RESOLUTION)
+
+    def test_floor_rounds_up(self):
+        assert resistance_to_steps(0.25, min_r=0.288) == 2
+
+    def test_floor_on_the_grid_is_not_bumped_a_step(self):
+        assert resistance_to_steps(0.25, min_r=0.5) == 2
+        assert resistance_to_steps(0.25, min_r=0.1 + 0.2 + 0.2) == 2   # 0.5 via float error
+
+    def test_never_exceeds_an_8_bit_command(self):
+        assert resistance_to_steps(1e6, min_r=1e6) == 255

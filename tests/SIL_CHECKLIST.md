@@ -42,11 +42,11 @@ plant-model window and the main telemetry GUI appear.
 | B1 | Raise temp slider past **Max Temp** (default 60 °C) | State goes `FAULT` (red), console logs `OVERTEMP ALARM!` |
 | B2 | While in FAULT, lower temp back to 25 °C | State **stays** `FAULT` — must not self-clear |
 | B3 | Press **RESET** | Returns to `IDLE` |
-| B4 | Raise current slider past **Max Amp + E-Stop Buffer** (185 A) | `FAULT`, console logs `OVERCURRENT ALARM!` |
+| B4 | Set **Max Amp** to 120 A, then raise current slider past 125 A (Max Amp + E-Stop Buffer) | `FAULT`, console logs `OVERCURRENT ALARM!`. The derived RS50 limit is 280 A, past the slider, and the bank's 8 kW trip (B16) fires first at any limit above ~190 A |
 | B5 | RESET, then press **E-STOP** with no fault present | Immediately `FAULT` regardless of prior state |
 | B6 | RESET, then drag SIL **Pack OCV** down to 3.00 V/cell | `FAULT`, console logs `UNDERVOLTAGE ALARM!` |
 | B7 | RESET, set OCV to 3.20 V/cell, then raise current to ~150 A | `FAULT` on sag alone — pack reads 31.65 V under load despite 38.4 V at rest |
-| B8 | With all three faults possible at once (hot + high amps + low OCV) | Console reports `OVERTEMP` — priority is temp > current > voltage |
+| B8 | With all three faults possible at once (hot + high amps + low OCV) | Console reports `OVERTEMP` — priority is temp > current > bank power > voltage |
 | B9 | RESET, ARM, then tick **Simulate hardware interlock fault** | `FAULT` logging `TEMP LINK LOST` — losing thermal monitoring while armed is itself a fault |
 | B10 | Untick the fault, RESET, stay in `IDLE`, tick it again | **No** fault — sensor checks apply only in ARMED/RUNNING, so the rig can still be brought up |
 | B11 | RESET, ARM, then set OCV so one cell would read below **Cell min** (2.70 V) | `FAULT` logging `CELL UNDERVOLTAGE` |
@@ -54,6 +54,7 @@ plant-model window and the main telemetry GUI appear.
 | B13 | From B12, press **ARM** | `FAULT` — arming on a 0.0 V reading must not be silently permitted |
 | B14 | ARM+RUN, then close the SIL window so the plant stops feeding | `FAULT` logging `DAQ DATA STALE` within ~1 s, and the GUI keeps updating rather than freezing |
 | B15 | Repeat B14 but press **E-STOP** while the plant is stopped | E-STOP is still processed — the logic loop no longer skips its body on an empty queue |
+| B16 | RESET, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~192 A | `FAULT` logging `BANK OVERPOWER` once V × I passes 8 kW, in `IDLE` as well. No Max Amp setting moves this trip |
 
 **Not reachable from the SIL sliders** — the plant model generates uniform cells
 and always-fresh timestamps, so these need either a unit test or real hardware:

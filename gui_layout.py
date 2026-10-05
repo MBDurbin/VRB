@@ -10,7 +10,7 @@ from rig_config import (
     RigConfig, VehicleParams, PackConfig, DaqConfig,
     VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, DAQ_FIELD_LABELS, field_label,
 )
-from control_logic import DEFAULT_LAP_CSV
+from control_logic import DEFAULT_LAP_CSV, VRB_MAX_POWER_W
 import theme
 from PyQt6 import QtWidgets, QtCore
 import pyqtgraph as pg
@@ -321,7 +321,9 @@ class ConfigDialog(QtWidgets.QDialog):
             f"RESULTING TRIPS   {candidate.limits.max_amps:.0f} A "
             f"(+{candidate.limits.amp_buffer:.0f} buffer)  |  "
             f"{candidate.limits.max_temp:.0f} C  |  "
-            f"{candidate.limits.min_volts:.1f} V"
+            f"{candidate.limits.min_volts:.1f} V\n"
+            f"BANK LIMIT        {VRB_MAX_POWER_W / 1000:.1f} kW, fixed in control_logic.py and "
+            f"applied whatever the current limit above"
         )
 
         warnings = candidate.validate()

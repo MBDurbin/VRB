@@ -176,11 +176,29 @@ Planned, per the notes in `rig_config.py`. When they arrive, **155 °C** is the
 TE series operating ceiling and needs its own limit field — `max_temp` is a
 60 °C cell figure and must not be reused.
 
-**3. The current limit exceeds the bank's rating.** The VRB is rated 8 kW, which
-at 50 V is **160 A**. The over-current trip is 180 A ≈ 9 kW, about **12.5%
-over**. That 180 A derives purely from the cells; the software has no idea the
-resistor bank exists. Forced air may well cover it — the 2 kW element figures are
-free-air ratings — but no software limit reflects the bank's own capability.
+**3. The bank's 8 kW rating — now enforced in software.** The current limit
+derives from the cells alone. With the Reliance RS50 cells (70 A each) it works out
+to 275 A, about 14 kW at 50 V, so the cell limit can no longer protect the bank.
+`VRB_MAX_POWER_W = 8000` in `control_logic.py` is a code constant, deliberately
+*not* a `rig_config` field, so neither the config file nor the GUI can raise it.
+It is enforced twice:
+
+- **Command floor.** The ladder is never set below V² / (0.95 × 8 kW), using the
+  measured module voltage. The 0.95 covers bank 1's ±5% elements. The floor
+  rounds up to the next 0.25 Ω step rather than to the nearest.
+- **Trip.** Measured V × I above 8 kW faults the rig as `BANK OVERPOWER` in any
+  state, like over-current.
+
+The ladder has no step between 0.25 Ω and 0.5 Ω, so the cap costs more than the
+last kilowatt. Above **43.6 V** (3.63 V/cell) the 0.25 Ω step would exceed 8 kW,
+and the next step down, 0.5 Ω, cannot draw more than about **5 kW**. Peak load
+therefore tops out near 5 kW for the top of the charge range and returns to
+7–8 kW only once the module has sagged below 43.6 V. If bank 1's actual
+resistance is measured, setting `RESISTOR_TOLERANCE` to match recovers the
+margin between 43.6 V and 44.7 V.
+
+Only bank 1 is rated 8 kW. The cap is a total, so it does not by itself keep the
+smaller banks inside *their* ratings; see the bank table above for each one.
 
 **4. Side-of-cell temperature sensors are not fitted.** Only the top of each cell
 is instrumented. Planned.

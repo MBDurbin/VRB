@@ -25,6 +25,18 @@ MAX_RESISTANCE = 63.75
 RESISTOR_RESOLUTION = 0.25
 RESISTOR_SCAN_COOLDOWN = 3.0
 
+# The resistor bank's power rating. At the 0.25 ohm floor only bank 1 -- four
+# 2 kW elements in parallel -- is in circuit, so it carries the peak duty
+# (docs/hardware_topology.md). A property of the hardware, like the two ladder
+# values above, and deliberately NOT a rig_config field: every field there can
+# be edited from the GUI. The cells may support more current; the bank does not.
+VRB_MAX_POWER_W = 8000.0
+
+# Bank 1's elements are +/-5% parts (TE2000B1R0J, the J). One 5% under its
+# nominal resistance draws 5% more power at the same voltage, so the resistance
+# floor assumes that worst case rather than tripping BANK OVERPOWER mid-run.
+RESISTOR_TOLERANCE = 0.05
+
 # The resistor Arduino sheds load after 2 s without an "alive" or a valid
 # command. 0.5 s gives four chances before it fires.
 HEARTBEAT_INTERVAL_S = 0.5
@@ -108,6 +120,24 @@ def check_thermal_and_current(max_temp, amps, max_safe_temp, max_safe_current, c
         return True, "OVERTEMP"
     if amps >= (max_safe_current + current_buffer):
         return True, "OVERCURRENT"
+    return False, None
+
+
+def check_bank_power(voltage, amps):
+    """Resistor bank overload. Returns (is_fault, reason).
+
+    Checked against the fixed VRB_MAX_POWER_W, never against the configurable
+    limits: the current limit derives from the cells, and with high-rate cells
+    it sits well above anything the bank can absorb. Module voltage times
+    current is never less than what the bank itself dissipates, since wiring
+    and contact drops come out of the same total.
+
+    The resistance floor (see bank_power_floor) keeps a healthy rig under this
+    at steady state, so a trip here means something the floor could not see: a
+    bank element out of tolerance, a relay stuck closed, or a bad reading.
+    """
+    if voltage * amps > VRB_MAX_POWER_W:
+        return True, "BANK OVERPOWER"
     return False, None
 
 
@@ -209,10 +239,11 @@ def evaluate_safety(data, limits, armed=True):
     genuinely over-current AND the temperature link has dropped, the operator
     needs to hear about the current first.
 
-    `armed` should be True only in ARMED/RUNNING. Over-temperature and
-    over-current are always checked -- either means something is wrong no matter
-    what state the FSM thinks it is in. Everything else is gated, because before
-    the rig is armed those readings describe a bench that is not loaded yet:
+    `armed` should be True only in ARMED/RUNNING. Over-temperature, over-current
+    and bank overpower are always checked -- any of them means something is wrong
+    no matter what state the FSM thinks it is in. Everything else is gated,
+    because before the rig is armed those readings describe a bench that is not
+    loaded yet:
 
       * Voltage checks. A rig powered up before the battery is plugged in reads
         0.0 V, which is below any sane undervoltage trip. Checking it in IDLE
@@ -228,6 +259,10 @@ def evaluate_safety(data, limits, armed=True):
         data.get('max_temp', 0.0), data.get('amps', 0.0),
         limits['max_temp'], limits['max_amps'], limits['amp_buffer'],
     )
+    if fault:
+        return True, reason
+
+    fault, reason = check_bank_power(data.get('voltage', 0.0), data.get('amps', 0.0))
     if fault:
         return True, reason
 
@@ -368,6 +403,54 @@ def compute_required_power(velocity_ms, acceleration, params=None):
     return power_at_wheels * eta
 
 
+def bank_power_floor(voltage):
+    """Lowest resistance that keeps the bank within VRB_MAX_POWER_W.
+
+    Bank power is V^2 / R. `voltage` is the measured module voltage, which is
+    never below the voltage across the bank. Stepping to a lower resistance sags
+    the module further, so V^2 / R from the reading taken before the step
+    over-estimates the power after it. Stepping to a higher resistance always
+    lowers the power. Either way the bank stays inside its rating.
+
+    Sized for an element at the low end of its tolerance, so the floor rather
+    than the BANK OVERPOWER trip is what holds the limit.
+
+    In practice this only ever removes the bottom step. At a full 50.4 V module
+    the 0.25 ohm step would dissipate about 10 kW, while the next step, 0.5 ohm,
+    cannot exceed about 5 kW at any charge. 0.25 ohm comes back once the module
+    is below sqrt(0.25 * 0.95 * 8000) = 43.6 V.
+    """
+    return voltage ** 2 / (VRB_MAX_POWER_W * (1.0 - RESISTOR_TOLERANCE))
+
+
+def resistance_floor(voltage, max_safe_current, current_max_temp, derate_enabled,
+                     derate_start_temp, max_safe_temp):
+    """Lowest resistance the bank may be set to right now.
+
+    The highest of three floors, each dividing the MODULE voltage because that is
+    what is across the bank:
+      * the configured current limit, which comes from the cells;
+      * the bank's own power rating, which no configuration can change;
+      * the thermal derate, when enabled and the cells are past its start.
+    """
+    floor_r = max(voltage / max(max_safe_current, 1.0), bank_power_floor(voltage))
+
+    if derate_enabled and (current_max_temp > derate_start_temp):
+        derate_range = max_safe_temp - derate_start_temp
+        if derate_range <= 0:
+            # Misconfigured thresholds (derate start >= max temp) -- fail safe to full derate
+            # instead of a ZeroDivisionError that would crash the safety-critical logic process.
+            derate_pct = 1.0
+        else:
+            derate_pct = (current_max_temp - derate_start_temp) / derate_range
+            derate_pct = max(0.0, min(1.0, derate_pct))
+
+        active_current_limit = max_safe_current * (1.0 - derate_pct)
+        floor_r = max(floor_r, voltage / max(active_current_limit, 1.0))
+
+    return min(MAX_RESISTANCE, floor_r)
+
+
 def compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
                                derate_enabled, derate_start_temp, max_safe_temp,
                                modules_in_series=1):
@@ -385,8 +468,9 @@ def compute_target_resistance(voltage, req_power, max_safe_current, current_max_
     would need -- the bank sees a ninth of the voltage, so it needs a ninth of
     the resistance to pull the same current.
 
-    Both current clamps below divide the MODULE voltage, because that is what is
-    actually across the bank.
+    The result never goes below resistance_floor(): the current limit, the
+    bank's power rating and the thermal derate. It is continuous; command_steps()
+    turns it into a ladder setting without rounding under that floor.
 
     This previously read `(voltage * 9) ** 2`, i.e. N^2 rather than N. That is
     the resistance for a bank spanning the entire battery, so on a single-module
@@ -400,27 +484,25 @@ def compute_target_resistance(voltage, req_power, max_safe_current, current_max_
     else:
         req_r = min(MAX_RESISTANCE, (modules * voltage ** 2) / req_power)
 
-    clamp_min_r = voltage / max(max_safe_current, 1.0)
-    if req_r < clamp_min_r:
-        req_r = clamp_min_r
+    return max(req_r, resistance_floor(voltage, max_safe_current, current_max_temp,
+                                       derate_enabled, derate_start_temp, max_safe_temp))
 
-    if derate_enabled and (current_max_temp > derate_start_temp):
-        derate_range = max_safe_temp - derate_start_temp
-        if derate_range <= 0:
-            # Misconfigured thresholds (derate start >= max temp) -- fail safe to full derate
-            # instead of a ZeroDivisionError that would crash the safety-critical logic process.
-            derate_pct = 1.0
-        else:
-            derate_pct = (current_max_temp - derate_start_temp) / derate_range
-            derate_pct = max(0.0, min(1.0, derate_pct))
 
-        active_current_limit = max_safe_current * (1.0 - derate_pct)
-        derate_min_r = voltage / max(active_current_limit, 1.0)
+def command_steps(voltage, req_power, max_safe_current, current_max_temp,
+                  derate_enabled, derate_start_temp, max_safe_temp, modules_in_series=1):
+    """Ladder steps to send for one profile row.
 
-        if req_r < derate_min_r:
-            req_r = min(MAX_RESISTANCE, derate_min_r)
-
-    return req_r
+    The request rounds to the nearest 0.25 ohm step, but the floor rounds UP.
+    Rounding everything to nearest used to undercut the floor at the bottom of
+    the ladder: a 0.29 ohm current-limit clamp became the 0.25 ohm step, which
+    draws 192 A from a full module.
+    """
+    req_r = compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
+                                      derate_enabled, derate_start_temp, max_safe_temp,
+                                      modules_in_series=modules_in_series)
+    floor_r = resistance_floor(voltage, max_safe_current, current_max_temp,
+                               derate_enabled, derate_start_temp, max_safe_temp)
+    return resistance_to_steps(req_r, min_r=floor_r)
 
 
 def NEUTRAL_PACKET():
@@ -486,8 +568,17 @@ def lap_row_interval(lap_data, idx, default=1.0):
     return default
 
 
-def resistance_to_steps(req_r):
-    return int(round(max(RESISTOR_RESOLUTION, req_r) / RESISTOR_RESOLUTION))
+def resistance_to_steps(req_r, min_r=0.0):
+    """Nearest ladder step to req_r, but never below min_r and never past the top.
+
+    min_r rounds up, so the step sent always sits at or above it. The small
+    epsilon stops a floor exactly on the grid (0.5 ohm) becoming one step too
+    many through float error.
+    """
+    steps = int(round(max(RESISTOR_RESOLUTION, req_r) / RESISTOR_RESOLUTION))
+    floor_steps = math.ceil(min_r / RESISTOR_RESOLUTION - 1e-9)
+    max_steps = int(round(MAX_RESISTANCE / RESISTOR_RESOLUTION))
+    return min(max_steps, max(steps, floor_steps))
 
 
 def heartbeat_due(fsm_state, since_last_s):
@@ -589,7 +680,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     print(f"[LOGIC] Trips: {limits['max_amps']:.0f} A (+{limits['amp_buffer']:.0f}) | "
           f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V module | "
           f"{limits['min_cell_volts']:.2f} V/cell | "
-          f"temp stale > {limits['temp_stale_timeout']:.1f} s")
+          f"temp stale > {limits['temp_stale_timeout']:.1f} s | "
+          f"bank {VRB_MAX_POWER_W / 1000:.1f} kW (fixed)")
     for warning in config.limits.exceedances(pack):
         print(f"[LOGIC WARNING] {warning}")
 
@@ -837,14 +929,16 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         voltage = data['voltage']
                         current_max_temp = data['max_temp']
 
-                        req_r = compute_target_resistance(
+                        steps = command_steps(
                             voltage, req_power, limits['max_amps'], current_max_temp,
                             limits['derate_en'], limits['derate_start'], limits['max_temp'],
                             modules_in_series=pack.modules_in_series
                         )
 
-                        target_res = req_r
-                        steps = resistance_to_steps(req_r)
+                        # What the ladder is actually set to, not the continuous
+                        # request. Near the bottom of the ladder the two can
+                        # differ by a whole step.
+                        target_res = steps * RESISTOR_RESOLUTION
 
                         send_binary_command(res_ser, steps)
 

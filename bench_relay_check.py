@@ -338,10 +338,10 @@ def main():
     except (KeyboardInterrupt, EOFError):
         print()
     finally:
-        # KILL only. Never follow it with 00000000: the firmware closes the main
-        # contactor on any command that isn't a handshake, so a 00000000 after
-        # KILL re-closes it with a resistor in circuit until the 2 s watchdog
-        # fires. Isolated Master Sender.py and Master_Code_v1.py both do that.
+        # KILL only. Never follow it with 00000000: that is a valid command (the
+        # firmware interlock turns it into 00000001), so it re-closes the main
+        # contactor with a resistor in circuit until the 2 s watchdog fires.
+        # Isolated Master Sender.py and Master_Code_v1.py both do that.
         try:
             send_kill(ser, mon)
             time.sleep(0.3)    # let the Arduino's reply print

@@ -145,6 +145,6 @@ Fixing the queue guarantees the **GUI** stays responsive, but the logic process
 still cannot *act* on a STOP while it is blocked inside `auto_detect_resistor()`
 port scanning. This is acceptable because during a port scan `res_ser` is None —
 the resistor Arduino is disconnected, so its own 2s serial watchdog
-(`turnONAllRESISTORS()`) has already opened the main contactor and shed the load
+(`shedAllLoad()`) has already opened the main contactor and shed the load
 in hardware. Confirm this on the bench before trusting it: the software E-STOP
 and the Arduino watchdog are independent layers and both must work.

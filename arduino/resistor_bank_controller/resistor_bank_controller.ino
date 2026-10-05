@@ -1,6 +1,7 @@
 // --- Function Prototypes ---
 void shedAllLoad();
-bool isBinary(String str);
+void feedWatchdog();
+bool isValidCommand(String str);
 bool isAllZeros(String str);
 void updateOtherRelays(String binaryStr);
 
@@ -14,6 +15,10 @@ const int RELAY_MAIN_PIN = 4;       // Main relay d4
 const int BANK_1_RELAY   = 5;        // 0.25 ohm relay on Digital
 const int otherRelayPins[] = {12, 11, 10, 9, 8, 7, 6}; // Relays
 const int numOtherRelays = sizeof(otherRelayPins) / sizeof(otherRelayPins[0]);
+
+// One character per ladder relay: otherRelayPins in order, then BANK_1_RELAY.
+// The host always sends exactly this many (send_binary_command in Python).
+const int COMMAND_LENGTH = numOtherRelays + 1;
 
 const int RELAY_OPEN  = LOW;  // LED OFF
 const int RELAY_CLOSE = HIGH;  // LED ON
@@ -53,42 +58,59 @@ void loop() {
 
     String incomingData = Serial.readStringUntil('\n');
     incomingData.trim();
-    lastConnectionTime = millis();
-    noSignalAnnounced = false;
 
-    // 3. FILTERS & HANDSHAKES (Move these UP!)
+    // 3. IDENTIFY THE MESSAGE BEFORE ACTING ON IT
+    // Only the four messages the host actually sends are acted on. Anything
+    // else -- serial noise, a line cut short by the read timeout, a binary word
+    // of the wrong length -- is rejected without touching a relay or feeding
+    // the watchdog.
+    //
+    // The main relay used to close as soon as a message got past the
+    // handshakes, BEFORE it was checked. A malformed line closed it and left it
+    // closed until the watchdog fired, and even KILL closed it an instant
+    // before opening it again.
+    //
+    // Only "alive" and a valid resistance command feed the watchdog: they are
+    // the host's control traffic. The handshake and KILL are answered but do not
+    // count as proof the host is still in control.
     if (incomingData == "?WHOAMI") {
       Serial.println("RESISTOR_CTRL");
-      return; 
-    }
-
-    if (incomingData == "alive") {
       return;
     }
 
-    // Now it is safe to close the Main Relay, because we know the 
-    // incoming command is actually meant for the resistor bank.
-    if (MainRelay == "Open"){
-      digitalWrite(RELAY_MAIN_PIN, RELAY_CLOSE);
-      MainRelay = "Close";
+    if (incomingData == "alive") {
+      feedWatchdog();
+      return;
     }
 
-    // Fixed: Matches Python's uppercase "KILL" command
+    // Matches Python's uppercase "KILL"; lowercase kept for bench_relay_check.
     if (incomingData == "KILL" || incomingData == "kill") {
       shedAllLoad();
-      return; // Stop processing so it doesn't hit the binary check
+      return;
     }
 
-    // Is it binary?
-    if (!isBinary(incomingData)) {
-       Serial.println("Error: Not a binary signal.");
-       return;
+    if (!isValidCommand(incomingData)) {
+      Serial.print("Error: Rejected. A command is exactly ");
+      Serial.print(COMMAND_LENGTH);
+      Serial.println(" binary digits.");
+      return;
     }
+
+    feedWatchdog();
 
     // SAFETY INTERLOCK
     if (isAllZeros(incomingData)) {
        Serial.println("SAFETY ACTION: All-Zero detected. Adjusting...");
        incomingData.setCharAt(incomingData.length() - 1, '1');
+    }
+
+    // Only now, holding a complete and valid resistance command, connect the
+    // bank. When the main relay is open every ladder relay is open too
+    // (shedAllLoad and setup both guarantee it), so it closes onto maximum
+    // resistance and the ladder steps down to the target below.
+    if (MainRelay == "Open"){
+      digitalWrite(RELAY_MAIN_PIN, RELAY_CLOSE);
+      MainRelay = "Close";
     }
 
     // State change check
@@ -166,8 +188,21 @@ void shedAllLoad() {
   }
 }
 
-bool isBinary(String str) {
-  if (str.length() == 0) return false;
+// Called only for an "alive" heartbeat or a valid resistance command. Any other
+// line -- noise, an unrelated program writing to the port, a malformed command --
+// leaves the timer running, so the bank still sheds 2 s after real control
+// traffic stops, however much else is arriving.
+void feedWatchdog() {
+  lastConnectionTime = millis();
+  noSignalAnnounced = false;
+}
+
+// A resistance command is exactly one 0/1 character per ladder relay. A shorter
+// word would update only some relays and leave the rest at their old setting; a
+// longer one carries bits no relay listens to. Either way the bank would not be
+// at the resistance the host asked for.
+bool isValidCommand(String str) {
+  if ((int)str.length() != COMMAND_LENGTH) return false;
   for (unsigned int i = 0; i < str.length(); i++) {
     if (str.charAt(i) != '0' && str.charAt(i) != '1') {
       return false;

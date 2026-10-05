@@ -25,6 +25,10 @@ MAX_RESISTANCE = 63.75
 RESISTOR_RESOLUTION = 0.25
 RESISTOR_SCAN_COOLDOWN = 3.0
 
+# The resistor Arduino sheds load after 2 s without an "alive" or a valid
+# command. 0.5 s gives four chances before it fires.
+HEARTBEAT_INTERVAL_S = 0.5
+
 
 # Module-level default. Mutating a field here retunes every call that does not
 # pass an explicit params object.
@@ -486,6 +490,27 @@ def resistance_to_steps(req_r):
     return int(round(max(RESISTOR_RESOLUTION, req_r) / RESISTOR_RESOLUTION))
 
 
+def heartbeat_due(fsm_state, since_last_s):
+    """Whether the resistor controller should be sent an "alive" now.
+
+    RUNNING is included deliberately. The heartbeat used to stop once a run
+    began, leaving the per-row resistance commands as the only thing feeding the
+    Arduino's 2 s watchdog. With the shipped 1 s rows that left about 0.9 s of
+    margin; a profile with rows ~2 s apart, or a single command lost on the
+    wire, let the watchdog fire mid-run. That opens the main contactor under full
+    load, and the next command re-closes it a few milliseconds later.
+
+    "alive" moves no relay, so this holds the bank at its current resistance
+    between rows. The watchdog still protects against a stalled host, because
+    the heartbeat comes from this same loop.
+
+    Not in FAULT: the load has been killed, and letting the watchdog lapse there
+    is a second, independent guarantee that it stays shed.
+    """
+    return (fsm_state in ("IDLE", "ARMED", "RUNNING")
+            and since_last_s > HEARTBEAT_INTERVAL_S)
+
+
 def is_valid_transition(current_state, command):
     """Pure FSM guard mirroring the legality checks in the GUI-command handler below."""
     if command == "ARM":
@@ -766,21 +791,20 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
         # --- F. Finite State Machine Actions ---
         if res_ser and res_ser.is_open:
-            if fsm_state in ["IDLE", "ARMED"]:
-                if time.time() - last_heartbeat > 0.5:
-                    try:
-                        res_ser.write(b"alive\n")
-                    except serial.SerialException:
-                        # Link dropped. Swallowed deliberately: the port check at
-                        # the top of the loop handles reconnection, and the
-                        # Arduino's own 2 s watchdog sheds the load meanwhile.
-                        # Narrowed from a bare except, which also caught
-                        # KeyboardInterrupt and SystemExit and would have made
-                        # this process ignore a shutdown request.
-                        pass
-                    last_heartbeat = time.time()
+            if heartbeat_due(fsm_state, time.time() - last_heartbeat):
+                try:
+                    res_ser.write(b"alive\n")
+                except serial.SerialException:
+                    # Link dropped. Swallowed deliberately: the port check at
+                    # the top of the loop handles reconnection, and the
+                    # Arduino's own 2 s watchdog sheds the load meanwhile.
+                    # Narrowed from a bare except, which also caught
+                    # KeyboardInterrupt and SystemExit and would have made
+                    # this process ignore a shutdown request.
+                    pass
+                last_heartbeat = time.time()
 
-            elif fsm_state == "RUNNING":
+            if fsm_state == "RUNNING":
                 # Dwell on each row for the interval the profile itself declares,
                 # not a fixed second. A 10 Hz log played at 1 row/s would run ten
                 # times too slow and hold every power demand ten times too long.

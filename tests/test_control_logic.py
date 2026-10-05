@@ -31,6 +31,8 @@ from control_logic import (
     compute_target_resistance,
     resistance_to_steps,
     is_valid_transition,
+    heartbeat_due,
+    HEARTBEAT_INTERVAL_S,
     VehicleParams,
     MAX_RESISTANCE,
     RESISTOR_RESOLUTION,
@@ -471,6 +473,31 @@ class TestFSMTransitions:
 
     def test_unknown_command_rejected(self):
         assert is_valid_transition("IDLE", "NOT_A_REAL_COMMAND") is False
+
+
+# ================= RESISTOR HEARTBEAT =================
+
+class TestHeartbeat:
+    def test_heartbeat_continues_while_running(self):
+        # Row commands alone left ~0.9 s of watchdog margin; a 2 s row or one
+        # lost command opened the main contactor under load mid-run.
+        assert heartbeat_due("RUNNING", HEARTBEAT_INTERVAL_S + 0.01) is True
+
+    def test_idle_and_armed_still_heartbeat(self):
+        for state in ("IDLE", "ARMED"):
+            assert heartbeat_due(state, HEARTBEAT_INTERVAL_S + 0.01) is True
+
+    def test_no_heartbeat_once_faulted(self):
+        # Letting the watchdog lapse keeps the bank shed even if KILL was lost.
+        assert heartbeat_due("FAULT", 10.0) is False
+
+    def test_not_sent_early(self):
+        assert heartbeat_due("RUNNING", HEARTBEAT_INTERVAL_S - 0.01) is False
+
+    def test_interval_leaves_margin_on_the_arduino_watchdog(self):
+        # Firmware TIMEOUT_LIMIT is 2000 ms. Several heartbeats must fit inside
+        # it, or one late loop iteration would shed the load.
+        assert HEARTBEAT_INTERVAL_S * 3 < 2.0
 
 
 # ================= COULOMB COUNTING =================

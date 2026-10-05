@@ -27,16 +27,33 @@ Drives the binary ladder — 0.25, 0.5, 1, 2, 4, 8, 16, 32 Ω — from an 8-bit 
 sent over serial, plus a main contactor.
 
 **This sketch carries an independent safety layer.** A 2 second serial timeout
-calls `turnONAllRESISTORS()`, which opens every relay including the main
+calls `shedAllLoad()`, which opens every relay including the main
 contactor and sheds the load. That runs whether or not the host is healthy, and
 it is what actually protects the rig when the Python side stalls — during a
 COM-port scan, or if the DAQ process hangs. Do not remove or lengthen that
 timeout without understanding what depends on it.
 
-The host feeds this watchdog with an `alive\n` heartbeat while idle. Note that
-`alive` returns *before* the block that re-closes the main contactor, so a
-heartbeat keeps the watchdog fed without re-energising the bank; only a binary
-command does that.
+The sketch acts on exactly four messages: `?WHOAMI`, `alive`, `KILL`, and a
+resistance command of exactly 8 binary digits, one per ladder relay. Every
+message is identified before anything happens, and only a valid resistance
+command closes the main contactor. Anything else (noise, a line cut short, a
+word of the wrong length) is rejected with an `Error: Rejected` reply and moves
+no relay.
+
+Only `alive` and a valid resistance command reset the watchdog. Garbage on the
+line, the handshake and `KILL` do not, so the bank sheds 2 s after real control
+traffic stops, however much else is arriving. The host sends `alive` every
+0.5 s in IDLE, ARMED *and* RUNNING. During a run that keeps the watchdog fed
+between rows, so a slow lap profile or one lost command cannot open the main
+contactor mid-run. `alive` itself never moves a relay. In FAULT the heartbeat
+stops on purpose.
+
+Bench check after flashing, with the battery disconnected and the relay supply
+on: open the serial monitor at 9600 baud, newline line ending, and send `hello`,
+`0101` and `KILL`. Each must leave the main contactor silent. `00010000` must
+close it. Then send `hello` about once a second: the contactor must still drop
+out about 2 s after `00010000`, with a `No Signal` reply, because junk does not
+reset the watchdog.
 
 ### temperature_sensor_array
 

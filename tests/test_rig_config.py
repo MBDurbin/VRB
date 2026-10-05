@@ -24,13 +24,27 @@ from rig_config import (
 )
 
 
+# The Molicel INR-21700-P45B v1.2, whose datasheet is in datasheets/. The rig now
+# ships configured for the Reliance RS50, but the repo has no RS50 datasheet to
+# check figures against, so the datasheet-anchored tests pin the derivation math
+# on this explicit P45B pack instead of on whatever the defaults happen to be.
+P45B = dict(cell_model="Molicel INR-21700-P45B", cell_capacity_ah=4.5,
+            cell_capacity_min_ah=4.3, cell_max_continuous_a=45.0, cell_max_voltage=4.2,
+            cell_nominal_voltage=3.6, cell_min_voltage=2.5, cell_max_temp_c=60.0,
+            cell_dc_milliohm=15.0, series_count=12, parallel_count=4)
+
+
+def p45b_pack(**overrides):
+    return PackConfig(**{**P45B, **overrides})
+
+
 # ================= PACK DERIVATION =================
 
 class TestPackDerivation:
-    def test_defaults_match_p45b_datasheet(self):
+    def test_p45b_derives_its_datasheet_figures(self):
         # Molicel INR-21700-P45B v1.2, 12S4P. These are the numbers validated
-        # against the datasheet -- if one drifts, the rig is mis-rated.
-        p = PackConfig()
+        # against the datasheet -- if one drifts, the derivation is wrong.
+        p = p45b_pack()
         assert p.cell_count == 48
         assert math.isclose(p.capacity_ah, 18.0)          # 4.5 Ah x 4P
         assert math.isclose(p.max_current_a, 180.0)       # 45 A x 4P
@@ -77,20 +91,21 @@ class TestPackDerivation:
         assert math.isclose(p.resistance_ohm, 0.040)
 
     def test_minimum_capacity_option_is_more_conservative(self):
-        typical = PackConfig(use_minimum_capacity=False)
-        minimum = PackConfig(use_minimum_capacity=True)
+        typical = p45b_pack(use_minimum_capacity=False)
+        minimum = p45b_pack(use_minimum_capacity=True)
 
         assert minimum.capacity_ah < typical.capacity_ah
         assert math.isclose(minimum.capacity_ah, 17.2)  # 4.3 Ah x 4P
 
     def test_sag_matches_ohms_law(self):
-        p = PackConfig()
+        p = p45b_pack()
         assert math.isclose(p.sag_volts(180.0), 180.0 * 0.045)
 
     def test_voltage_under_load_reproduces_the_sag_hazard(self):
         # A pack resting at a healthy-looking 3.2 V/cell is pushed under the
         # 2.5 V/cell cutoff while loaded. This is why the trip sits above 30 V.
-        p = PackConfig()
+        # Needs the P45B's 45 mOhm module; a low-resistance cell sags far less.
+        p = p45b_pack()
         loaded = p.voltage_under_load(ocv_per_cell=3.2, current_a=187.0)
         assert loaded < p.min_voltage
         assert math.isclose(loaded / p.series_count, 2.499, abs_tol=0.001)
@@ -105,15 +120,21 @@ class TestPackDerivation:
 
 class TestLimitDerivation:
     def test_derives_from_pack_by_default(self):
+        # Whatever cell the rig ships configured for.
         pack = PackConfig()
         limits = SafetyLimits().apply_pack_derivation(pack)
 
         # Operating limit sits a buffer below the rating so the E-STOP, which
         # fires at max_amps + buffer, lands exactly ON the rating.
-        assert math.isclose(limits.max_amps, 175.0)
         assert math.isclose(limits.max_amps + limits.amp_buffer, pack.max_current_a)
-        assert math.isclose(limits.max_temp, 60.0)
-        assert math.isclose(limits.min_volts, 36.0)
+        assert math.isclose(limits.max_temp, pack.cell_max_temp_c)
+        assert math.isclose(limits.min_volts, 3.0 * pack.series_count)
+
+    def test_p45b_derives_its_datasheet_limits(self):
+        limits = SafetyLimits().apply_pack_derivation(p45b_pack())
+        assert math.isclose(limits.max_amps, 175.0)     # 180 A rating, less the 5 A buffer
+        assert math.isclose(limits.max_temp, 60.0)      # discharge ceiling, not the 80 C cut-off
+        assert math.isclose(limits.min_volts, 36.0)     # 3.0 V x 12S
 
     def test_trip_point_never_exceeds_pack_rating(self):
         for buffer in [0.0, 5.0, 20.0, 100.0]:
@@ -198,7 +219,7 @@ class TestDerivationConflicts:
         assert 'max_amps' in names
         loaded, derived = next((lo, d) for n, lo, d in conflicts if n == 'max_amps')
         assert loaded == 120.0
-        assert derived == 175.0
+        assert derived == pack.max_current_a - SafetyLimits().amp_buffer
 
     def test_reversion_can_be_in_the_unsafe_direction(self):
         # The reason this warning exists: a deliberate derate coming back higher.
@@ -252,7 +273,8 @@ class TestDerivationConflicts:
         raw = RigConfig.defaults().to_dict()
         raw['pack']['parallel_count'] = 8
         cfg = RigConfig.from_dict(raw)
-        assert math.isclose(cfg.limits.max_amps + cfg.limits.amp_buffer, 360.0)
+        assert math.isclose(cfg.limits.max_amps + cfg.limits.amp_buffer,
+                            cfg.pack.cell_max_continuous_a * 8)
 
 
 # ================= EXCEEDANCE WARNINGS =================
@@ -267,19 +289,21 @@ class TestExceedances:
         # The E-STOP fires at max_amps + buffer, so a limit exactly at the
         # rating still trips over it. This is the 182/187 A bug, generalised.
         pack = PackConfig()
-        limits = SafetyLimits(derive_from_pack=False, max_amps=180.0, amp_buffer=5.0)
+        limits = SafetyLimits(derive_from_pack=False, max_amps=pack.max_current_a,
+                              amp_buffer=5.0)
         warnings = limits.exceedances(pack)
         assert any("exceeds" in w and "A" in w for w in warnings)
 
     def test_zero_buffer_at_rating_is_clean(self):
         pack = PackConfig()
-        limits = SafetyLimits(derive_from_pack=False, max_amps=180.0, amp_buffer=0.0)
+        limits = SafetyLimits(derive_from_pack=False, max_amps=pack.max_current_a,
+                              amp_buffer=0.0)
         assert not any("pack rating" in w for w in limits.exceedances(pack))
 
     def test_overtemp_limit_is_flagged(self):
         pack = PackConfig()
-        limits = SafetyLimits(derive_from_pack=False, max_temp=65.0, amp_buffer=0.0,
-                              max_amps=180.0, min_volts=36.0)
+        limits = SafetyLimits(derive_from_pack=False, max_temp=pack.cell_max_temp_c + 5.0,
+                              amp_buffer=0.0, max_amps=pack.max_current_a, min_volts=36.0)
         assert any("discharge ceiling" in w for w in limits.exceedances(pack))
 
     def test_undervoltage_below_absolute_cutoff_is_flagged(self):
@@ -319,7 +343,7 @@ class TestPersistence:
     def test_missing_file_falls_back_to_defaults(self):
         with tempfile.TemporaryDirectory() as d:
             loaded = RigConfig.load(os.path.join(d, "nope.json"))
-        assert math.isclose(loaded.pack.capacity_ah, 18.0)
+        assert loaded.pack == PackConfig()
 
     def test_corrupt_file_falls_back_rather_than_crashing(self):
         # A broken config must never stop the rig from starting.
@@ -328,7 +352,7 @@ class TestPersistence:
             with open(path, 'w') as fh:
                 fh.write("{ this is not json")
             loaded = RigConfig.load(path)
-        assert math.isclose(loaded.pack.max_current_a, 180.0)
+        assert loaded.pack == PackConfig()
 
     def test_unknown_keys_are_ignored(self):
         # Forward compatibility: a config from a newer version still loads.
@@ -336,13 +360,14 @@ class TestPersistence:
         raw['pack']['some_future_field'] = 123
         raw['vehicle']['another_one'] = "x"
         loaded = RigConfig.from_dict(raw)
-        assert math.isclose(loaded.pack.capacity_ah, 18.0)
+        assert loaded.pack == PackConfig()
 
     def test_missing_keys_fall_back_to_field_defaults(self):
         loaded = RigConfig.from_dict({'pack': {'parallel_count': 8}})
+        default_cell_amps = PackConfig().cell_max_continuous_a
         assert loaded.pack.parallel_count == 8
-        assert math.isclose(loaded.pack.cell_max_continuous_a, 45.0)
-        assert math.isclose(loaded.pack.max_current_a, 360.0)
+        assert math.isclose(loaded.pack.cell_max_continuous_a, default_cell_amps)
+        assert math.isclose(loaded.pack.max_current_a, default_cell_amps * 8)
 
     def test_empty_dict_yields_defaults(self):
         loaded = RigConfig.from_dict({})
@@ -354,7 +379,8 @@ class TestPersistence:
         raw = RigConfig.defaults().to_dict()
         raw['pack']['parallel_count'] = 8
         loaded = RigConfig.from_dict(raw)
-        assert math.isclose(loaded.limits.max_amps + loaded.limits.amp_buffer, 360.0)
+        assert math.isclose(loaded.limits.max_amps + loaded.limits.amp_buffer,
+                            loaded.pack.cell_max_continuous_a * 8)
 
     def test_saved_file_is_readable_json(self):
         with tempfile.TemporaryDirectory() as d:

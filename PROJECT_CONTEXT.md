@@ -70,9 +70,9 @@ hardware_manager ──────────> control_logic ─────�
 | `main_v2.py` | Entry point. Probes COM ports for a `SIL_KEY` dongle; if present runs SIL mode, otherwise starts the real DAQ process. |
 | `rig_config.py` | Vehicle model, pack spec, DAQ mapping and safety limits, with JSON persistence. Everything a future team retargets lives here. |
 | `theme.py` | Colour, type and spacing for the whole interface. One global stylesheet; widgets carry a `variant` property rather than inline CSS. |
-| `hardware_manager.py` | Reads NI cDAQ (current + cumulative cell voltage taps) and the temperature Arduino (OneWire buses of DS18B20s). Channel map and sensor layout come from config. Self-healing watchdog thread re-detects the temperature Arduino. Falls back to simulated data, sized to the configured pack, if no NI-DAQ is present. |
+| `hardware_manager.py` | Reads NI cDAQ (current + cumulative cell voltage taps, plus resistor-bank thermocouples on banks 1–4 in their own task and thread) and the temperature Arduino (OneWire buses of DS18B20s). Channel map and sensor layout come from config. Self-healing watchdog thread re-detects the temperature Arduino. Falls back to simulated data, sized to the configured pack, if no NI-DAQ is present. |
 | `control_logic.py` | The safety-critical process. FSM, safety trips, lap physics, coulomb counting, resistor bank serial commands. |
-| `gui_layout.py` | PyQt6 telemetry UI — live voltage/current plots, 12S cell voltages, 48-sensor thermal heatmap, threshold controls, CSV recording. |
+| `gui_layout.py` | PyQt6 telemetry UI — live voltage/current plots, 12S cell voltages, 48-sensor thermal heatmap, resistor bank map laid out as built, threshold controls, CSV recording. |
 | `sil_simulator.py` | Desk-test plant model. Replaces the DAQ entirely with operator-driven sliders (load, temperature, pack OCV) plus a hardware-fault toggle. |
 
 ### Finite state machine

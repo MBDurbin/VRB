@@ -170,11 +170,30 @@ unplugged has no protection at all — the cell-side trips would not notice a
 resistor bank cooking. This is currently a procedural control only: *never run
 without the fan*.
 
-**2. No resistor thermal protection.** Every trip in `control_logic.py` protects
-the *cells*. The bank has no temperature sensors yet and no software limit.
-Planned, per the notes in `rig_config.py`. When they arrive, **155 °C** is the
-TE series operating ceiling and needs its own limit field — `max_temp` is a
-60 °C cell figure and must not be reused.
+**2. Resistor thermal protection — banks 1–4 only.** One thermocouple per bank
+on banks 1–4, read by the NI-DAQ. The channels are `resistor_tc_channels` in
+`rig_config.json`, default `cDAQ1Mod3/ai0`–`ai3`, bank 1 first, Type K. They are
+read on their own thread so a slow thermocouple module cannot slow the voltage
+and current loop. Per-bank trips are `resistor_max_temp_c` in the `limits`
+section. Each bank is held to its own trip, which applies in every state and
+logs `RESISTOR OVERTEMP` with the bank named. Once armed, a thermocouple with no
+valid reading for 3 s (open, off-scale, or a failed read) faults as
+`RESISTOR TC FAULT`. No thermocouple data at all faults as
+`NO RESISTOR TEMP DATA`. The **Resistor Map** button shows the banks laid out as
+built.
+
+Default trips:
+- **Banks 1–3: 225 °C.** TE's **155 °C** is an *ambient* limit on its derating
+  curve, not an element temperature; at full load the element runs ~370 °C above
+  ambient (datasheet p.3). The element limit is conventionally **275 °C**, where
+  that curve reaches zero load. 225 °C leaves 50 K for the hot side of an element
+  and a thermocouple that sits off the hottest point.
+- **Bank 4: 150 °C, a placeholder.** There is no datasheet for the Uxcell part
+  in this repo, so it is deliberately low. Replace it once the rating is known.
+
+Banks 5–8 are not instrumented. Not recorded anywhere: which middle-row tube is
+bank 3, and where banks 4–8 sit on the flat bars. The map draws both in bank
+order (`MIDDLE_ROW_BANKS` and `FLAT_BAR_BANKS` in `gui_layout.py`).
 
 **3. The bank's 8 kW rating — now enforced in software.** The current limit
 derives from the cells alone. With the Reliance RS50 cells (70 A each) it works out

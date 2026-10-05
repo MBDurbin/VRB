@@ -232,6 +232,61 @@ def check_temp_sensors(sensor_ages, stale_timeout_s):
     return False, None
 
 
+def resistor_limit(max_temps, bank_idx):
+    """Trip temperature for the bank at 0-based bank_idx.
+
+    A bank with a thermocouple but no trip of its own gets the strictest one
+    configured, and with none configured at all, -inf: any reading trips.
+    Mismatched lists are a config error that RigConfig.validate() reports; this
+    keeps it from leaving a bank unprotected meanwhile.
+    """
+    if bank_idx < len(max_temps):
+        return max_temps[bank_idx]
+    return min(max_temps, default=float('-inf'))
+
+
+def hot_resistor_banks(resistor_temps, max_temps):
+    """(bank, temperature, trip) for every bank at or over its trip; banks 1-based."""
+    return [(i + 1, t, resistor_limit(max_temps, i))
+            for i, t in enumerate(resistor_temps)
+            if t is not None and t >= resistor_limit(max_temps, i)]
+
+
+def check_resistor_temps(resistor_temps, max_temps):
+    """Resistor bank over-temperature. Returns (is_fault, reason).
+
+    Applies in every FSM state, like the cell over-temperature trip: a hot bank
+    is hot whatever the state machine thinks. A bank that has not reported yet
+    (None) is not judged here; check_resistor_tc_health() faults on it once armed.
+    """
+    if hot_resistor_banks(resistor_temps, max_temps):
+        return True, "RESISTOR OVERTEMP"
+    return False, None
+
+
+def stale_resistor_banks(tc_ages, stale_timeout_s):
+    """1-based banks whose thermocouple has no valid reading within the timeout."""
+    if stale_timeout_s <= 0:
+        return []
+    return [i + 1 for i, age in enumerate(tc_ages) if age > stale_timeout_s]
+
+
+def check_resistor_tc_health(tc_ages, stale_timeout_s):
+    """Resistor thermocouple integrity. Returns (is_fault, reason).
+
+    The over-temperature trip can only see a reading that arrives. An open
+    thermocouple, a failed read or a missing module leaves the last value frozen
+    while the bank keeps heating, so once armed a bank that stops reporting is a
+    fault in its own right. Same timeout as the cell sensors.
+    """
+    if not tc_ages:
+        # Fail closed: no thermocouple data at all means the banks are unwatched.
+        return True, "NO RESISTOR TEMP DATA"
+    if stale_resistor_banks(tc_ages, stale_timeout_s):
+        return True, "RESISTOR TC FAULT"
+    return False, None
+
+
 def evaluate_safety(data, limits, armed=True):
     """All safety checks against one telemetry packet. Returns (is_fault, reason).
 
@@ -239,9 +294,10 @@ def evaluate_safety(data, limits, armed=True):
     genuinely over-current AND the temperature link has dropped, the operator
     needs to hear about the current first.
 
-    `armed` should be True only in ARMED/RUNNING. Over-temperature, over-current
-    and bank overpower are always checked -- any of them means something is wrong
-    no matter what state the FSM thinks it is in. Everything else is gated,
+    `armed` should be True only in ARMED/RUNNING. Cell over-temperature,
+    over-current, bank overpower and resistor over-temperature are always
+    checked -- any of them means something is wrong no matter what state the FSM
+    thinks it is in. Everything else is gated,
     because before the rig is armed those readings describe a bench that is not
     loaded yet:
 
@@ -263,6 +319,11 @@ def evaluate_safety(data, limits, armed=True):
         return True, reason
 
     fault, reason = check_bank_power(data.get('voltage', 0.0), data.get('amps', 0.0))
+    if fault:
+        return True, reason
+
+    fault, reason = check_resistor_temps(
+        data.get('resistor_temps', []), limits['resistor_max_temp'])
     if fault:
         return True, reason
 
@@ -294,6 +355,11 @@ def evaluate_safety(data, limits, armed=True):
     # TEMP LINK LOST is the more useful thing to tell the operator.
     fault, reason = check_temp_sensors(
         data.get('temp_sensor_ages_s', []), limits['temp_stale_timeout'])
+    if fault:
+        return True, reason
+
+    fault, reason = check_resistor_tc_health(
+        data.get('resistor_temp_ages_s', []), limits['temp_stale_timeout'])
     if fault:
         return True, reason
 
@@ -516,6 +582,7 @@ def NEUTRAL_PACKET():
         'amps': 0.0, 'voltage': 0.0, 'max_temp': 0.0,
         'cell_voltages': [], 'temperatures': [], 'power_kw': 0.0,
         'temp_age_s': float('inf'), 'temp_sensor_ages_s': [],
+        'resistor_temps': [], 'resistor_temp_ages_s': [],
         'hardware_status': {},
     }
 
@@ -681,7 +748,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
           f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V module | "
           f"{limits['min_cell_volts']:.2f} V/cell | "
           f"temp stale > {limits['temp_stale_timeout']:.1f} s | "
-          f"bank {VRB_MAX_POWER_W / 1000:.1f} kW (fixed)")
+          f"bank {VRB_MAX_POWER_W / 1000:.1f} kW (fixed) | resistors "
+          + "/".join(f"{t:.0f}" for t in limits['resistor_max_temp']) + " C")
     for warning in config.limits.exceedances(pack):
         print(f"[LOGIC WARNING] {warning}")
 
@@ -871,6 +939,16 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                           limits['temp_stale_timeout'])
                 print("[LOGIC] No valid reading from: "
                       + ", ".join(f"bus {b} sensor {s}" for b, s in dead))
+            elif trigger_reason == "RESISTOR OVERTEMP":
+                hot = hot_resistor_banks(data.get('resistor_temps', []),
+                                         limits['resistor_max_temp'])
+                print("[LOGIC] " + ", ".join(f"Bank {b} at {t:.0f} C (trip {lim:.0f} C)"
+                                             for b, t, lim in hot))
+            elif trigger_reason == "RESISTOR TC FAULT":
+                dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
+                                            limits['temp_stale_timeout'])
+                print("[LOGIC] No valid thermocouple reading from: "
+                      + ", ".join(f"bank {b}" for b in dead))
             if res_ser:
                 res_ser.write(b"KILL\n")
 

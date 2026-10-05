@@ -2,6 +2,7 @@ import math
 import serial
 import serial.tools.list_ports
 import nidaqmx
+from nidaqmx.constants import CJCSource, TemperatureUnits, ThermocoupleType
 import time
 import threading
 from multiprocessing import Queue, Event
@@ -15,6 +16,19 @@ from rig_config import RigConfig
 # Nothing about the resistor controller belongs in this module. This process
 # owns the NI-DAQ and the temperature Arduino; control_logic owns the resistor
 # controller, including its baud rate and its port discovery.
+
+# Resistor thermocouples are read on their own thread, this often. The banks
+# heat over minutes, and some NI thermocouple modules (the 4-channel 9211) take
+# ~0.3 s for one on-demand read, which inline would cut the voltage and current
+# loop to ~3 Hz.
+RESISTOR_TC_PERIOD_S = 0.25
+
+# Readings outside this band are not temperatures. An open or broken
+# thermocouple typically reads far past the top of it, or as NaN. Also passed to
+# DAQmx as the channel's expected range: its default of 0-100 C is below what
+# the banks reach.
+TC_MIN_C = -40.0
+TC_MAX_C = 600.0
 
 
 def derive_cell_voltages(cumulative_voltages):
@@ -82,8 +96,33 @@ def temperature_sensor_ages(last_valid_rx, now):
     A sensor that has never delivered a number -- ERR since power-up -- reads
     inf, so it cannot pass as fresh.
     """
-    return [[now - t if t is not None else float('inf') for t in bus]
-            for bus in last_valid_rx]
+    return [reading_ages(bus, now) for bus in last_valid_rx]
+
+
+def reading_ages(last_valid_rx, now):
+    """Flat version of temperature_sensor_ages(): one age per timestamp, inf for None."""
+    return [now - t if t is not None else float('inf') for t in last_valid_rx]
+
+
+def apply_thermocouple_readings(raw, temps, last_rx, now):
+    """Store each plausible reading from one thermocouple read, and stamp its time.
+
+    `raw` is what task.read() returned: a list, or a bare float when only one
+    channel is configured. Readings that are not finite or fall outside
+    TC_MIN_C..TC_MAX_C are skipped. They leave that bank's last value and
+    timestamp alone, so its age grows and the logic process faults on it once
+    armed -- the same treatment as a DS18B20 reporting ERR.
+    """
+    if not isinstance(raw, (list, tuple)):
+        raw = [raw]
+    for i, value in enumerate(raw[:len(temps)]):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and TC_MIN_C <= value <= TC_MAX_C:
+            temps[i] = value
+            last_rx[i] = now
 
 
 def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig = None,
@@ -213,6 +252,63 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
         print("[WARNING] Running in DESK TEST / SIMULATION MODE.")
         if task: task.close()
 
+    # --- Resistor bank thermocouples ---
+    # A task of their own, so a slow or missing thermocouple module cannot stall
+    # or break the voltage and current reads. Based on Bryce Marshall's bench
+    # test (tests/test_tc.py on origin/master), with two settings it left at
+    # nidaqmx's defaults made explicit: the cold junction (default a fixed 25 C)
+    # and the expected range (default 0-100 C, below what the banks reach).
+    #
+    # Never simulated. With no thermocouple data the logic process refuses to
+    # arm, rather than running the bank on made-up resistor temperatures.
+    n_tc = len(daq_cfg.resistor_tc_channels)
+    resistor_temps = [None] * n_tc          # last valid reading per bank, C
+    resistor_last_rx = [None] * n_tc        # when it arrived; None = never
+    tc_lock = threading.Lock()
+    tc_task = None
+    tc_thread = None
+    # Its own stop signal: the shared stop_event is not set if this process
+    # exits on an error, and the task must not be closed under a running read.
+    tc_stop = threading.Event()
+    try:
+        tc_task = nidaqmx.Task()
+        for ch in daq_cfg.resistor_tc_channels:
+            tc_task.ai_channels.add_ai_thrmcpl_chan(
+                ch, min_val=TC_MIN_C, max_val=TC_MAX_C,
+                units=TemperatureUnits.DEG_C,
+                thermocouple_type=ThermocoupleType[daq_cfg.thermocouple_type],
+                cjc_source=CJCSource[daq_cfg.resistor_tc_cjc_source])
+        print(f"[DAQ] Resistor thermocouples initialized: {n_tc} bank(s), "
+              f"type {daq_cfg.thermocouple_type}, CJC {daq_cfg.resistor_tc_cjc_source}.")
+    except Exception as e:
+        print(f"\n[WARNING] Resistor thermocouples unavailable: {e}")
+        print("[WARNING] The rig will not arm without resistor temperatures.")
+        if tc_task: tc_task.close()
+        tc_task = None
+
+    def resistor_tc_reader():
+        """Reads every bank thermocouple once per RESISTOR_TC_PERIOD_S."""
+        reported = False
+        while not (stop_event.is_set() or tc_stop.is_set()):
+            started = time.time()
+            try:
+                raw = tc_task.read()
+                reported = False
+            except Exception as exc:
+                # Leave the timestamps alone so the ages grow and the logic
+                # process faults. Say so once, not ten times a second.
+                if not reported:
+                    print(f"\n[DAQ ERROR] Resistor thermocouple read failed: {exc}")
+                    reported = True
+                raw = []
+            with tc_lock:
+                apply_thermocouple_readings(raw, resistor_temps, resistor_last_rx, time.time())
+            tc_stop.wait(max(0.0, RESISTOR_TC_PERIOD_S - (time.time() - started)))
+
+    if tc_task is not None:
+        tc_thread = threading.Thread(target=resistor_tc_reader, daemon=True)
+        tc_thread.start()
+
     try:
         while not stop_event.is_set():
             loop_start = time.time()
@@ -267,6 +363,9 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
 
             # --- C. Package Data and Send to Queue ---
             now = time.time()
+            with tc_lock:
+                bank_temps = list(resistor_temps)
+                bank_ages = reading_ages(resistor_last_rx, now)
             data_packet = {
                 'amps': current,
                 'voltage': total_pack_voltage,
@@ -276,8 +375,12 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 'max_temp': max_t,
                 'temp_age_s': now - last_temp_rx,
                 'temp_sensor_ages_s': temperature_sensor_ages(sensor_last_rx, now),
+                # Bank 1 first. None until a bank's first valid reading.
+                'resistor_temps': bank_temps,
+                'resistor_temp_ages_s': bank_ages,
                 'hardware_status': {
                     'temp_arduino': current_temp_ser is not None,
+                    'resistor_tc': tc_task is not None,
                     # Placeholder only. This process does not talk to the
                     # resistor controller and cannot know its state;
                     # control_logic owns that port and overwrites this key on
@@ -304,4 +407,9 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 hardware_state['temp_ser'].close()
         if ni_daq_active and task:
             task.close()
+        tc_stop.set()
+        if tc_thread is not None:
+            tc_thread.join(timeout=2.0)
+        if tc_task is not None:
+            tc_task.close()
         print("[DAQ] Process cleanly shutdown.")

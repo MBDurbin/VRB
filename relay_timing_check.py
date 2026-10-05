@@ -83,6 +83,7 @@ def healthy_packet():
         'amps': 50.0, 'voltage': 46.0, 'cell_voltages': [3.85] * 12, 'power_kw': 2.3,
         'temperatures': [[30.0] * 8 for _ in range(6)], 'max_temp': 30.0,
         'temp_age_s': 0.05, 'temp_sensor_ages_s': [[0.05] * 8 for _ in range(6)],
+        'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.05] * 4,
         'hardware_status': {'temp_arduino': True, 'ni_daq': True, 'res_arduino': False},
     }
 

@@ -481,6 +481,18 @@ DEFAULT_VOLTAGE_CHANNELS = [
     "cDAQ1Mod5/ai0",
 ]
 
+# Thermocouple inputs for resistor banks 1-4, in bank order. See DaqConfig.
+DEFAULT_RESISTOR_TC_CHANNELS = [
+    "cDAQ1Mod3/ai0", "cDAQ1Mod3/ai1", "cDAQ1Mod3/ai2", "cDAQ1Mod3/ai3",
+]
+
+# Accepted values for the thermocouple settings, kept here so rig_config does
+# not have to import nidaqmx. They are the member names of nidaqmx's
+# ThermocoupleType and CJCSource. SCANNABLE_CHANNEL is left out: it needs a
+# separate CJC channel this config has no field for.
+THERMOCOUPLE_TYPES = ("B", "E", "J", "K", "N", "R", "S", "T")
+CJC_SOURCES = ("BUILT_IN", "CONSTANT_USER_VALUE")
+
 
 @dataclass
 class DaqConfig:
@@ -539,7 +551,7 @@ class DaqConfig:
     # for a bidirectional current sensor reading below zero during regen.
     ai_min_volts: float = -10.0
     ai_max_volts: float = 10.0
-    #NOTE THIS WILL NEED EDITING WHEN WE ADD THE RESISTOR TEMPS AND INBETWEEN TEMPS
+    #NOTE THIS WILL NEED EDITING WHEN WE ADD THE INBETWEEN TEMPS
     # --- Temperature sensor layout ---
     # DS18B20s on OneWire buses. The Arduino emits one CSV line per bus:
     # "<bus number>,<t1>,...,<tN>", so a line carries sensors_per_bus + 1 fields.
@@ -561,6 +573,28 @@ class DaqConfig:
     # value in its sketch or the handshake returns garbage and the device is
     # never identified. High because 48 readings per sweep is a lot of text.
     temp_baud_rate: int = 115200
+
+    # --- Resistor bank thermocouples ---
+    # One thermocouple per bank on banks 1-4, read by the NI-DAQ rather than the
+    # Arduino. Entry i is bank i+1, so ORDER IS MEANINGFUL, as with the voltage
+    # taps. Banks 5-8 carry too little current to need one (docs/hardware_topology.md).
+    #
+    # Module 3 per Bryce Marshall's bench test (tests/test_tc.py on origin/master),
+    # which read cDAQ1Mod3/ai0:1. Banks 3 and 4 on ai2/ai3 assume the remaining
+    # inputs of the same module -- check against the wiring.
+    resistor_tc_channels: List[str] = field(
+        default_factory=lambda: list(DEFAULT_RESISTOR_TC_CHANNELS))
+
+    # Thermocouple type letter, as printed on the plug or lead colours. K is what
+    # the bench test used.
+    thermocouple_type: str = "K"
+
+    # Where the cold-junction temperature comes from. BUILT_IN uses the module's
+    # own sensor at the terminals, which every NI thermocouple module (9210-9214)
+    # has. nidaqmx's own default is CONSTANT_USER_VALUE at a fixed 25 C, which is
+    # what the bench test got by not setting it -- every reading is then off by
+    # however far the terminal block is from 25 C.
+    resistor_tc_cjc_source: str = "BUILT_IN"
 
     # --- Loop timing ---
     # Target seconds per DAQ cycle. 0.1 s is 10 Hz. The loop sleeps for whatever
@@ -632,6 +666,24 @@ class DaqConfig:
                       if self.voltage_channels.count(c) > 1}
         if duplicates:
             problems.append(f"Duplicate voltage channels: {', '.join(sorted(duplicates))}.")
+        # A thermocouple input that is also a voltage or current input would put
+        # two different measurements on one terminal; neither could be trusted.
+        analog = set(self.voltage_channels) | {self.current_channel}
+        clashes = sorted(set(self.resistor_tc_channels) & analog)
+        if clashes:
+            problems.append(f"Thermocouple channel(s) {', '.join(clashes)} are also used "
+                            f"for voltage or current.")
+        tc_dupes = {c for c in self.resistor_tc_channels
+                    if self.resistor_tc_channels.count(c) > 1}
+        if tc_dupes:
+            problems.append(f"Duplicate thermocouple channels: {', '.join(sorted(tc_dupes))}; "
+                            f"two banks would show the same temperature.")
+        if self.thermocouple_type not in THERMOCOUPLE_TYPES:
+            problems.append(f"Thermocouple type '{self.thermocouple_type}' is not one of "
+                            f"{', '.join(THERMOCOUPLE_TYPES)}.")
+        if self.resistor_tc_cjc_source not in CJC_SOURCES:
+            problems.append(f"Cold-junction source '{self.resistor_tc_cjc_source}' is not one "
+                            f"of {', '.join(CJC_SOURCES)}.")
         # A zero or negative period would make the DAQ loop spin without pausing.
         if self.sample_period_s <= 0:
             problems.append("Sample period must be greater than zero.")
@@ -651,11 +703,23 @@ DAQ_FIELD_LABELS = {
     'temp_bus_count':        ("OneWire bus count", "buses"),
     'sensors_per_bus':       ("Sensors per bus", "sensors"),
     'temp_baud_rate':        ("Temp sensor baud", "baud"),
+    'resistor_tc_channels':  ("Resistor thermocouples", "bank 1 first, comma separated"),
+    'thermocouple_type':     ("Thermocouple type", "B E J K N R S T"),
+    'resistor_tc_cjc_source': ("Cold-junction source", "BUILT_IN or CONSTANT_USER_VALUE"),
     'sample_period_s':       ("DAQ sample period", "s"),
 }
 
 
 # ================= SAFETY LIMITS =================
+
+# Default resistor trips, bank 1 first. Reasoning is on the field below.
+DEFAULT_RESISTOR_MAX_TEMP_C = [225.0, 225.0, 225.0, 150.0]
+
+# The highest temperature each thermocoupled bank's parts are rated for, used
+# only to warn when a configured trip sits above it. Banks 1-3 are TE2000B1R0J:
+# 275 C, the zero-load point of TE's derating curve. Bank 4's Uxcell part has no
+# datasheet here, so there is nothing to check it against (None).
+RESISTOR_ELEMENT_MAX_C = (275.0, 275.0, 275.0, None)
 
 @dataclass
 class SafetyLimits:
@@ -748,6 +812,30 @@ class SafetyLimits:
     # max_temp or the ramp has no range to act over -- apply_pack_derivation
     # enforces a 5 C gap and exceedances() warns if it is violated by hand.
     derate_start: float = 55.0
+
+    # Resistor over-temperature trip, one per thermocoupled bank, bank 1 first,
+    # in Celsius at the thermocouple. Like the cell trip it applies in EVERY
+    # state. Never derived from the pack: these protect the bank, not the cells.
+    #
+    # Edited in rig_config.json; the GUI's Configure dialog does not show limits.
+    #
+    # Banks 1-3 (TE2000B1R0J): 225 C. TE's 155 C figure is an AMBIENT limit;
+    # the element itself is conventionally limited to 275 C, where the derating
+    # curve reaches zero load (datasheet p.3). 50 K under that covers the hot side
+    # of an element running up to ~38 K above its mean surface (resistor_thermal.py)
+    # and a thermocouple that sits off the hottest point.
+    #
+    # Bank 4 (Uxcell 500 W, aluminium housed): 150 C is a PLACEHOLDER. There is no
+    # datasheet for it in this repo, so this is set low on purpose. Replace it
+    # once the part's rating is known.
+    resistor_max_temp_c: List[float] = field(
+        default_factory=lambda: list(DEFAULT_RESISTOR_MAX_TEMP_C))
+
+    def __post_init__(self):
+        # rig_config.json is hand-edited, and a quoted "225" would otherwise reach
+        # the safety check as a string. Failing here makes load() fall back to
+        # defaults with a message, instead of a TypeError inside the logic loop.
+        self.resistor_max_temp_c = [float(t) for t in self.resistor_max_temp_c]
 
     def apply_pack_derivation(self, pack: PackConfig):
         """Recompute limits from the cell datasheet. No-op if derivation is off."""
@@ -873,6 +961,15 @@ class SafetyLimits:
                 f"Derate start {self.derate_start:.1f} C is not below max temp "
                 f"{self.max_temp:.1f} C; derating cannot ramp."
             )
+        # A resistor trip above what the element is rated for only fires once
+        # the element is already past its limit.
+        for bank, (limit, rated) in enumerate(
+                zip(self.resistor_max_temp_c, RESISTOR_ELEMENT_MAX_C), start=1):
+            if rated is not None and limit > rated:
+                warnings.append(
+                    f"Bank {bank} resistor trip {limit:.0f} C is above its elements' "
+                    f"{rated:.0f} C rating."
+                )
         return warnings
 
     def to_command_dict(self):
@@ -902,6 +999,8 @@ class SafetyLimits:
             'daq_stale_timeout': self.daq_stale_timeout_s,
             'derate_en': self.derate_enabled,
             'derate_start': self.derate_start,
+            # A copy, so the logic process never shares a list with this object.
+            'resistor_max_temp': list(self.resistor_max_temp_c),
         }
 
 
@@ -956,7 +1055,17 @@ class RigConfig:
         # Two independent checks concatenated: limits versus what the cells can
         # take, and wiring versus what the pack needs. Both return lists, so an
         # empty result means the whole configuration is coherent.
-        return self.limits.exceedances(self.pack) + self.daq.validate(self.pack)
+        problems = self.limits.exceedances(self.pack) + self.daq.validate(self.pack)
+        # Limits and channels live in different sections, so only this level can
+        # see whether every thermocoupled bank has a trip of its own.
+        n_tc, n_lim = len(self.daq.resistor_tc_channels), len(self.limits.resistor_max_temp_c)
+        if n_tc != n_lim:
+            problems.append(
+                f"{n_tc} resistor thermocouple channel(s) but {n_lim} resistor trip "
+                f"temperature(s). A bank without its own trip uses the lowest one set; "
+                f"with none set, any reading trips."
+            )
+        return problems
 
     @staticmethod
     def from_dict(raw):

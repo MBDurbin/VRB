@@ -156,7 +156,8 @@ class TestLimitDerivation:
         keys = set(SafetyLimits().to_command_dict())
         assert keys == {'max_amps', 'amp_buffer', 'max_temp', 'min_volts',
                         'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout',
-                        'daq_stale_timeout', 'derate_en', 'derate_start'}
+                        'daq_stale_timeout', 'derate_en', 'derate_start',
+                        'resistor_max_temp'}
 
     def test_per_cell_trip_derives_above_cell_cutoff(self):
         pack = PackConfig()
@@ -401,10 +402,13 @@ class TestDaqConfig:
 
     def test_matching_custom_wiring_validates_clean(self):
         # A future team's 14S5P rig, correctly wired: 14 taps, 70 thermistors.
+        # The taps fill modules 1-4, so the resistor thermocouples move off
+        # their default module 3.
         pack = PackConfig(series_count=14, parallel_count=5)
         daq = DaqConfig(
             voltage_channels=[f"cDAQ1Mod{1 + i // 4}/ai{i % 4}" for i in range(14)],
             temp_bus_count=10, sensors_per_bus=7,
+            resistor_tc_channels=[f"cDAQ1Mod9/ai{i}" for i in range(4)],
         )
         assert daq.validate(pack) == []
         assert daq.sensor_count == pack.cell_count
@@ -447,3 +451,68 @@ class TestFieldLabels:
         label, unit = field_label('some_new_param', {})
         assert label == "Some new param"
         assert unit == ""
+
+
+# ================= RESISTOR THERMOCOUPLES AND TRIPS =================
+
+class TestResistorTrips:
+    def test_defaults_cover_the_four_thermocoupled_banks(self):
+        limits = SafetyLimits()
+        assert len(limits.resistor_max_temp_c) == len(DaqConfig().resistor_tc_channels) == 4
+
+    def test_te_banks_trip_below_the_element_rating(self):
+        # TE2000: 275 C element limit (derating curve zero-load point).
+        assert all(t < 275.0 for t in SafetyLimits().resistor_max_temp_c[:3])
+
+    def test_quoted_numbers_in_the_json_become_floats(self):
+        limits = SafetyLimits(resistor_max_temp_c=["200", 210])
+        assert limits.resistor_max_temp_c == [200.0, 210.0]
+
+    def test_garbage_trip_makes_load_fall_back_rather_than_reach_the_loop(self, tmp_path):
+        raw = RigConfig.defaults().to_dict()
+        raw['limits']['resistor_max_temp_c'] = ["hot", 200.0]
+        path = tmp_path / "rig_config.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        assert RigConfig.load(str(path)).limits.resistor_max_temp_c == \
+            SafetyLimits().resistor_max_temp_c
+
+    def test_trip_above_element_rating_is_flagged(self):
+        limits = SafetyLimits(resistor_max_temp_c=[300.0, 225.0, 225.0, 150.0])
+        assert any("Bank 1 resistor trip" in w for w in limits.exceedances(PackConfig()))
+
+    def test_bank_4_has_no_rating_to_flag_against(self):
+        limits = SafetyLimits(resistor_max_temp_c=[225.0, 225.0, 225.0, 900.0])
+        assert not any("Bank 4" in w for w in limits.exceedances(PackConfig()))
+
+    def test_pack_derivation_never_touches_resistor_trips(self):
+        limits = SafetyLimits(resistor_max_temp_c=[100.0, 110.0, 120.0, 90.0])
+        limits.apply_pack_derivation(PackConfig(cell_max_temp_c=45.0))
+        assert limits.resistor_max_temp_c == [100.0, 110.0, 120.0, 90.0]
+
+    def test_mismatched_channel_and_trip_counts_are_reported(self):
+        cfg = RigConfig.defaults()
+        cfg.limits.resistor_max_temp_c = [225.0, 225.0]
+        assert any("thermocouple channel" in p for p in cfg.validate())
+
+    def test_round_trips_through_the_file(self, tmp_path):
+        cfg = RigConfig.defaults()
+        cfg.limits.resistor_max_temp_c = [200.0, 205.0, 210.0, 140.0]
+        cfg.daq.resistor_tc_channels = ["cDAQ1Mod4/ai0", "cDAQ1Mod4/ai1"]
+        path = cfg.save(str(tmp_path / "rig_config.json"))
+        loaded = RigConfig.load(path)
+        assert loaded.limits.resistor_max_temp_c == [200.0, 205.0, 210.0, 140.0]
+        assert loaded.daq.resistor_tc_channels == ["cDAQ1Mod4/ai0", "cDAQ1Mod4/ai1"]
+
+    def test_bad_thermocouple_settings_are_reported(self):
+        pack = PackConfig()
+        assert any("Thermocouple type" in p for p in DaqConfig(thermocouple_type="Q").validate(pack))
+        assert any("Cold-junction" in p
+                   for p in DaqConfig(resistor_tc_cjc_source="GUESS").validate(pack))
+
+    def test_thermocouple_on_a_voltage_input_is_reported(self):
+        daq = DaqConfig(resistor_tc_channels=["cDAQ1Mod8/ai1", "cDAQ1Mod3/ai1"])
+        assert any("also used" in p for p in daq.validate(PackConfig()))
+
+    def test_duplicate_thermocouple_channels_are_reported(self):
+        daq = DaqConfig(resistor_tc_channels=["cDAQ1Mod3/ai0", "cDAQ1Mod3/ai0"])
+        assert any("Duplicate thermocouple" in p for p in daq.validate(PackConfig()))

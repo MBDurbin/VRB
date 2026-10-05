@@ -12,7 +12,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hardware_manager import (
-    derive_cell_voltages, parse_temperature_line, temperature_sensor_ages)
+    derive_cell_voltages, parse_temperature_line, temperature_sensor_ages,
+    apply_thermocouple_readings, reading_ages, TC_MAX_C)
 
 
 # ================= CELL VOLTAGE DIFFERENCING =================
@@ -140,3 +141,49 @@ class TestTemperatureSensorAges:
         ages = temperature_sensor_ages([[None] * 8 for _ in range(6)], now=0.0)
         assert len(ages) == 6
         assert all(len(bus) == 8 for bus in ages)
+
+
+# ================= RESISTOR THERMOCOUPLES =================
+
+class TestThermocoupleReadings:
+    def _fresh(self, n=4):
+        return [None] * n, [None] * n
+
+    def test_valid_readings_are_stored_and_stamped(self):
+        temps, rx = self._fresh()
+        apply_thermocouple_readings([120.5, 80.0, 60.0, 45.0], temps, rx, now=10.0)
+        assert temps == [120.5, 80.0, 60.0, 45.0]
+        assert rx == [10.0] * 4
+
+    def test_open_thermocouple_readings_are_skipped(self):
+        # An open thermocouple reads far off scale or as NaN. Neither may
+        # refresh that bank, so its age grows and the logic faults on it.
+        temps, rx = [100.0] * 4, [5.0] * 4
+        apply_thermocouple_readings([float('nan'), 1372.0, -270.0, 101.0], temps, rx, now=6.0)
+        assert temps[:3] == [100.0, 100.0, 100.0]
+        assert rx[:3] == [5.0, 5.0, 5.0]
+        assert temps[3] == 101.0 and rx[3] == 6.0
+
+    def test_limit_of_the_valid_band_is_accepted(self):
+        temps, rx = self._fresh(1)
+        apply_thermocouple_readings([TC_MAX_C], temps, rx, now=1.0)
+        assert temps == [TC_MAX_C]
+
+    def test_single_channel_read_returns_a_bare_float(self):
+        # nidaqmx returns a float, not a list, when one channel is configured.
+        temps, rx = self._fresh(1)
+        apply_thermocouple_readings(55.0, temps, rx, now=1.0)
+        assert temps == [55.0]
+
+    def test_failed_read_changes_nothing(self):
+        temps, rx = [50.0] * 4, [1.0] * 4
+        apply_thermocouple_readings([], temps, rx, now=9.0)
+        assert temps == [50.0] * 4 and rx == [1.0] * 4
+
+    def test_extra_values_are_ignored(self):
+        temps, rx = self._fresh(2)
+        apply_thermocouple_readings([30.0, 31.0, 32.0], temps, rx, now=1.0)
+        assert temps == [30.0, 31.0]
+
+    def test_ages(self):
+        assert reading_ages([9.0, None], now=10.0) == [1.0, float('inf')]

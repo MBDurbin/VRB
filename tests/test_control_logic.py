@@ -18,6 +18,11 @@ from control_logic import (
     check_cell_safety,
     check_sensor_health,
     check_temp_sensors,
+    check_resistor_temps,
+    check_resistor_tc_health,
+    hot_resistor_banks,
+    resistor_limit,
+    stale_resistor_banks,
     stale_temp_sensors,
     check_daq_health,
     evaluate_safety,
@@ -95,6 +100,7 @@ class TestModuleUndervoltage:
         d = {'max_temp': 25.0, 'amps': 50.0, 'voltage': 43.2,
              'cell_voltages': [3.60] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
              'temp_sensor_ages_s': _fresh_sensor_ages(),
+             'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
              'hardware_status': {'temp_arduino': True}}
         d.update(kw)
         return d
@@ -133,6 +139,7 @@ def _limits(**overrides):
         'min_volts': 36.0, 'min_cell_volts': 2.70, 'cell_sense_floor': 0.50,
         'temp_stale_timeout': 3.0, 'daq_stale_timeout': 1.0,
         'derate_en': False, 'derate_start': 55.0,
+        'resistor_max_temp': [225.0, 225.0, 225.0, 150.0],
     }
     base.update(overrides)
     return base
@@ -344,6 +351,86 @@ class TestTempSensorHealth:
         assert stale_temp_sensors(ages, 3.0) == [(2, 4), (6, 1)]
 
 
+# ================= RESISTOR BANK TEMPERATURES =================
+
+RESISTOR_LIMITS = [225.0, 225.0, 225.0, 150.0]
+
+
+class TestResistorTemps:
+    def _packet(self, **kw):
+        d = {'max_temp': 30.0, 'amps': 50.0, 'voltage': 45.0,
+             'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
+             'temp_sensor_ages_s': _fresh_sensor_ages(),
+             'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
+             'hardware_status': {'temp_arduino': True}}
+        d.update(kw)
+        return d
+
+    def test_cool_banks_pass(self):
+        assert evaluate_safety(self._packet(), _limits()) == (False, None)
+
+    def test_bank_at_its_trip_faults(self):
+        data = self._packet(resistor_temps=[225.0, 40.0, 40.0, 40.0])
+        assert evaluate_safety(data, _limits()) == (True, "RESISTOR OVERTEMP")
+
+    def test_each_bank_is_held_to_its_own_trip(self):
+        # 160 C is fine for a TE bank (225 C) but over bank 4's 150 C.
+        assert check_resistor_temps([160.0, 160.0, 160.0, 40.0], RESISTOR_LIMITS) == (False, None)
+        assert check_resistor_temps([40.0, 40.0, 40.0, 160.0], RESISTOR_LIMITS) \
+            == (True, "RESISTOR OVERTEMP")
+
+    def test_applies_unarmed(self):
+        # A hot bank is hot whatever the FSM thinks, like the cell trip.
+        data = self._packet(resistor_temps=[300.0, 40.0, 40.0, 40.0])
+        assert evaluate_safety(data, _limits(), armed=False) == (True, "RESISTOR OVERTEMP")
+
+    def test_hot_banks_are_named(self):
+        hot = hot_resistor_banks([230.0, 40.0, 40.0, 151.0], RESISTOR_LIMITS)
+        assert hot == [(1, 230.0, 225.0), (4, 151.0, 150.0)]
+
+    def test_bank_with_no_reading_yet_is_not_judged_hot(self):
+        assert check_resistor_temps([None, 40.0, 40.0, 40.0], RESISTOR_LIMITS) == (False, None)
+
+    def test_bank_without_a_trip_uses_the_strictest(self):
+        # Five thermocouples, four trips: bank 5 is held to 150 C, not left open.
+        assert resistor_limit(RESISTOR_LIMITS, 4) == 150.0
+        assert check_resistor_temps([40.0] * 4 + [151.0], RESISTOR_LIMITS) \
+            == (True, "RESISTOR OVERTEMP")
+
+    def test_no_trips_configured_fails_closed(self):
+        assert check_resistor_temps([25.0], []) == (True, "RESISTOR OVERTEMP")
+
+    def test_stale_thermocouple_faults_once_armed(self):
+        # Open thermocouple: the last reading freezes while the bank heats.
+        data = self._packet(resistor_temp_ages_s=[0.1, 10.0, 0.1, 0.1])
+        assert evaluate_safety(data, _limits()) == (True, "RESISTOR TC FAULT")
+        assert evaluate_safety(data, _limits(), armed=False) == (False, None)
+
+    def test_never_read_thermocouple_faults_once_armed(self):
+        data = self._packet(resistor_temps=[None, 40.0, 40.0, 40.0],
+                            resistor_temp_ages_s=[float('inf'), 0.1, 0.1, 0.1])
+        assert evaluate_safety(data, _limits()) == (True, "RESISTOR TC FAULT")
+
+    def test_no_thermocouple_data_fails_closed_once_armed(self):
+        # No thermocouple module: the logic refuses to arm on unwatched banks.
+        data = self._packet(resistor_temps=[], resistor_temp_ages_s=[])
+        assert evaluate_safety(data, _limits()) == (True, "NO RESISTOR TEMP DATA")
+        assert evaluate_safety(data, _limits(), armed=False) == (False, None)
+
+    def test_stale_banks_are_named(self):
+        assert stale_resistor_banks([0.1, 10.0, float('inf'), 0.1], 3.0) == [2, 3]
+
+    def test_zero_timeout_disables_the_staleness_check(self):
+        assert check_resistor_tc_health([999.0] * 4, 0.0) == (False, None)
+
+    def test_measured_dangers_outrank_resistor_temperature(self):
+        hot = [300.0, 40.0, 40.0, 40.0]
+        assert evaluate_safety(self._packet(resistor_temps=hot, max_temp=99.0),
+                               _limits()) == (True, "OVERTEMP")
+        assert evaluate_safety(self._packet(resistor_temps=hot, amps=500.0),
+                               _limits()) == (True, "OVERCURRENT")
+
+
 # ================= COMPOSED SAFETY EVALUATION =================
 
 class TestEvaluateSafety:
@@ -352,6 +439,7 @@ class TestEvaluateSafety:
             'max_temp': 30.0, 'amps': 50.0, 'voltage': 45.0,
             'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
             'temp_sensor_ages_s': _fresh_sensor_ages(),
+            'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
             'hardware_status': {'temp_arduino': True},
         }
         data.update(overrides)
@@ -888,6 +976,7 @@ class TestBankOverpowerTrip:
         d = {'max_temp': 30.0, 'amps': 50.0, 'voltage': 46.0,
              'cell_voltages': [3.83] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
              'temp_sensor_ages_s': _fresh_sensor_ages(),
+             'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
              'hardware_status': {'temp_arduino': True}}
         d.update(kw)
         return d

@@ -12,7 +12,7 @@ class SILSimulatorWindow(QtWidgets.QWidget):
         self.telemetry_queue = telemetry_queue
 
         self.setWindowTitle("SIL Plant Model")
-        self.resize(430, 330)
+        self.resize(430, 380)
 
         # Physics Constants for P45B 12S4P (Molicel INR-21700-P45B v1.2)
         #   4.2 V/cell charge * 12S      = 50.4 V full
@@ -75,6 +75,17 @@ class SILSimulatorWindow(QtWidgets.QWidget):
         layout.addWidget(self.lbl_temp)
         layout.addWidget(self.slider_temp)
 
+        # Bank 1 resistor temperature. Bank 1 carries the peak duty, so it is the
+        # one to drive past its trip; banks 2-4 sit at room temperature.
+        self.lbl_res_temp = self._slider_label("Bank 1 resistor  30 °C")
+        self.slider_res_temp = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_res_temp.setRange(20, 350)
+        self.slider_res_temp.setValue(30)
+        self.slider_res_temp.valueChanged.connect(
+            lambda v: self.lbl_res_temp.setText(f"Bank 1 resistor  {v} °C"))
+        layout.addWidget(self.lbl_res_temp)
+        layout.addWidget(self.slider_res_temp)
+
         # Pack OCV Slider -- lets the operator walk the pack down to exercise the
         # UNDERVOLTAGE trip. Without this the rig floors at 39.15 V (max sag at
         # 250 A) and the trip can never be reached on a desk test.
@@ -124,6 +135,8 @@ class SILSimulatorWindow(QtWidgets.QWidget):
             # temp_arduino instead, which is what exercises the stale/lost checks.
             'temp_age_s': 0.0,
             'temp_sensor_ages_s': [[0.0] * len(bus) for bus in fake_temps],
+            'resistor_temps': [float(self.slider_res_temp.value()), 30.0, 30.0, 30.0],
+            'resistor_temp_ages_s': [0.0] * 4,
             'hardware_status': {
                 'ni_daq': not hw_fault,
                 'temp_arduino': not hw_fault,

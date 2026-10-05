@@ -55,6 +55,8 @@ plant-model window and the main telemetry GUI appear.
 | B14 | ARM+RUN, then close the SIL window so the plant stops feeding | `FAULT` logging `DAQ DATA STALE` within ~1 s, and the GUI keeps updating rather than freezing |
 | B15 | Repeat B14 but press **E-STOP** while the plant is stopped | E-STOP is still processed — the logic loop no longer skips its body on an empty queue |
 | B16 | RESET, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~192 A | `FAULT` logging `BANK OVERPOWER` once V × I passes 8 kW, in `IDLE` as well. No Max Amp setting moves this trip |
+| B17 | RESET, ARM, drag SIL **Bank 1 resistor** past 225 °C | `FAULT` logging `RESISTOR OVERTEMP` and `Bank 1 at ... C (trip 225 C)`. Fires in `IDLE` as well |
+| B18 | Open **Resistor Map** while dragging the Bank 1 slider | Bank 1's four top-row elements recolour toward red as they near 225 °C; banks 5–8 read `NO SENSOR` |
 
 **Not reachable from the SIL sliders** — the plant model generates uniform cells
 and always-fresh timestamps, so these need either a unit test or real hardware:
@@ -64,6 +66,7 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
 - `TEMP DATA STALE` (link reports connected but stops sending). B9 exercises the
   link-lost path only. On the bench, pull the temp Arduino's TX line while
   leaving it enumerated to reach this. Covered by `test_stale_data_trips`.
+- `RESISTOR TC FAULT` / `NO RESISTOR TEMP DATA` (an open thermocouple, or no thermocouple module). The SIL plant always reports all four banks. On the bench, ARM and unplug one thermocouple: the rig should fault within ~3 s naming that bank. Covered by `test_stale_thermocouple_faults_once_armed`.
 - `TEMP SENSOR FAULT` (one DS18B20 reporting `ERR` while the rest of the stream
   stays fresh). On the bench, ARM and then pull one sensor's data lead: the rig
   should fault within ~3 s and the console should name that bus and sensor.

@@ -12,7 +12,7 @@ from rig_config import (
 )
 from control_logic import DEFAULT_LAP_CSV, VRB_MAX_POWER_W
 import theme
-from PyQt6 import QtWidgets, QtCore
+from PyQt6 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 
 
@@ -323,7 +323,11 @@ class ConfigDialog(QtWidgets.QDialog):
             f"{candidate.limits.max_temp:.0f} C  |  "
             f"{candidate.limits.min_volts:.1f} V\n"
             f"BANK LIMIT        {VRB_MAX_POWER_W / 1000:.1f} kW, fixed in control_logic.py and "
-            f"applied whatever the current limit above"
+            f"applied whatever the current limit above\n"
+            f"RESISTOR TRIPS    "
+            + "  |  ".join(f"B{i + 1} {t:.0f} C"
+                           for i, t in enumerate(candidate.limits.resistor_max_temp_c))
+            + "   (edit in rig_config.json)"
         )
 
         warnings = candidate.validate()
@@ -458,6 +462,223 @@ class HeatmapWindow(QtWidgets.QWidget):
                         self._cell_style(colour, text_colour))
 
 
+# ================= RESISTOR BANK MAP =================
+# The bank as built, viewed along the elements (docs/hardware_topology.md,
+# "Cooling", and the tube-bank geometry in CFM Calculator.py). The fan sits below
+# and blows UP, so air meets the flat bars first and the top row last.
+#
+#   top row     bank 1: four 1 ohm TE2000 elements side by side. The only bank in
+#               circuit at the 0.25 ohm floor, so it carries the peak duty.
+#   middle row  banks 2 and 3: three TE2000 elements offset into the top row's
+#               gaps, so the array is a staggered tube bank.
+#   bottom row  banks 4-8 on four sideways aluminium flat bars.
+#
+# NOT RECORDED anywhere in the repo: which middle-row position is bank 3, and
+# where banks 4-8 sit on the flat bars. Both are drawn in bank order. Correct
+# these two tuples if the bank is surveyed.
+MIDDLE_ROW_BANKS = (2, 3, 2)
+FLAT_BAR_BANKS = (4, 4, 5, 6, 7, 8, 8)
+
+# What each bank is built from, for the table beside the map.
+BANK_PARTS = {
+    1: "4 × 1 Ω TE2000", 2: "2 × 1 Ω TE2000", 3: "1 × 1 Ω TE2000",
+    4: "2 × 4 Ω Uxcell", 5: "4 Ω Uxcell", 6: "8 Ω Ohmite HS300",
+    7: "16 Ω Ohmite HS200", 8: "2 × 16 Ω Ohmite HS200",
+}
+BANK_COUNT = 8
+
+
+def bank_tile(temp, age, limit, stale_timeout_s):
+    """(fill colour, status) for one bank's tile on the resistor map.
+
+    The colour ramps from cool to red at THAT bank's trip, so a glance compares
+    each bank against its own limit rather than against the hottest one.
+    `temp` is None for a bank with no thermocouple or no reading yet.
+    """
+    if temp is None:
+        return theme.SURFACE_HIGH, ("NO SENSOR" if limit is None else "NO DATA")
+    colour, _ = theme.heat_colour(temp, limit)
+    if temp >= limit:
+        return colour, "OVER"
+    if stale_timeout_s > 0 and age > stale_timeout_s:
+        return colour, "STALE"
+    return colour, "OK"
+
+
+class ResistorBankCanvas(QtWidgets.QWidget):
+    """Paints the bank's cross-section, each element coloured by its bank."""
+
+    PITCH = 104         # element spacing, px: ~2.07 diameters, the real 124 mm on 60 mm
+    RADIUS = 26
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(5 * self.PITCH, 430)
+        self.tiles = {}             # bank -> (fill, label text, status)
+
+    def set_tiles(self, tiles):
+        self.tiles = tiles
+        self.update()
+
+    @staticmethod
+    def _outline(status):
+        """Over trip: heavy white, since the fill is already red. Stale: dashed red."""
+        if status == "OVER":
+            pen = QtGui.QPen(QtGui.QColor(theme.TEXT), 3)
+        elif status == "STALE":
+            pen = QtGui.QPen(QtGui.QColor(theme.DANGER), 3)
+            pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+        else:
+            pen = QtGui.QPen(QtGui.QColor(theme.BORDER), 1)
+        return pen
+
+    def _tube(self, p, cx, cy, bank):
+        fill, text, status = self.tiles.get(bank, (theme.SURFACE_HIGH, "", "NO SENSOR"))
+        p.setPen(self._outline(status))
+        p.setBrush(QtGui.QColor(fill))
+        p.drawEllipse(QtCore.QPointF(cx, cy), self.RADIUS, self.RADIUS)
+        self._text(p, QtCore.QRectF(cx - self.RADIUS, cy - 10, 2 * self.RADIUS, 20), text,
+                   bold=True, colour="#ffffff")
+        self._text(p, QtCore.QRectF(cx - self.RADIUS, cy + self.RADIUS + 2, 2 * self.RADIUS, 14),
+                   f"B{bank}", colour=theme.TEXT_MUTED, size=9)
+
+    def _text(self, p, rect, text, bold=False, colour=None, size=10,
+              align=QtCore.Qt.AlignmentFlag.AlignCenter):
+        font = p.font()
+        font.setPointSize(size)
+        font.setBold(bold)
+        p.setFont(font)
+        p.setPen(QtGui.QColor(colour or theme.TEXT_DIM))
+        p.drawText(rect, align, text)
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        x0 = w / 2 - 1.5 * self.PITCH           # left tube of the 4-wide rows
+        y_top, y_mid, y_bars = 70, 160, 250
+
+        self._text(p, QtCore.QRectF(0, 18, w, 18), "EXHAUST ↑", colour=theme.TEXT_MUTED, size=9)
+
+        # Top row: bank 1.
+        for i in range(4):
+            self._tube(p, x0 + i * self.PITCH, y_top, 1)
+
+        # Middle row: offset into the gaps above.
+        for i, bank in enumerate(MIDDLE_ROW_BANKS):
+            self._tube(p, x0 + (i + 0.5) * self.PITCH, y_mid, bank)
+
+        # Bottom row: four flat bars, on edge, under the top row's tubes.
+        p.setPen(QtGui.QPen(QtGui.QColor(theme.BORDER)))
+        p.setBrush(QtGui.QColor(theme.SURFACE_HOVER))
+        for i in range(4):
+            p.drawRoundedRect(QtCore.QRectF(x0 + i * self.PITCH - 4, y_bars - 32, 8, 64), 2, 2)
+
+        # Banks 4-8 as blocks along the bar row. Positions are not recorded.
+        span = 3 * self.PITCH + 2 * self.RADIUS
+        step = span / len(FLAT_BAR_BANKS)
+        for i, bank in enumerate(FLAT_BAR_BANKS):
+            fill, text, status = self.tiles.get(bank, (theme.SURFACE_HIGH, "", "NO SENSOR"))
+            rect = QtCore.QRectF(x0 - self.RADIUS + i * step + 3, y_bars - 14, step - 6, 28)
+            p.setPen(self._outline(status))
+            p.setBrush(QtGui.QColor(fill))
+            p.drawRoundedRect(rect, 3, 3)
+            self._text(p, rect, text or f"B{bank}", bold=bool(text),
+                       colour="#ffffff" if text else theme.TEXT_MUTED, size=9)
+        self._text(p, QtCore.QRectF(0, y_bars + 38, w, 14),
+                   "banks 4–8 on the flat bars · positions not recorded",
+                   colour=theme.TEXT_MUTED, size=8)
+
+        # Fan and airflow.
+        y_fan = 370
+        for i in range(4):
+            x = x0 + (i - 0.5) * self.PITCH + self.PITCH / 2
+            p.setPen(QtGui.QPen(QtGui.QColor(theme.ACCENT), 2))
+            p.drawLine(QtCore.QPointF(x, y_fan - 12), QtCore.QPointF(x, y_bars + 58))
+            p.drawLine(QtCore.QPointF(x, y_bars + 58), QtCore.QPointF(x - 5, y_bars + 66))
+            p.drawLine(QtCore.QPointF(x, y_bars + 58), QtCore.QPointF(x + 5, y_bars + 66))
+        p.setPen(QtGui.QPen(QtGui.QColor(theme.BORDER)))
+        p.setBrush(QtGui.QColor(theme.SURFACE))
+        fan = QtCore.QRectF(x0 - self.RADIUS, y_fan - 10, 3 * self.PITCH + 2 * self.RADIUS, 26)
+        p.drawRoundedRect(fan, 6, 6)
+        self._text(p, fan, "FAN · blows up", colour=theme.TEXT_DIM, size=9)
+        p.end()
+
+
+class ResistorMapWindow(QtWidgets.QWidget):
+    """Live thermal map of the resistor bank, laid out as the bank is built."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Resistor Bank Thermal Map")
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(theme.GAP_LG, theme.GAP_MD, theme.GAP_LG, theme.GAP_LG)
+        layout.setSpacing(theme.GAP_LG)
+
+        left = QtWidgets.QVBoxLayout()
+        caption = QtWidgets.QLabel("RESISTOR BANK · VIEWED ALONG THE ELEMENTS")
+        caption.setProperty("variant", "section")
+        left.addWidget(caption)
+        self.canvas = ResistorBankCanvas()
+        left.addWidget(self.canvas, 1)
+        swatches = "".join(
+            f"<span style='color:{hexcode}'>■</span>" for _, hexcode in theme.HEAT_STOPS)
+        legend = QtWidgets.QLabel(f"cool &nbsp;{swatches}&nbsp; at that bank's trip · "
+                                  f"white outline: over trip · dashed red: stale reading")
+        legend.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
+        left.addWidget(legend)
+        layout.addLayout(left, 1)
+
+        # Per-bank table.
+        table = QtWidgets.QGridLayout()
+        table.setHorizontalSpacing(theme.GAP_MD)
+        table.setVerticalSpacing(theme.GAP_XS)
+        for col, head in enumerate(("BANK", "BUILT FROM", "TEMP", "TRIP", "STATUS")):
+            lbl = QtWidgets.QLabel(head)
+            lbl.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 10px; font-weight: 700;")
+            table.addWidget(lbl, 0, col)
+        self.rows = {}
+        mono = f"font-family: {theme.FONT_MONO}; font-size: {theme.SIZE_SMALL}px;"
+        for bank in range(1, BANK_COUNT + 1):
+            cells = [QtWidgets.QLabel(t) for t in
+                     (f"{bank}", BANK_PARTS[bank], "--", "--", "")]
+            for col, lbl in enumerate(cells):
+                lbl.setStyleSheet(mono + f"color: {theme.TEXT_DIM};")
+                table.addWidget(lbl, bank, col)
+            self.rows[bank] = cells
+        table.setRowStretch(BANK_COUNT + 1, 1)
+        layout.addLayout(table)
+
+        self.resize(980, 500)
+
+    def update_banks(self, temps, ages, limits, stale_timeout_s):
+        """temps/ages: per thermocoupled bank, bank 1 first. limits: per bank, C."""
+        tiles = {}
+        for bank in range(1, BANK_COUNT + 1):
+            i = bank - 1
+            sensed = i < len(temps)
+            temp = temps[i] if sensed else None
+            age = ages[i] if i < len(ages) else float('inf')
+            # Matches control_logic.resistor_limit(): no trip of its own means
+            # the strictest one set.
+            limit = (limits[i] if i < len(limits) else min(limits, default=0.0)) if sensed else None
+            fill, status = bank_tile(temp, age, limit, stale_timeout_s)
+            text = f"{temp:.0f}" if temp is not None else ""
+            tiles[bank] = (fill, text, status)
+
+            _, _, lbl_temp, lbl_trip, lbl_status = self.rows[bank]
+            lbl_temp.setText(f"{temp:.1f} °C" if temp is not None else "--")
+            lbl_trip.setText(f"{limit:.0f} °C" if limit is not None else "--")
+            lbl_status.setText(status)
+            colour = {"OK": theme.SUCCESS, "OVER": theme.DANGER, "STALE": theme.DANGER,
+                      "NO DATA": theme.WARNING}.get(status, theme.TEXT_MUTED)
+            lbl_status.setStyleSheet(
+                f"font-family: {theme.FONT_MONO}; font-size: {theme.SIZE_SMALL}px; "
+                f"font-weight: 700; color: {colour};")
+        self.canvas.set_tiles(tiles)
+
+
 # ================= MAIN TELEMETRY GUI =================
 class TelemetryGUI(QtWidgets.QMainWindow):
     def __init__(self, telemetry_queue: Queue, gui_cmd_queue: Queue, stop_event: Event):
@@ -470,6 +691,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.csv_file = None
         self.csv_writer = None
         self.heatmap_window = None
+        self.resistor_map_window = None
 
         # Vehicle, pack and safety limits all come from rig_config.json, falling
         # back to the P45B 12S4P defaults. Editable from the Configure dialog so
@@ -593,6 +815,10 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.btn_heatmap = QtWidgets.QPushButton("Thermal Map")
         self.btn_heatmap.clicked.connect(self.toggle_heatmap)
 
+        self.btn_resistor_map = QtWidgets.QPushButton("Resistor Map")
+        self.btn_resistor_map.setToolTip("Resistor bank temperatures, laid out as the bank is built")
+        self.btn_resistor_map.clicked.connect(self.toggle_resistor_map)
+
         self.btn_record = QtWidgets.QPushButton("Record")
         self.btn_record.setCheckable(True)
         self.btn_record.clicked.connect(self.toggle_logging)
@@ -611,6 +837,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         control_row.addWidget(self.btn_reset)
         control_row.addWidget(self._divider())
         control_row.addWidget(self.btn_heatmap)
+        control_row.addWidget(self.btn_resistor_map)
         control_row.addWidget(self.btn_record)
         main_layout.addLayout(control_row)
 
@@ -1000,6 +1227,19 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.btn_heatmap.setText("Hide Thermal Map")
             theme.restyle(self.btn_heatmap, "primary")
 
+    def toggle_resistor_map(self):
+        if self.resistor_map_window is None:
+            self.resistor_map_window = ResistorMapWindow()
+
+        if self.resistor_map_window.isVisible():
+            self.resistor_map_window.hide()
+            self.btn_resistor_map.setText("Resistor Map")
+            theme.restyle(self.btn_resistor_map, None)
+        else:
+            self.resistor_map_window.show()
+            self.btn_resistor_map.setText("Hide Resistor Map")
+            theme.restyle(self.btn_resistor_map, "primary")
+
     def toggle_logging(self):
         if self.btn_record.isChecked():
             self.is_logging = True
@@ -1099,6 +1339,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             if self.heatmap_window and self.heatmap_window.isVisible() and temps:
                 self.heatmap_window.update_temps(temps, self.lim_t_crit)
 
+            if self.resistor_map_window and self.resistor_map_window.isVisible():
+                self.resistor_map_window.update_banks(
+                    latest_data.get('resistor_temps', []),
+                    latest_data.get('resistor_temp_ages_s', []),
+                    self.config.limits.resistor_max_temp_c,
+                    self.config.limits.temp_stale_timeout_s)
+
             current_time = time.time() - self.start_time
             self.time_data.append(current_time)
             self.voltage_data.append(volts)
@@ -1161,6 +1408,8 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.csv_file.close()
         if self.heatmap_window:
             self.heatmap_window.close()
+        if self.resistor_map_window:
+            self.resistor_map_window.close()
         event.accept()
 
 

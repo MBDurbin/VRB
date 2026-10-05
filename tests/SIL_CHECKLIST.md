@@ -63,6 +63,10 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
 - `TEMP DATA STALE` (link reports connected but stops sending). B9 exercises the
   link-lost path only. On the bench, pull the temp Arduino's TX line while
   leaving it enumerated to reach this. Covered by `test_stale_data_trips`.
+- `TEMP SENSOR FAULT` (one DS18B20 reporting `ERR` while the rest of the stream
+  stays fresh). On the bench, ARM and then pull one sensor's data lead: the rig
+  should fault within ~3 s and the console should name that bus and sensor.
+  Covered by `test_one_frozen_sensor_trips_despite_a_fresh_stream`.
 
 ## C. FSM transition guards
 

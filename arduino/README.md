@@ -50,6 +50,13 @@ A disconnected sensor prints `ERR` rather than a number, and the Python parser
 skips those readings rather than writing a zero — a zero would drag the max-temp
 calculation down and could mask a real overtemp.
 
+Skipping leaves that sensor's last good value in place, so the DAQ also tracks
+how long each sensor has gone without a valid reading. Once armed, any sensor
+with no reading for longer than the temperature staleness timeout (3 s by
+default) faults the rig as `TEMP SENSOR FAULT`, and the console names the bus and
+sensor. A sensor that reads `ERR` from power-up counts too, so a known-dead
+sensor has to be fixed before the rig can be armed.
+
 **The 48 sensor ROM addresses are hardcoded in this sketch.** Changing
 `sensors_per_bus` or `temp_bus_count` in `rig_config.json` does *not* change what
 the firmware reads; the addresses here must be edited and the sketch re-flashed.

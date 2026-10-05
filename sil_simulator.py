@@ -123,6 +123,7 @@ class SILSimulatorWindow(QtWidgets.QWidget):
             # SIL data is generated fresh every tick. The fault toggle below drops
             # temp_arduino instead, which is what exercises the stale/lost checks.
             'temp_age_s': 0.0,
+            'temp_sensor_ages_s': [[0.0] * len(bus) for bus in fake_temps],
             'hardware_status': {
                 'ni_daq': not hw_fault,
                 'temp_arduino': not hw_fault,

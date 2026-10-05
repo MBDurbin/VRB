@@ -11,7 +11,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hardware_manager import derive_cell_voltages, parse_temperature_line
+from hardware_manager import (
+    derive_cell_voltages, parse_temperature_line, temperature_sensor_ages)
 
 
 # ================= CELL VOLTAGE DIFFERENCING =================
@@ -111,3 +112,31 @@ class TestParseTemperatureLine:
         line = "1," + ",".join(["-15.5"] * 8)
         _, readings = parse_temperature_line(line, 8, 6)
         assert all(math.isclose(v, -15.5) for v in readings.values())
+
+    def test_non_finite_values_are_not_readings(self):
+        # float() accepts these. A NaN would hide from max() and the overtemp
+        # trip while still refreshing that sensor's age.
+        _, readings = parse_temperature_line("1,nan,inf,-inf,4,5,6,7,8", 8, 6)
+        assert 0 not in readings
+        assert 1 not in readings
+        assert 2 not in readings
+        assert len(readings) == 5
+
+
+# ================= PER-SENSOR AGES =================
+
+class TestTemperatureSensorAges:
+    def test_age_is_time_since_last_valid_reading(self):
+        ages = temperature_sensor_ages([[100.0, 98.0], [99.5, 90.0]], now=100.0)
+        assert ages == [[0.0, 2.0], [0.5, 10.0]]
+
+    def test_never_read_sensor_is_infinitely_old(self):
+        # ERR since power-up must not read as fresh.
+        ages = temperature_sensor_ages([[100.0, None]], now=100.0)
+        assert ages[0][0] == 0.0
+        assert ages[0][1] == float('inf')
+
+    def test_keeps_the_bus_layout(self):
+        ages = temperature_sensor_ages([[None] * 8 for _ in range(6)], now=0.0)
+        assert len(ages) == 6
+        assert all(len(bus) == 8 for bus in ages)

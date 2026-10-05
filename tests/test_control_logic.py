@@ -17,6 +17,8 @@ from control_logic import (
     check_thermal_and_current,
     check_cell_safety,
     check_sensor_health,
+    check_temp_sensors,
+    stale_temp_sensors,
     check_daq_health,
     evaluate_safety,
     lap_row_interval,
@@ -85,6 +87,7 @@ class TestModuleUndervoltage:
     def _packet(self, **kw):
         d = {'max_temp': 25.0, 'amps': 50.0, 'voltage': 43.2,
              'cell_voltages': [3.60] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
+             'temp_sensor_ages_s': _fresh_sensor_ages(),
              'hardware_status': {'temp_arduino': True}}
         d.update(kw)
         return d
@@ -126,6 +129,11 @@ def _limits(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def _fresh_sensor_ages(buses=6, per_bus=8, age=0.2):
+    """Per-sensor ages for the default 6x8 layout, every sensor recently read."""
+    return [[age] * per_bus for _ in range(buses)]
 
 
 class TestCellSafety:
@@ -288,6 +296,47 @@ class TestSensorHealth:
         assert fault is False
 
 
+# ================= PER-SENSOR TEMPERATURE HEALTH =================
+
+class TestTempSensorHealth:
+    def test_all_sensors_fresh_passes(self):
+        assert check_temp_sensors(_fresh_sensor_ages(), 3.0) == (False, None)
+
+    def test_one_err_sensor_trips_while_the_rest_stay_fresh(self):
+        # Bus 2 sensor 4 has reported ERR for 10 s. The other 47 keep the
+        # stream fresh, so only a per-sensor check can see it.
+        ages = _fresh_sensor_ages()
+        ages[1][3] = 10.0
+        assert check_temp_sensors(ages, 3.0) == (True, "TEMP SENSOR FAULT")
+
+    def test_brief_err_within_timeout_passes(self):
+        # One or two ERR lines from OneWire noise must not trip the rig.
+        ages = _fresh_sensor_ages()
+        ages[0][0] = 2.9
+        assert check_temp_sensors(ages, 3.0) == (False, None)
+
+    def test_sensor_never_read_trips(self):
+        # ERR since power-up: the DAQ reports inf, never a fresh-looking 0.
+        ages = _fresh_sensor_ages()
+        ages[5][7] = float('inf')
+        assert check_temp_sensors(ages, 3.0) == (True, "TEMP SENSOR FAULT")
+
+    def test_no_per_sensor_data_fails_closed(self):
+        assert check_temp_sensors([], 3.0) == (True, "NO TEMP SENSOR DATA")
+        assert check_temp_sensors([[], []], 3.0) == (True, "NO TEMP SENSOR DATA")
+
+    def test_zero_timeout_disables_the_staleness_check(self):
+        ages = _fresh_sensor_ages(age=999.0)
+        assert check_temp_sensors(ages, 0.0) == (False, None)
+
+    def test_stale_sensors_are_named_in_arduino_numbering(self):
+        # 1-based, matching the bus numbers the Arduino prints.
+        ages = _fresh_sensor_ages()
+        ages[1][3] = 10.0
+        ages[5][0] = float('inf')
+        assert stale_temp_sensors(ages, 3.0) == [(2, 4), (6, 1)]
+
+
 # ================= COMPOSED SAFETY EVALUATION =================
 
 class TestEvaluateSafety:
@@ -295,6 +344,7 @@ class TestEvaluateSafety:
         data = {
             'max_temp': 30.0, 'amps': 50.0, 'voltage': 45.0,
             'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
+            'temp_sensor_ages_s': _fresh_sensor_ages(),
             'hardware_status': {'temp_arduino': True},
         }
         data.update(overrides)
@@ -312,6 +362,33 @@ class TestEvaluateSafety:
         fault, reason = evaluate_safety(data, _limits())
         assert fault is True
         assert reason == "TEMP DATA STALE"
+
+    def test_one_frozen_sensor_trips_despite_a_fresh_stream(self):
+        # One DS18B20 reports ERR and its last 30 C stays in the array while the
+        # cell heats. Link is up and the stream is fresh, so before per-sensor
+        # tracking this packet read as healthy.
+        ages = _fresh_sensor_ages()
+        ages[2][5] = 30.0
+        data = self._packet(temp_sensor_ages_s=ages)
+        assert evaluate_safety(data, _limits()) == (True, "TEMP SENSOR FAULT")
+
+    def test_lost_link_reported_ahead_of_per_sensor_fault(self):
+        # A dropped link makes every sensor stale; the link is the real cause.
+        data = self._packet(hardware_status={'temp_arduino': False},
+                            temp_sensor_ages_s=_fresh_sensor_ages(age=30.0))
+        assert evaluate_safety(data, _limits()) == (True, "TEMP LINK LOST")
+
+    def test_dead_sensor_does_not_fault_unarmed(self):
+        # Same bring-up rule as the other sensor checks.
+        ages = _fresh_sensor_ages()
+        ages[0][0] = float('inf')
+        data = self._packet(temp_sensor_ages_s=ages)
+        assert evaluate_safety(data, _limits(), armed=False) == (False, None)
+
+    def test_missing_per_sensor_data_trips_once_armed(self):
+        data = self._packet()
+        del data['temp_sensor_ages_s']
+        assert evaluate_safety(data, _limits()) == (True, "NO TEMP SENSOR DATA")
 
     def test_weak_cell_caught_despite_healthy_module_total(self):
         data = self._packet(voltage=38.4, cell_voltages=[3.40] * 11 + [1.00])

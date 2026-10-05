@@ -725,6 +725,10 @@ class SafetyLimits:
     # temperature link freezes the last reading and the overtemp trip can never
     # fire while the cells keep heating.
     #
+    # Applied per sensor as well as to the stream: one DS18B20 reporting ERR for
+    # longer than this faults the rig once armed, even while every other sensor
+    # is still arriving. Short ERR blips from bus noise ride through it.
+    #
     # Seconds. Must exceed the Arduino's full sensor sweep or normal operation
     # would look like a dead sensor.
     temp_stale_timeout_s: float = 3.0
@@ -861,7 +865,7 @@ class SafetyLimits:
         if self.temp_stale_timeout_s <= 0:
             warnings.append(
                 "Temperature staleness timeout must be positive, or a lost "
-                "temperature link will never be detected."
+                "temperature link or failed sensor will never be detected."
             )
         # Derating needs a temperature band to ramp across.
         if self.derate_enabled and self.derate_start >= self.max_temp:

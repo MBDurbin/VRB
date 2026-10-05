@@ -1,3 +1,4 @@
+import math
 import serial
 import serial.tools.list_ports
 import nidaqmx
@@ -57,11 +58,32 @@ def parse_temperature_line(line, sensors_per_bus, bus_count):
         if raw == "ERR":
             continue
         try:
-            readings[i] = float(raw)
+            value = float(raw)
         except ValueError:
             continue
+        # float() accepts "nan" and "inf". Neither is a temperature, and a NaN
+        # loses every comparison, so it would hide from max() and the overtemp
+        # trip while still counting as a fresh reading for that sensor.
+        if math.isfinite(value):
+            readings[i] = value
 
     return bus_idx, readings
+
+
+def temperature_sensor_ages(last_valid_rx, now):
+    """Seconds since each sensor last delivered a valid reading.
+
+    Same [bus][sensor] shape as the temperature array. The stream-wide
+    temp_age_s cannot see a single failed sensor: when one DS18B20 reports ERR,
+    the other sensors on the bus keep the stream fresh while that sensor's last
+    value sits frozen in the array. This is what lets the logic process fault on
+    it.
+
+    A sensor that has never delivered a number -- ERR since power-up -- reads
+    inf, so it cannot pass as fresh.
+    """
+    return [[now - t if t is not None else float('inf') for t in bus]
+            for bus in last_valid_rx]
 
 
 def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig = None,
@@ -168,6 +190,11 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     # temperature while the cells keep heating.
     last_temp_rx = time.time()
 
+    # The same timestamp per sensor. Stream-wide freshness says nothing about a
+    # single sensor reporting ERR while the rest of its bus keeps arriving.
+    # None means no valid reading yet.
+    sensor_last_rx = [[None] * daq_cfg.sensors_per_bus for _ in range(daq_cfg.temp_bus_count)]
+
     # --- FIX 3: NI-DAQ DESK TEST BYPASS ---
     ni_daq_active = False
     task = None
@@ -222,10 +249,12 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                             if parsed is None:
                                 continue
                             bus_idx, readings = parsed
+                            rx_time = time.time()
                             for i, temp_c in readings.items():
                                 battery_temps[bus_idx][i] = temp_c
+                                sensor_last_rx[bus_idx][i] = rx_time
                             if readings:
-                                last_temp_rx = time.time()
+                                last_temp_rx = rx_time
                 except serial.SerialException:
                     print("\n[DAQ ERROR] Temperature Sensor LOST! Watchdog engaging...")
                     current_temp_ser.close()
@@ -237,6 +266,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
             max_t = max((max(bus) for bus in battery_temps if bus), default=0.0)
 
             # --- C. Package Data and Send to Queue ---
+            now = time.time()
             data_packet = {
                 'amps': current,
                 'voltage': total_pack_voltage,
@@ -244,7 +274,8 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 'power_kw': (current * total_pack_voltage) / 1000.0,
                 'temperatures': battery_temps,
                 'max_temp': max_t,
-                'temp_age_s': time.time() - last_temp_rx,
+                'temp_age_s': now - last_temp_rx,
+                'temp_sensor_ages_s': temperature_sensor_ages(sensor_last_rx, now),
                 'hardware_status': {
                     'temp_arduino': current_temp_ser is not None,
                     # Placeholder only. This process does not talk to the

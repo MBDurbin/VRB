@@ -161,6 +161,43 @@ def check_sensor_health(temp_age_s, temp_link_ok, stale_timeout_s):
     return False, None
 
 
+def stale_temp_sensors(sensor_ages, stale_timeout_s):
+    """1-based (bus, sensor) positions with no valid reading within the timeout.
+
+    Numbered the way the Arduino prints them, so the operator can match the
+    console message against the bus lines and the sketch's address tables.
+    """
+    if stale_timeout_s <= 0:
+        return []
+    return [(b + 1, s + 1)
+            for b, bus in enumerate(sensor_ages)
+            for s, age in enumerate(bus)
+            if age > stale_timeout_s]
+
+
+def check_temp_sensors(sensor_ages, stale_timeout_s):
+    """Per-sensor temperature integrity. Returns (is_fault, reason).
+
+    The Arduino prints ERR for a DS18B20 it cannot read, and the DAQ keeps that
+    sensor's last value rather than writing a zero. The other sensors keep the
+    stream as a whole fresh, so neither TEMP LINK LOST nor TEMP DATA STALE
+    fires -- while one cell's reading sits frozen at a safe-looking value and
+    the cell itself keeps heating.
+
+    sensor_ages is the DAQ's [bus][sensor] array of seconds since each sensor's
+    last valid reading. The timeout is the same one the stream-wide check uses,
+    so an occasional ERR from OneWire noise does not trip the rig, but a sensor
+    that stays dead does.
+    """
+    if not any(sensor_ages):
+        # Fail closed, as with NO CELL DATA: an empty array means per-sensor
+        # validity is not being reported at all, so no sensor can be trusted.
+        return True, "NO TEMP SENSOR DATA"
+    if stale_temp_sensors(sensor_ages, stale_timeout_s):
+        return True, "TEMP SENSOR FAULT"
+    return False, None
+
+
 def evaluate_safety(data, limits, armed=True):
     """All safety checks against one telemetry packet. Returns (is_fault, reason).
 
@@ -211,6 +248,13 @@ def evaluate_safety(data, limits, armed=True):
         data.get('hardware_status', {}).get('temp_arduino', False),
         limits['temp_stale_timeout'],
     )
+    if fault:
+        return True, reason
+
+    # After the link checks: a dropped link makes every sensor stale too, and
+    # TEMP LINK LOST is the more useful thing to tell the operator.
+    fault, reason = check_temp_sensors(
+        data.get('temp_sensor_ages_s', []), limits['temp_stale_timeout'])
     if fault:
         return True, reason
 
@@ -385,7 +429,8 @@ def NEUTRAL_PACKET():
     return {
         'amps': 0.0, 'voltage': 0.0, 'max_temp': 0.0,
         'cell_voltages': [], 'temperatures': [], 'power_kw': 0.0,
-        'temp_age_s': float('inf'), 'hardware_status': {},
+        'temp_age_s': float('inf'), 'temp_sensor_ages_s': [],
+        'hardware_status': {},
     }
 
 
@@ -704,6 +749,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
             fsm_state = "FAULT"
             print(f"\n[LOGIC] {trigger_reason} ALARM! Killing Load.")
+            if trigger_reason == "TEMP SENSOR FAULT":
+                dead = stale_temp_sensors(data.get('temp_sensor_ages_s', []),
+                                          limits['temp_stale_timeout'])
+                print("[LOGIC] No valid reading from: "
+                      + ", ".join(f"bus {b} sensor {s}" for b, s in dead))
             if res_ser:
                 res_ser.write(b"KILL\n")
 

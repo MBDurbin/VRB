@@ -62,6 +62,11 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import root_scalar
 
+# Paths beside this file, so it runs from any folder on any machine.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+GAS_TABLE_CSV = os.path.join(_HERE, "Gas_Properties_ATMP.csv")
+PLOTS_DIR = os.path.join(_HERE, "plots")
+
 # --- Tube-bank geometry: the WHOLE array. Sets the aerodynamics. ---
 # Kept global so helper functions can access them without needing them passed every time
 D = 0.060           # element outer diameter, m (TE 1000-2500 W parts: 60 mm)
@@ -113,7 +118,7 @@ def get_gas_properties(temp_k):
     """
     Interpolates gas properties from a CSV file for a given temperature.
     """
-    file_path = r"C:\Users\Durbi\PycharmProjects\Resistor Bank Master\Gas_Properties_ATMP.csv"
+    file_path = GAS_TABLE_CSV
 
     try:
         df = pd.read_csv(file_path)
@@ -142,8 +147,7 @@ def get_gas_properties(temp_k):
 
 # The table's range, read once for its bounds only. The interpolation itself
 # stays in get_gas_properties.
-_gas_table = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                      "Gas_Properties_ATMP.csv"))
+_gas_table = pd.read_csv(GAS_TABLE_CSV)
 _gas_table.columns = _gas_table.columns.str.strip()
 T_TABLE_MIN_K = float(_gas_table['T (K)'].min())
 T_TABLE_MAX_K = float(_gas_table['T (K)'].max())
@@ -470,7 +474,8 @@ def plot_cfm_effects(bypass_fraction=BYPASS_FRACTION):
     plt.grid(False)
     plt.tight_layout()
 
-    resistor_filename = 'CFM_vs_Resistor_Count.png'
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    resistor_filename = os.path.join(PLOTS_DIR, 'CFM_vs_Resistor_Count.png')
     plt.savefig(resistor_filename, dpi=300)
     plt.close()
     print(f"Saved: {os.path.abspath(resistor_filename)}")
@@ -483,7 +488,7 @@ def plot_cfm_effects(bypass_fraction=BYPASS_FRACTION):
     plt.grid(False)
     plt.tight_layout()
 
-    temp_filename = 'CFM_vs_Surface_Temp.png'
+    temp_filename = os.path.join(PLOTS_DIR, 'CFM_vs_Surface_Temp.png')
     plt.savefig(temp_filename, dpi=300)
     plt.close()
     print(f"Saved: {os.path.abspath(temp_filename)}")

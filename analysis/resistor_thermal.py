@@ -81,15 +81,19 @@ Known biases, both directions, with their size (measured here, or by review):
 import importlib.util
 import math
 import os
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as np
 import pandas as pd
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# rig_config lives one folder up, in the rig app.
+sys.path.insert(0, os.path.dirname(_HERE))
+
 from rig_config import RigConfig
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("cfm_calculator",
                                                os.path.join(_HERE, "CFM Calculator.py"))
 cfm = importlib.util.module_from_spec(_spec)
@@ -1022,7 +1026,8 @@ def plot_results(runs, profile, sweep=None, prefix="Thermal"):
              f"(see Peak_vs_Airflow); air at {cfm.SITE_PRESSURE_RATIO:g} atm. Runs start at room temperature.",
              color=_MUTED, fontsize=8)
     fig.tight_layout(rect=(0, 0.015, 1, 1))
-    name1 = f"{prefix}_Transient_Surface_Temp.png"
+    os.makedirs(cfm.PLOTS_DIR, exist_ok=True)
+    name1 = os.path.join(cfm.PLOTS_DIR, f"{prefix}_Transient_Surface_Temp.png")
     fig.savefig(name1, dpi=200, facecolor=_SURFACE)
     plt.close(fig)
 
@@ -1063,7 +1068,7 @@ def plot_results(runs, profile, sweep=None, prefix="Thermal"):
     ax.set_title(f"If 8 kW ran forever: {', '.join(verdicts)}", loc="left",
                  color=_INK, fontsize=11, fontweight="semibold")
     fig.tight_layout()
-    name2 = f"{prefix}_Steady_State.png"
+    name2 = os.path.join(cfm.PLOTS_DIR, f"{prefix}_Steady_State.png")
     fig.savefig(name2, dpi=200, facecolor=_SURFACE)
     plt.close(fig)
     if not sweep:
@@ -1138,7 +1143,7 @@ def plot_results(runs, profile, sweep=None, prefix="Thermal"):
              "The fan publishes no pressure curve, so it is bracketed: straight lines from 3500 CFM "
              "free-air to a stall pressure in the band shown.", color=_MUTED, fontsize=8)
     fig.tight_layout(rect=(0, 0.035, 1, 1))
-    name3 = f"{prefix}_Peak_vs_Airflow.png"
+    name3 = os.path.join(cfm.PLOTS_DIR, f"{prefix}_Peak_vs_Airflow.png")
     fig.savefig(name3, dpi=200, facecolor=_SURFACE)
     plt.close(fig)
     return name1, name2, name3

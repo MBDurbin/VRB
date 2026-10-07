@@ -18,8 +18,10 @@ RESISTOR_BAUD_RATE = 9600
 # Resolved relative to this file so the rig runs from any checkout on any
 # machine. An absolute path here would break for every future team.
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Lap profiles live in profiles/. The GUI's Load CSV dialog opens there too.
+PROFILES_DIR = os.path.join(PROJECT_DIR, "profiles")
 DEFAULT_LAP_CSV = "FSAE - ETS - Speed and Time 1 Lap.csv"
-CSV_FILENAME = os.path.join(PROJECT_DIR, DEFAULT_LAP_CSV)
+CSV_FILENAME = os.path.join(PROFILES_DIR, DEFAULT_LAP_CSV)
 
 MAX_RESISTANCE = 63.75
 RESISTOR_RESOLUTION = 0.25

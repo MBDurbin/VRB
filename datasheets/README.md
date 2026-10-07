@@ -91,7 +91,7 @@ elements combined.
 
 ### Why this matters to the rig, and what to check
 
-**The power ratings are free-air figures.** `CFM Calculator.py` in the repo root
+**The power ratings are free-air figures.** `analysis/CFM Calculator.py`
 exists precisely because the bank is force-cooled — it models the resistors as a
 staggered tube bank in cross-flow and sizes the airflow. Its 60 mm cylinder
 diameter matches the 1000 W–2500 W parts in the dimensions table on page 5. The

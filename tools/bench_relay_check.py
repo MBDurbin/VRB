@@ -12,8 +12,8 @@ It says nothing about which resistor moved. Only the meter tells you that.
 For the small banks (0.25, 0.5 ohm), short the meter probes together first and
 subtract that reading. Lead resistance is the same size as what you're measuring.
 
-    python bench_relay_check.py              # auto-detect the resistor Arduino
-    python bench_relay_check.py --port COM5
+    python tools/bench_relay_check.py              # auto-detect the resistor Arduino
+    python tools/bench_relay_check.py --port COM5
 
 At the prompt:
     8               command 8 ohms, encoded exactly as the rig would
@@ -33,9 +33,14 @@ The warnings, and what each one means:
 """
 
 import argparse
+import os
+import sys
 import threading
 import time
 import serial
+
+# The rig's modules live one folder up.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from control_logic import (
     MAX_RESISTANCE,

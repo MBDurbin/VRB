@@ -1,5 +1,5 @@
 """
-test_tc.py
+thermocouple_check.py  (was tests/test_tc.py)
 
 Thermocouple test code for type K thermocouples using NI DAQ
 """
@@ -7,9 +7,10 @@ Thermocouple test code for type K thermocouples using NI DAQ
 import nidaqmx
 from nidaqmx.constants import TemperatureUnits, ThermocoupleType
 
-# Bench script, run directly: python tests/test_tc.py
-# The guard stops pytest, which imports every test_*.py, from opening the DAQ on
-# import -- without cDAQ1Mod3 present that import fails and halts the whole suite.
+# Bench script, run directly: python tools/thermocouple_check.py
+# The guard keeps a plain import from opening the DAQ. It used to sit in tests/
+# as test_tc.py, where pytest imported it and, without cDAQ1Mod3 present, the
+# import failed and halted the whole suite.
 if __name__ == "__main__":
     with nidaqmx.Task() as task:
         task.ai_channels.add_ai_thrmcpl_chan(

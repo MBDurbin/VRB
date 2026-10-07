@@ -75,6 +75,10 @@ hardware_manager ──────────> control_logic ─────�
 | `gui_layout.py` | PyQt6 telemetry UI — live voltage/current plots, 12S cell voltages, 48-sensor thermal heatmap, resistor bank map laid out as built, threshold controls, CSV recording. |
 | `sil_simulator.py` | Desk-test plant model. Replaces the DAQ entirely with operator-driven sliders (load, temperature, pack OCV) plus a hardware-fault toggle. |
 
+These run the rig and stay at the top level. Lap profiles, bench tools, the
+cooling analysis and the superseded prototypes each have their own folder; the
+map is in [README.md](README.md).
+
 ### Finite state machine
 
 ```

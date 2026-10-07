@@ -28,6 +28,7 @@ from control_logic import (
     evaluate_safety,
     lap_row_interval,
     load_lap_profile,
+    CSV_FILENAME,
     NEUTRAL_PACKET,
     coulomb_step,
     compute_lap_physics,
@@ -252,9 +253,9 @@ class TestLoadLapProfile:
         assert dropped == 0
 
     def test_shipped_profile_has_no_unusable_rows_after_load(self):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "FSAE - ETS - Speed and Time 1 Lap.csv")
-        rows, dropped = load_lap_profile(path)
+        # The path the rig loads at startup, so this also proves it resolves to
+        # a real file in profiles/.
+        rows, dropped = load_lap_profile(CSV_FILENAME)
         assert dropped > 0, "shipped profile is known to carry trailing blanks"
         for row in rows:
             assert math.isfinite(float(row['Speed (mph)']))

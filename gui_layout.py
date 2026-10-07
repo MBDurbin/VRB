@@ -10,7 +10,7 @@ from rig_config import (
     RigConfig, VehicleParams, PackConfig, DaqConfig,
     VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, DAQ_FIELD_LABELS, field_label,
 )
-from control_logic import DEFAULT_LAP_CSV, VRB_MAX_POWER_W
+from control_logic import DEFAULT_LAP_CSV, PROFILES_DIR, PROJECT_DIR, VRB_MAX_POWER_W
 import theme
 from PyQt6 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
@@ -464,7 +464,7 @@ class HeatmapWindow(QtWidgets.QWidget):
 
 # ================= RESISTOR BANK MAP =================
 # The bank as built, viewed along the elements (docs/hardware_topology.md,
-# "Cooling", and the tube-bank geometry in CFM Calculator.py). The fan sits below
+# "Cooling", and the tube-bank geometry in analysis/CFM Calculator.py). The fan sits below
 # and blows UP, so air meets the flat bars first and the top row last.
 #
 #   top row     bank 1: four 1 ohm TE2000 elements side by side. The only bank in
@@ -1075,7 +1075,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Lap Telemetry CSV",
-            "",
+            PROFILES_DIR,
             "CSV Files (*.csv)"
         )
         if filepath:
@@ -1245,7 +1245,11 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.is_logging = True
             self.btn_record.setText("● Recording")
 
-            filename = f"telemetry_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            # Into logs/ in the repo, not wherever the app was launched from.
+            # git ignores the folder.
+            log_dir = os.path.join(PROJECT_DIR, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            filename = os.path.join(log_dir, f"telemetry_{time.strftime('%Y%m%d_%H%M%S')}.csv")
             self.csv_file = open(filename, 'w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
 

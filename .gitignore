@@ -6,7 +6,8 @@ __pycache__/
 # IDE
 .idea/
 
-# Generated telemetry logs
+# Generated telemetry logs: the GUI's Record button writes into logs/
+logs/
 telemetry_*.csv
 
 # Python environemnts

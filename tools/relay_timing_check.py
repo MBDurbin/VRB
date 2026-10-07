@@ -15,7 +15,7 @@ A mid-run open of the main relay breaks full load current, and the next command
 re-closes it milliseconds later. That cycle wears the contactor and kicks the
 system's inductance. A healthy run closes the relay once and opens it once.
 
-    python relay_timing_check.py
+    python tools/relay_timing_check.py
 
 Takes about 20 s; the scenarios run in parallel. Prints PASS or FAIL for each and
 exits non-zero if any fail.
@@ -37,6 +37,10 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+
+# The rig's modules live one folder up. At module level so the scenario
+# processes, which re-import this file, can find them too.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Mirrors arduino/resistor_bank_controller: TIMEOUT_LIMIT = 2000 ms, and
 # COMMAND_LENGTH = numOtherRelays + 1.
@@ -141,7 +145,7 @@ def run_scenario(sc):
     t_hang = None
     with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(log):
         # The shipped lap's speeds, re-timed to this scenario's row spacing.
-        profile = pd.read_csv(os.path.join(cl.PROJECT_DIR, cl.DEFAULT_LAP_CSV)).head(sc.rows).copy()
+        profile = pd.read_csv(cl.CSV_FILENAME).head(sc.rows).copy()
         profile["Time (s)"] = [sc.row_dt * i for i in range(len(profile))]
         csv_path = os.path.join(tmp, "profile.csv")
         profile.to_csv(csv_path, index=False)

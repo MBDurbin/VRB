@@ -90,7 +90,7 @@ pointing up.
 > **The fan has one setting: ON. It must be plugged into the wall.
 > Never run the VRB without the fan blowing.**
 
-`CFM Calculator.py` in the repo root is the analysis behind this arrangement —
+`analysis/CFM Calculator.py` is the analysis behind this arrangement —
 it models the resistors as a staggered tube bank and sizes the airflow. Its
 60 mm cylinder diameter matches the 1000–2500 W parts in the TE dimensions
 table.

@@ -100,7 +100,7 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
 
 | # | Step | Expected |
 |---|------|----------|
-| E1 | START RECORDING, run 1 lap, STOP RECORDING | `telemetry_*.csv` created with 68 columns + header |
+| E1 | START RECORDING, run 1 lap, STOP RECORDING | `logs/telemetry_*.csv` created with 68 columns + header |
 | E2 | Open the CSV | Rows are contiguous, SOC decreases monotonically, no blank/garbage rows |
 | E3 | START RECORDING then close the GUI without stopping | File closes cleanly, no truncation/corruption |
 

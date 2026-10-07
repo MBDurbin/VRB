@@ -255,7 +255,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     # --- Resistor bank thermocouples ---
     # A task of their own, so a slow or missing thermocouple module cannot stall
     # or break the voltage and current reads. Based on Bryce Marshall's bench
-    # test (tests/test_tc.py on origin/master), with two settings it left at
+    # test (tools/thermocouple_check.py), with two settings it left at
     # nidaqmx's defaults made explicit: the cold junction (default a fixed 25 C)
     # and the expected range (default 0-100 C, below what the banks reach).
     #

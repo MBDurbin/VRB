@@ -579,7 +579,7 @@ class DaqConfig:
     # Arduino. Entry i is bank i+1, so ORDER IS MEANINGFUL, as with the voltage
     # taps. Banks 5-8 carry too little current to need one (docs/hardware_topology.md).
     #
-    # Module 3 per Bryce Marshall's bench test (tests/test_tc.py on origin/master),
+    # Module 3 per Bryce Marshall's bench test (tools/thermocouple_check.py),
     # which read cDAQ1Mod3/ai0:1. Banks 3 and 4 on ai2/ai3 assume the remaining
     # inputs of the same module -- check against the wiring.
     resistor_tc_channels: List[str] = field(
@@ -822,7 +822,7 @@ class SafetyLimits:
     # Banks 1-3 (TE2000B1R0J): 225 C. TE's 155 C figure is an AMBIENT limit;
     # the element itself is conventionally limited to 275 C, where the derating
     # curve reaches zero load (datasheet p.3). 50 K under that covers the hot side
-    # of an element running up to ~38 K above its mean surface (resistor_thermal.py)
+    # of an element running up to ~38 K above its mean surface (analysis/resistor_thermal.py)
     # and a thermocouple that sits off the hottest point.
     #
     # Bank 4 (Uxcell 500 W, aluminium housed): 150 C is a PLACEHOLDER. There is no

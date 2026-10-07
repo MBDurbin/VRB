@@ -48,7 +48,7 @@ between rows, so a slow lap profile or one lost command cannot open the main
 contactor mid-run. `alive` itself never moves a relay. In FAULT the heartbeat
 stops on purpose.
 
-`python relay_timing_check.py` (repo root, no hardware, ~20 s) runs the host's
+`python tools/relay_timing_check.py` (no hardware, ~20 s) runs the host's
 real control loop and replays everything it sends through these rules. It fails
 if the main relay would open mid-run, or if the watchdog would go more than 1 s
 unfed while the bank is connected. Run it after changing the heartbeat, the lap

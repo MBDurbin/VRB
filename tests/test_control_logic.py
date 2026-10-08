@@ -25,6 +25,7 @@ from control_logic import (
     stale_resistor_banks,
     stale_temp_sensors,
     check_daq_health,
+    check_ni_daq,
     evaluate_safety,
     lap_row_interval,
     load_lap_profile,
@@ -102,7 +103,7 @@ class TestModuleUndervoltage:
              'cell_voltages': [3.60] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
              'temp_sensor_ages_s': _fresh_sensor_ages(),
              'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
-             'hardware_status': {'temp_arduino': True}}
+             'hardware_status': {'temp_arduino': True, 'ni_daq': True}}
         d.update(kw)
         return d
 
@@ -363,7 +364,7 @@ class TestResistorTemps:
              'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
              'temp_sensor_ages_s': _fresh_sensor_ages(),
              'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
-             'hardware_status': {'temp_arduino': True}}
+             'hardware_status': {'temp_arduino': True, 'ni_daq': True}}
         d.update(kw)
         return d
 
@@ -441,7 +442,7 @@ class TestEvaluateSafety:
             'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
             'temp_sensor_ages_s': _fresh_sensor_ages(),
             'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
-            'hardware_status': {'temp_arduino': True},
+            'hardware_status': {'temp_arduino': True, 'ni_daq': True},
         }
         data.update(overrides)
         return data
@@ -470,7 +471,7 @@ class TestEvaluateSafety:
 
     def test_lost_link_reported_ahead_of_per_sensor_fault(self):
         # A dropped link makes every sensor stale; the link is the real cause.
-        data = self._packet(hardware_status={'temp_arduino': False},
+        data = self._packet(hardware_status={'temp_arduino': False, 'ni_daq': True},
                             temp_sensor_ages_s=_fresh_sensor_ages(age=30.0))
         assert evaluate_safety(data, _limits()) == (True, "TEMP LINK LOST")
 
@@ -496,14 +497,14 @@ class TestEvaluateSafety:
         # Over-current with a dead temperature link: the operator needs to hear
         # about the current, not the sensor.
         data = self._packet(amps=500.0, temp_age_s=99.0,
-                            hardware_status={'temp_arduino': False})
+                            hardware_status={'temp_arduino': False, 'ni_daq': True})
         fault, reason = evaluate_safety(data, _limits())
         assert fault is True
         assert reason == "OVERCURRENT"
 
     def test_unarmed_skips_data_integrity_checks(self):
         # In IDLE a missing temperature link is not-connected-yet, not a fault.
-        data = self._packet(hardware_status={'temp_arduino': False})
+        data = self._packet(hardware_status={'temp_arduino': False, 'ni_daq': True})
         assert evaluate_safety(data, _limits(), armed=False)[0] is False
         assert evaluate_safety(data, _limits(), armed=True)[0] is True
 
@@ -513,7 +514,7 @@ class TestEvaluateSafety:
         # clear -- back to IDLE, instantly re-trips -- locking out bring-up.
         cold = self._packet(voltage=0.0, cell_voltages=[], max_temp=0.0, amps=0.0,
                             temp_age_s=float('inf'),
-                            hardware_status={'temp_arduino': False})
+                            hardware_status={'temp_arduino': False, 'ni_daq': True})
         assert evaluate_safety(cold, _limits(), armed=False)[0] is False
         # ...but arming on that same reading must not be silently permitted.
         assert evaluate_safety(cold, _limits(), armed=True)[0] is True
@@ -539,8 +540,44 @@ class TestEvaluateSafety:
     def test_missing_keys_fall_back_to_safe_defaults(self):
         # A malformed packet must not raise inside the safety loop.
         fault, reason = evaluate_safety({}, _limits())
-        assert fault is True          # 0.0 V reads as undervoltage
-        assert reason == "UNDERVOLTAGE"
+        assert fault is True          # no hardware_status reads as no NI-DAQ
+        assert reason == "NI-DAQ OFFLINE"
+
+    # The packet hardware_manager now publishes without its NI-DAQ, in place of
+    # the simulated 15 A healthy pack it used to substitute.
+    NO_DAQ = dict(amps=0.0, voltage=0.0, cell_voltages=[], power_kw=0.0,
+                  hardware_status={'temp_arduino': True, 'ni_daq': False})
+
+    def test_no_daq_faults_once_armed(self):
+        assert evaluate_safety(self._packet(**self.NO_DAQ), _limits()) \
+            == (True, "NI-DAQ OFFLINE")
+
+    def test_no_daq_reported_ahead_of_the_zero_readings_it_causes(self):
+        # 0.0 V and no cells would otherwise read as UNDERVOLTAGE, pointing the
+        # operator at the battery instead of the DAQ.
+        data = self._packet(**self.NO_DAQ)
+        assert evaluate_safety(data, _limits())[1] == "NI-DAQ OFFLINE"
+
+    def test_no_daq_does_not_fault_unarmed(self):
+        # Same bring-up rule as the other integrity checks: ARM is refused
+        # instead (see test_logic_loop.py).
+        assert evaluate_safety(self._packet(**self.NO_DAQ), _limits(), armed=False) \
+            == (False, None)
+
+    def test_missing_ni_daq_flag_fails_closed(self):
+        data = self._packet(hardware_status={'temp_arduino': True})
+        assert evaluate_safety(data, _limits()) == (True, "NI-DAQ OFFLINE")
+
+    def test_measured_danger_outranks_no_daq(self):
+        # The temperature sensors still read without the NI-DAQ.
+        data = self._packet(max_temp=99.0, **self.NO_DAQ)
+        assert evaluate_safety(data, _limits()) == (True, "OVERTEMP")
+
+    def test_check_ni_daq(self):
+        assert check_ni_daq({'ni_daq': True}) == (False, None)
+        assert check_ni_daq({'ni_daq': False}) == (True, "NI-DAQ OFFLINE")
+        assert check_ni_daq({}) == (True, "NI-DAQ OFFLINE")
+
 
 
 # ================= FSM TRANSITION GUARDS =================
@@ -978,7 +1015,7 @@ class TestBankOverpowerTrip:
              'cell_voltages': [3.83] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
              'temp_sensor_ages_s': _fresh_sensor_ages(),
              'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
-             'hardware_status': {'temp_arduino': True}}
+             'hardware_status': {'temp_arduino': True, 'ni_daq': True}}
         d.update(kw)
         return d
 

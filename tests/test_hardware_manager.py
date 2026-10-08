@@ -3,17 +3,23 @@ Unit tests for the DAQ layer's pure data handling.
 
 Covers cumulative-tap differencing and temperature line parsing, both of which
 previously assumed a fixed 12S / 6x8 layout and would raise or silently corrupt
-readings on any other pack. No NI-DAQ or serial hardware required.
+readings on any other pack, and what run_daq_process publishes when its NI-DAQ
+is missing or lost (nidaqmx faked). No NI-DAQ or serial hardware required.
 """
 import math
 import os
+import queue
 import sys
+import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import hardware_manager
 from hardware_manager import (
     derive_cell_voltages, parse_temperature_line, temperature_sensor_ages,
     apply_thermocouple_readings, reading_ages, TC_MAX_C)
+from rig_config import RigConfig
 
 
 # ================= CELL VOLTAGE DIFFERENCING =================
@@ -187,3 +193,87 @@ class TestThermocoupleReadings:
 
     def test_ages(self):
         assert reading_ages([9.0, None], now=10.0) == [1.0, float('inf')]
+
+
+# ================= NO NI-DAQ: NO SIMULATED PACK =================
+
+class _FakeChannels:
+    def add_ai_voltage_chan(self, *args, **kwargs):
+        pass
+
+    def add_ai_thrmcpl_chan(self, *args, **kwargs):
+        raise RuntimeError("no thermocouple module")
+
+
+class TestNoNiDaq:
+    """run_daq_process itself, with nidaqmx faked and no COM ports to sweep.
+
+    Without its NI-DAQ this process used to publish a healthy simulated pack --
+    15 A, every cell at nominal + 0.5 V -- that the logic process could not tell
+    from a real one.
+    """
+
+    def _collect(self, monkeypatch, task_factory, seconds=1.2):
+        monkeypatch.setattr(hardware_manager.serial.tools.list_ports, "comports", lambda: [])
+        monkeypatch.setattr(hardware_manager.nidaqmx, "Task", task_factory)
+
+        config = RigConfig.defaults()
+        packets = queue.Queue(maxsize=1000)
+        stop = threading.Event()
+        worker = threading.Thread(target=hardware_manager.run_daq_process,
+                                  args=(packets, stop, config), daemon=True)
+        worker.start()
+        time.sleep(seconds)
+        stop.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+        out = []
+        while not packets.empty():
+            out.append(packets.get_nowait())
+        return config, out
+
+    def test_missing_daq_publishes_no_data_not_a_simulated_pack(self, monkeypatch):
+        def no_daq():
+            raise RuntimeError("DaqNotFoundError")
+
+        _, packets = self._collect(monkeypatch, no_daq)
+        assert packets
+        for p in packets:
+            assert p['hardware_status']['ni_daq'] is False
+            assert p['amps'] == 0.0
+            assert p['voltage'] == 0.0
+            assert p['cell_voltages'] == []
+
+    def test_daq_lost_mid_session_keeps_publishing_as_offline(self, monkeypatch):
+        tasks = []
+
+        class FlakyTask:
+            def __init__(self):
+                self.ai_channels = _FakeChannels()
+                self.reads = 0
+                self.closed = False
+                tasks.append(self)
+
+            def read(self):
+                self.reads += 1
+                if self.reads > 3:
+                    raise RuntimeError("device removed")
+                return [0.5] + [0.35 * (i + 1) for i in range(12)]
+
+            def close(self):
+                self.closed = True
+
+        config, packets = self._collect(monkeypatch, FlakyTask)
+        online = [p for p in packets if p['hardware_status']['ni_daq']]
+        offline = [p for p in packets if not p['hardware_status']['ni_daq']]
+
+        assert len(online) == 3
+        assert online[0]['amps'] == 0.5 * config.daq.current_amps_per_volt
+        # Read failures used to end the loop. Now it carries on, offline.
+        assert len(offline) >= 3
+        assert packets.index(offline[0]) == 3
+        for p in offline:
+            assert p['amps'] == 0.0 and p['voltage'] == 0.0 and p['cell_voltages'] == []
+        assert tasks[0].closed
+

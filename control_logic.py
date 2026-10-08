@@ -182,6 +182,24 @@ def check_daq_health(daq_age_s, stale_timeout_s):
     return False, None
 
 
+def check_ni_daq(hardware_status):
+    """Whether current and voltage are being measured. Returns (is_fault, reason).
+
+    Every current and voltage reading comes from the NI-DAQ. hardware_manager
+    used to fill in a simulated healthy pack when the DAQ failed to start, so
+    the overcurrent, undervoltage and cell trips watched made-up numbers while
+    the bank loaded the real module. It now publishes zero readings with 'ni_daq'
+    False instead, and ARM is refused on them. A DAQ lost after arming faults
+    here on the next packet rather than waiting for DAQ DATA STALE.
+
+    SIL mode reports True from its plant model, where simulated data is the
+    point, and False when its hardware fault toggle is ticked.
+    """
+    if not hardware_status.get('ni_daq', False):
+        return True, "NI-DAQ OFFLINE"
+    return False, None
+
+
 def check_sensor_health(temp_age_s, temp_link_ok, stale_timeout_s):
     """Temperature data integrity. Returns (is_fault, reason).
 
@@ -307,8 +325,9 @@ def evaluate_safety(data, limits, armed=True):
         0.0 V, which is below any sane undervoltage trip. Checking it in IDLE
         latches a FAULT the operator cannot clear -- RESET returns to IDLE and it
         immediately re-trips -- locking them out of software bring-up entirely.
-      * Cell and sensor data integrity. Missing data before the DAQ has
-        connected is an ordinary not-connected-yet condition, not a fault.
+      * NI-DAQ, cell and sensor data integrity. Missing data before the DAQ
+        has connected is an ordinary not-connected-yet condition, not a fault.
+        ARM itself is refused without the NI-DAQ (see check_ni_daq).
 
     Once armed, all of them apply, and missing data is a fault rather than a
     reason to skip a check.
@@ -331,6 +350,12 @@ def evaluate_safety(data, limits, armed=True):
 
     if not armed:
         return False, None
+
+    # Ahead of the voltage checks: with the DAQ offline the module reads 0.0 V,
+    # and UNDERVOLTAGE would send the operator to the battery instead.
+    fault, reason = check_ni_daq(data.get('hardware_status', {}))
+    if fault:
+        return True, reason
 
     if data.get('voltage', 0.0) <= limits['min_volts']:
         return True, "UNDERVOLTAGE"
@@ -887,8 +912,16 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         print(f"\n[LOGIC ERROR] Failed to load new CSV: {e}")
 
                 elif cmd == "ARM" and is_valid_transition(fsm_state, "ARM"):
-                    fsm_state = "ARMED"
-                    print("[LOGIC] System ARMED.")
+                    # Refused outright rather than armed into an immediate
+                    # fault: nothing about the rig is wrong except that it
+                    # cannot see current or voltage, so stay in IDLE.
+                    no_daq, reason = check_ni_daq(data.get('hardware_status', {}))
+                    if no_daq:
+                        print(f"[LOGIC] Cannot ARM: {reason}. "
+                              "Current and voltage are not being measured.")
+                    else:
+                        fsm_state = "ARMED"
+                        print("[LOGIC] System ARMED.")
 
                 elif isinstance(cmd, tuple) and cmd[0] == "RUN" and is_valid_transition(fsm_state, "RUN"):
                     if total_rows > 0:

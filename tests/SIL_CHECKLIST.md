@@ -47,7 +47,7 @@ plant-model window and the main telemetry GUI appear.
 | B6 | RESET, then drag SIL **Pack OCV** down to 3.00 V/cell | `FAULT`, console logs `UNDERVOLTAGE ALARM!` |
 | B7 | RESET, set OCV to 3.20 V/cell, then raise current to ~150 A | `FAULT` on sag alone — pack reads 31.65 V under load despite 38.4 V at rest |
 | B8 | With all three faults possible at once (hot + high amps + low OCV) | Console reports `OVERTEMP` — priority is temp > current > bank power > voltage |
-| B9 | RESET, ARM, then tick **Simulate hardware interlock fault** | `FAULT` logging `TEMP LINK LOST` — losing thermal monitoring while armed is itself a fault |
+| B9 | RESET, ARM, then tick **Simulate hardware interlock fault** | `FAULT` logging `NI-DAQ OFFLINE` — the toggle drops the NI-DAQ and the temperature link together, and the DAQ is reported first because its 0.0 V would otherwise read as undervoltage |
 | B10 | Untick the fault, RESET, stay in `IDLE`, tick it again | **No** fault — sensor checks apply only in ARMED/RUNNING, so the rig can still be brought up |
 | B11 | RESET, ARM, then set OCV so one cell would read below **Cell min** (2.70 V) | `FAULT` logging `CELL UNDERVOLTAGE` |
 | B12 | Start the app with **no battery connected** (0.0 V), leave it in `IDLE` | **No** fault. Voltage checks apply only once armed, so software bring-up is possible without a pack |
@@ -57,6 +57,7 @@ plant-model window and the main telemetry GUI appear.
 | B16 | RESET, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~192 A | `FAULT` logging `BANK OVERPOWER` once V × I passes 8 kW, in `IDLE` as well. No Max Amp setting moves this trip |
 | B17 | RESET, ARM, drag SIL **Bank 1 resistor** past 225 °C | `FAULT` logging `RESISTOR OVERTEMP` and `Bank 1 at ... C (trip 225 C)`. Fires in `IDLE` as well |
 | B18 | Open **Resistor Map** while dragging the Bank 1 slider | Bank 1's four top-row elements recolour toward red as they near 225 °C; banks 5–8 read `NO SENSOR` |
+| B19 | RESET, tick **Simulate hardware interlock fault** in `IDLE`, press **ARM** | ARM **refused**: state stays `IDLE` (no FAULT, nothing to reset), console logs `Cannot ARM: NI-DAQ OFFLINE`. Untick, press ARM again: `ARMED` |
 
 **Not reachable from the SIL sliders** — the plant model generates uniform cells
 and always-fresh timestamps, so these need either a unit test or real hardware:

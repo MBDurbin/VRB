@@ -234,7 +234,14 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     # None means no valid reading yet.
     sensor_last_rx = [[None] * daq_cfg.sensors_per_bus for _ in range(daq_cfg.temp_bus_count)]
 
-    # --- FIX 3: NI-DAQ DESK TEST BYPASS ---
+    # --- NI-DAQ: current and cumulative cell voltages ---
+    # No simulated fallback. A DAQ that failed to start used to be replaced by a
+    # healthy pack at rest (15 A, every cell at nominal + 0.5 V), so a rig
+    # started without its DAQ drove the real bank while the overcurrent,
+    # undervoltage and cell trips watched made-up numbers. Desk testing is what
+    # the SIL dongle is for. Without the DAQ this process publishes zero current,
+    # zero volts and no cells with hardware_status['ni_daq'] False, and the logic
+    # process refuses to arm on that.
     ni_daq_active = False
     task = None
     try:
@@ -249,8 +256,9 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
         print("[DAQ] Hardware NI-DAQ initialized.")
     except Exception as e:
         print(f"\n[WARNING] NI-DAQ Hardware not found: {e}")
-        print("[WARNING] Running in DESK TEST / SIMULATION MODE.")
+        print("[WARNING] Current and voltage are NOT being measured. The rig will not arm.")
         if task: task.close()
+        task = None
 
     # --- Resistor bank thermocouples ---
     # A task of their own, so a slow or missing thermocouple module cannot stall
@@ -314,19 +322,32 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
             loop_start = time.time()
 
             # --- A. Read Voltages and Current ---
+            # Zero and empty unless the DAQ delivers: the same "no data" reading
+            # as control_logic.NEUTRAL_PACKET, never a plausible healthy pack.
+            current = 0.0
+            actual_cumulative_voltages = []
             if ni_daq_active:
-                daq_data = task.read()
-                current = daq_data[0] * daq_cfg.current_amps_per_volt
-                raw_daq_voltages = daq_data[1:]
-                actual_cumulative_voltages = [
-                    v * daq_cfg.voltage_multiplier for v in raw_daq_voltages]
-            else:
-                # SIMULATION DATA (Desk Test Mode): a healthy pack at rest, sized
-                # to the configured series count rather than a fixed 12S.
-                current = 15.0
-                sim_cell_v = pack.cell_nominal_voltage + 0.5
-                actual_cumulative_voltages = [
-                    sim_cell_v * (i + 1) for i in range(pack.series_count)]
+                try:
+                    daq_data = task.read()
+                    current = daq_data[0] * daq_cfg.current_amps_per_volt
+                    raw_daq_voltages = daq_data[1:]
+                    actual_cumulative_voltages = [
+                        v * daq_cfg.voltage_multiplier for v in raw_daq_voltages]
+                except Exception as exc:
+                    # Lost mid-session: USB pulled, chassis powered down. This
+                    # used to end the loop, so packets stopped and the logic
+                    # process only noticed once DAQ DATA STALE timed out.
+                    # Carrying on with ni_daq False faults it on the next packet
+                    # instead, and keeps the temperatures reaching the GUI. Not
+                    # retried: restart the program once the DAQ is back.
+                    print(f"\n[DAQ ERROR] NI-DAQ read failed: {exc}")
+                    print("[DAQ ERROR] Current and voltage are no longer measured.")
+                    ni_daq_active = False
+                    try:
+                        task.close()
+                    except Exception:
+                        pass
+                    task = None
 
             cell_voltages, total_pack_voltage = derive_cell_voltages(actual_cumulative_voltages)
 
@@ -405,7 +426,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
         with state_lock:
             if hardware_state['temp_ser'] and hardware_state['temp_ser'].is_open:
                 hardware_state['temp_ser'].close()
-        if ni_daq_active and task:
+        if task is not None:
             task.close()
         tc_stop.set()
         if tc_thread is not None:

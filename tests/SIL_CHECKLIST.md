@@ -75,6 +75,12 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
   stays fresh). On the bench, ARM and then pull one sensor's data lead: the rig
   should fault within ~3 s and the console should name that bus and sensor.
   Covered by `test_one_frozen_sensor_trips_despite_a_fresh_stream`.
+- `RESISTOR LINK LOST` (the resistor controller stops taking writes mid-run).
+  The SIL rig has no controller to unplug. On the bench, RUN, then pull the
+  resistor Arduino's USB: the rig should latch `FAULT` (not `DISCONNECTED`), the
+  `RESISTOR CTRL` pill should go offline, and the contactor should open within
+  2 s on the Arduino's watchdog. Covered by
+  `test_failed_write_mid_run_latches_a_fault_and_drops_the_link`.
 
 ## C. FSM transition guards
 

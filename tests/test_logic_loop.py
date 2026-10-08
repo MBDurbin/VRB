@@ -15,6 +15,7 @@ import threading
 import time
 
 import pytest
+import serial
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -44,10 +45,13 @@ def is_resistance_command(data):
 class FakeResistor:
     def __init__(self):
         self.is_open = True
+        self.fail = False       # set to make every write raise, like a pulled cable
         self.writes = []
         self._lock = threading.Lock()
 
     def write(self, data):
+        if self.fail:
+            raise serial.SerialException("WriteFile failed")
         with self._lock:
             self.writes.append(bytes(data))
 
@@ -64,8 +68,11 @@ class Rig:
 
     def __init__(self, monkeypatch):
         self.resistor = FakeResistor()
+        # Discovery finds the controller while it is open. Once the logic closes
+        # a failed handle it stays gone, as an unplugged board would.
         monkeypatch.setattr(cl, "auto_detect_resistor",
-                            lambda discovery_lock=None: self.resistor)
+                            lambda discovery_lock=None:
+                            self.resistor if self.resistor.is_open else None)
         # What the logic process loads at startup. Replace before start().
         self.config = RigConfig.defaults()
         monkeypatch.setattr(RigConfig, "load", staticmethod(lambda *a, **k: self.config))
@@ -79,7 +86,15 @@ class Rig:
         self.estop = threading.Event()   # the GUI's E-STOP signal
         self.seen = []          # every fsm_state forwarded, in order
         self.last = None        # the latest packet forwarded
+        self.crash = None       # what run_logic_process raised, if anything
         self.threads = []
+
+    def _logic(self):
+        try:
+            cl.run_logic_process(self.daq_q, self.tel_q, self.cmd_q, self.stop,
+                                 None, self.estop)
+        except Exception as exc:
+            self.crash = exc
 
     def _feed(self):
         while not self.stop.is_set():
@@ -103,10 +118,7 @@ class Rig:
         self.threads = [
             threading.Thread(target=self._feed, daemon=True),
             threading.Thread(target=self._tap, daemon=True),
-            threading.Thread(target=cl.run_logic_process,
-                             args=(self.daq_q, self.tel_q, self.cmd_q, self.stop,
-                                   None, self.estop),
-                             daemon=True),
+            threading.Thread(target=self._logic, daemon=True),
         ]
         for t in self.threads:
             t.start()
@@ -328,3 +340,90 @@ def test_loop_keeps_running_when_the_gui_drains_telemetry_mid_publish(rig):
     rig.wait_for("ARMED")
     rig.estop.set()
     rig.wait_for("FAULT")
+
+
+# ================= RESISTOR CONTROLLER LINK =================
+
+def run_to_running(rig):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put("ARM")
+    rig.wait_for("ARMED")
+    rig.cmd_q.put(("RUN", 1))
+    rig.wait_for("RUNNING")
+
+
+def test_failed_write_mid_run_latches_a_fault_and_drops_the_link(rig, capsys):
+    run_to_running(rig)
+    rig.resistor.fail = True            # cable pulled: every write raises
+    rig.wait_for("FAULT", timeout=2.0)
+
+    time.sleep(0.5)
+    # Latched, not DISCONNECTED, and the GUI is told the controller is gone.
+    assert rig.state == "FAULT"
+    assert rig.last['hardware_status']['res_arduino'] is False
+    assert not rig.resistor.is_open     # handle invalidated, discovery re-armed
+    assert rig.crash is None and rig.threads[2].is_alive()
+    assert "RESISTOR LINK LOST ALARM!" in capsys.readouterr().out
+
+
+def test_port_closed_mid_run_latches_a_fault_not_disconnected(rig, capsys):
+    # This used to drop to DISCONNECTED, and a reconnect then went straight
+    # back to IDLE with no fault on record.
+    run_to_running(rig)
+    rig.resistor.close()
+    rig.wait_for("FAULT", timeout=2.0)
+    time.sleep(0.5)
+    assert rig.state == "FAULT"
+    assert "link lost (port closed)" in capsys.readouterr().out
+
+
+def test_failed_kill_does_not_crash_the_loop(rig, capsys):
+    # The KILL writes were unguarded: a dead link raised out of the E-STOP
+    # handler and took the whole logic process down.
+    run_to_running(rig)
+    rig.resistor.fail = True
+    rig.estop.set()
+    rig.wait_for("FAULT", timeout=2.0)
+
+    count = len(rig.seen)
+    time.sleep(0.5)
+    assert rig.crash is None and rig.threads[2].is_alive()
+    assert len(rig.seen) > count                # still publishing telemetry
+    assert "Resistor controller link lost" in capsys.readouterr().out
+
+
+def test_heartbeat_failure_in_idle_disconnects_without_a_fault(rig):
+    # Nothing is loaded in IDLE, so a lost link is not-connected, not a fault.
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.resistor.fail = True
+    rig.wait_for("DISCONNECTED", timeout=2.0)
+    assert "FAULT" not in rig.seen
+
+
+def test_unexpected_error_still_kills_the_load_and_tells_the_gui(rig, monkeypatch, capsys):
+    # An error in the loop used to skip the cleanup after it: no KILL, port left
+    # open, and the GUI showing the last state it had been sent.
+    def broken(*args, **kwargs):
+        raise RuntimeError("physics blew up")
+    monkeypatch.setattr(cl, "compute_required_power", broken)
+
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put("ARM")
+    rig.wait_for("ARMED")
+    rig.cmd_q.put(("RUN", 1))
+
+    deadline = time.monotonic() + 3.0
+    while rig.crash is None:
+        assert time.monotonic() < deadline, "the loop never hit the error"
+        time.sleep(0.02)
+
+    assert isinstance(rig.crash, RuntimeError)
+    assert rig.resistor.written()[-1] == b"KILL\n"
+    assert not rig.resistor.is_open
+    rig.wait_for("FAULT", timeout=1.0)
+    out = capsys.readouterr().out
+    assert "LOGIC CRITICAL ERROR" in out
+    assert "Process cleanly shutdown" not in out

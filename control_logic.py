@@ -75,6 +75,12 @@ RESISTOR_TOLERANCE = 0.05
 # command. 0.5 s gives four chances before it fires.
 HEARTBEAT_INTERVAL_S = 0.5
 
+# A write the OS cannot take within this long fails rather than blocking the
+# safety loop: with pyserial's default of no timeout, a controller that stopped
+# reading would leave write() waiting forever. A healthy write takes
+# milliseconds; the Arduino's watchdog is 2 s.
+RESISTOR_WRITE_TIMEOUT_S = 0.25
+
 
 # Module-level default. Mutating a field here retunes every call that does not
 # pass an explicit params object.
@@ -117,6 +123,7 @@ def _sweep_for_resistor():
                 # hardware_manager's watchdog already avoids this for the temp
                 # sensor; this is the same trap.
                 ser.timeout = 0.1
+                ser.write_timeout = RESISTOR_WRITE_TIMEOUT_S
                 print(f"[LOGIC] Resistor Bank secured on {port.device}")
                 return ser
             ser.close()
@@ -125,14 +132,35 @@ def _sweep_for_resistor():
     return None
 
 
+def write_resistor(ser, payload):
+    """Write one line to the resistor controller. True if the port took it.
+
+    False, never an exception, when there is no handle, the port has gone, or
+    the write timed out. Every write the logic process makes goes through here,
+    and the loop treats False as a lost link: it closes the handle, re-arms
+    discovery, and faults a loaded rig. Failures used to be swallowed, leaving
+    the GUI showing a connected controller and RUNNING while nothing reached the
+    Arduino, and the KILL writes were not guarded at all.
+
+    True only means the OS accepted the bytes. The firmware does not answer
+    "alive", so a controller that has hung while still enumerated is not caught
+    here; its own 2 s watchdog sheds the load then.
+    """
+    if ser is None:
+        return False
+    try:
+        ser.write(payload)
+        return True
+    except (serial.SerialException, OSError):
+        return False
+
+
 def send_binary_command(ser, steps):
+    """Send a ladder setting. False if the write failed; see write_resistor()."""
     bin_str = format(steps, '08b')[::-1]
     if bin_str == "00000000":
         bin_str = "00000001"
-    try:
-        ser.write((bin_str + '\n').encode('utf-8'))
-    except serial.SerialException:
-        pass
+    return write_resistor(ser, (bin_str + '\n').encode('utf-8'))
 
 
 # ================= PURE SAFETY / PHYSICS LOGIC =================
@@ -871,16 +899,14 @@ def is_valid_transition(current_state, command):
 
 
 def kill_load(res_ser):
-    """Send KILL to the resistor controller, if connected. Never raises.
+    """Send KILL to the resistor controller. False only if the link failed.
 
-    A dead link must not take down the logic process on its way to a fault; the
-    Arduino's own 2 s watchdog sheds the load when the host goes quiet.
+    True with no controller connected: there is no link to lose, and nothing
+    the host could reach. Never raises, so a dead link cannot take down the
+    logic process on its way to a fault; the Arduino's own 2 s watchdog sheds
+    the load once the host goes quiet.
     """
-    if res_ser:
-        try:
-            res_ser.write(b"KILL\n")
-        except serial.SerialException:
-            pass
+    return res_ser is None or write_resistor(res_ser, b"KILL\n")
 
 
 def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Queue,
@@ -905,8 +931,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     resistor_slot = {'ser': None}
     slot_lock = threading.Lock()
 
+    # Set when the main loop ends, however it ends -- shutdown or an unexpected
+    # error -- so the worker never outlives it holding a port.
+    logic_done = threading.Event()
+
     def resistor_discovery_worker():
-        while not stop_event.is_set():
+        while not (stop_event.is_set() or logic_done.is_set()):
             with slot_lock:
                 have = resistor_slot['ser'] is not None
             if not have:
@@ -914,17 +944,40 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 if found is not None:
                     with slot_lock:
                         # Re-check: the main loop cannot have filled the slot,
-                        # but it may have signalled shutdown while we probed.
-                        if stop_event.is_set():
+                        # but it may have ended while we probed.
+                        if stop_event.is_set() or logic_done.is_set():
                             found.close()
                         else:
                             resistor_slot['ser'] = found
-            stop_event.wait(RESISTOR_SCAN_COOLDOWN)
+            logic_done.wait(RESISTOR_SCAN_COOLDOWN)
 
     discovery = threading.Thread(target=resistor_discovery_worker, daemon=True)
-    discovery.start()
 
     res_ser = None
+
+    def drop_resistor_link(what):
+        """The controller stopped taking writes, or its port closed under us.
+
+        Invalidate the handle: close it, and clear the slot so the discovery
+        thread looks for the controller again. If the bank could be loaded,
+        latch a fault, because commands are no longer reaching it. KILL cannot
+        go over a dead link; the Arduino's watchdog sheds the load 2 s after
+        the last message that reached it.
+        """
+        nonlocal res_ser, fsm_state
+        lost, res_ser = res_ser, None
+        with slot_lock:
+            resistor_slot['ser'] = None
+        if lost is not None:
+            try:
+                lost.close()
+            except Exception:
+                pass
+        print(f"\n[LOGIC] Resistor controller link lost ({what}).")
+        if fsm_state in ("ARMED", "RUNNING"):
+            fsm_state = "FAULT"
+            print("[LOGIC] RESISTOR LINK LOST ALARM! Commands are not reaching the "
+                  "controller; its watchdog sheds the load 2 s after the last one did.")
 
     # All limits, the pack spec and the vehicle model come from rig_config.json
     # (falling back to the P45B 12S4P defaults). Nothing here is hardcoded, so a
@@ -1002,347 +1055,370 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     last_daq_rx = time.time()
     row_interval = 1.0
 
-    while not stop_event.is_set():
-        # Never `continue` past the loop body on an empty queue. Doing so skipped
-        # GUI commands (including E-STOP), every safety check, the resistor
-        # heartbeat and telemetry forwarding, so a hung or crashed DAQ left the
-        # logic process paralysed: the operator's E-STOP sat unread in the queue
-        # and the GUI kept displaying RUNNING. The Arduino's own 2 s watchdog
-        # still shed the load, but nothing in software noticed or reported it.
-        try:
-            data = daq_queue.get(timeout=0.1)
-            last_data = data
-            last_daq_rx = time.time()
-        except Empty:
-            # Carry the last packet forward, tagged with its age so the staleness
-            # check can fault on it. Copy it: section G writes FSM fields into
-            # the packet before forwarding.
-            data = dict(last_data) if last_data is not None else NEUTRAL_PACKET()
+    # Started here rather than above, so nothing between its start and the
+    # finally below can leave it running.
+    discovery.start()
+    clean_exit = False
+    try:
+        while not stop_event.is_set():
+            # Never `continue` past the loop body on an empty queue. Doing so skipped
+            # GUI commands (including E-STOP), every safety check, the resistor
+            # heartbeat and telemetry forwarding, so a hung or crashed DAQ left the
+            # logic process paralysed: the operator's E-STOP sat unread in the queue
+            # and the GUI kept displaying RUNNING. The Arduino's own 2 s watchdog
+            # still shed the load, but nothing in software noticed or reported it.
+            try:
+                data = daq_queue.get(timeout=0.1)
+                last_data = data
+                last_daq_rx = time.time()
+            except Empty:
+                # Carry the last packet forward, tagged with its age so the staleness
+                # check can fault on it. Copy it: section G writes FSM fields into
+                # the packet before forwarding.
+                data = dict(last_data) if last_data is not None else NEUTRAL_PACKET()
 
-        data['daq_age_s'] = time.time() - last_daq_rx
+            data['daq_age_s'] = time.time() - last_daq_rx
 
-        # Pick up whatever the discovery thread has found. Never blocks: if the
-        # slot is empty the thread is still sweeping, and this loop carries on
-        # servicing commands and safety checks in the meantime.
-        if res_ser is None:
-            with slot_lock:
-                res_ser = resistor_slot['ser']
-
-        if res_ser is None or not res_ser.is_open:
-            if fsm_state != "FAULT":
-                fsm_state = "DISCONNECTED"
-            if res_ser is not None:
-                # Link died. Clearing the slot is what re-arms the discovery
-                # thread -- it only assigns when the slot is empty.
+            # Pick up whatever the discovery thread has found. Never blocks: if the
+            # slot is empty the thread is still sweeping, and this loop carries on
+            # servicing commands and safety checks in the meantime.
+            if res_ser is None:
                 with slot_lock:
-                    resistor_slot['ser'] = None
-                res_ser = None
-        else:
-            if fsm_state == "DISCONNECTED" and data['hardware_status'].get('temp_arduino', False):
+                    res_ser = resistor_slot['ser']
+
+            # A port that closed under us is a lost link, like a failed write. It
+            # used to drop a running rig to DISCONNECTED, and a reconnect then took
+            # it straight back to IDLE with no fault on record.
+            if res_ser is not None and not res_ser.is_open:
+                drop_resistor_link("port closed")
+
+            if res_ser is None:
+                if fsm_state != "FAULT":
+                    fsm_state = "DISCONNECTED"
+            elif fsm_state == "DISCONNECTED" and data['hardware_status'].get('temp_arduino', False):
                 fsm_state = "IDLE"
 
-        # --- B. Operator E-STOP, ahead of every queued command ---
-        # A latched Event rather than a queued "STOP": the bounded command queue
-        # could drop it when full (see gui_layout.request_estop). Cleared as it is
-        # taken, so each press is acted on once; a press landing between the
-        # check and the clear is the same stop.
-        if estop_event is not None and estop_event.is_set():
-            estop_event.clear()
-            fsm_state = "FAULT"
-            kill_load(res_ser)
-            print("[LOGIC] EMERGENCY STOP triggered via GUI.")
+            # --- B. Operator E-STOP, ahead of every queued command ---
+            # A latched Event rather than a queued "STOP": the bounded command queue
+            # could drop it when full (see gui_layout.request_estop). Cleared as it is
+            # taken, so each press is acted on once; a press landing between the
+            # check and the clear is the same stop.
+            if estop_event is not None and estop_event.is_set():
+                estop_event.clear()
+                fsm_state = "FAULT"
+                print("[LOGIC] EMERGENCY STOP triggered via GUI.")
+                if not kill_load(res_ser):
+                    drop_resistor_link("KILL")
 
-        # --- C. Process GUI Commands ---
-        while not gui_cmd_queue.empty():
-            try:
-                cmd = gui_cmd_queue.get_nowait()
+            # --- C. Process GUI Commands ---
+            while not gui_cmd_queue.empty():
+                try:
+                    cmd = gui_cmd_queue.get_nowait()
 
-                if isinstance(cmd, tuple) and cmd[0] == "SET_LIMITS":
-                    # Merge rather than replace, so a partial payload cannot drop
-                    # a limit and leave that check running on a missing key.
-                    limits.update(cmd[1])
-                    print(f"[LOGIC] Limits updated -> {limits['max_amps']:.0f} A | "
-                          f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V | "
-                          f"{limits['min_cell_volts']:.2f} V/cell | "
-                          f"derate={limits['derate_en']} | "
-                          f"bank power {bank_power_factor(limits) * 100:.0f}% of rating")
-                    # Staleness timeouts and resistor trips arrive here too.
-                    previous = config_problems
-                    config_problems = config_blockers(running_daq, pack, limits)
-                    if config_problems != previous:
-                        report_config_problems(config_problems)
+                    if isinstance(cmd, tuple) and cmd[0] == "SET_LIMITS":
+                        # Merge rather than replace, so a partial payload cannot drop
+                        # a limit and leave that check running on a missing key.
+                        limits.update(cmd[1])
+                        print(f"[LOGIC] Limits updated -> {limits['max_amps']:.0f} A | "
+                              f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V | "
+                              f"{limits['min_cell_volts']:.2f} V/cell | "
+                              f"derate={limits['derate_en']} | "
+                              f"bank power {bank_power_factor(limits) * 100:.0f}% of rating")
+                        # Staleness timeouts and resistor trips arrive here too.
+                        previous = config_problems
+                        config_problems = config_blockers(running_daq, pack, limits)
+                        if config_problems != previous:
+                            report_config_problems(config_problems)
 
-                elif isinstance(cmd, tuple) and cmd[0] == "SET_CONFIG":
-                    # Full config push from the GUI's Configure dialog: new car,
-                    # new cells, or both. Rejected while RUNNING so the physics
-                    # model cannot change underneath an in-progress lap.
-                    if fsm_state == "RUNNING":
-                        print("[LOGIC] Ignoring config change while RUNNING. Stop the run first.")
-                    else:
+                    elif isinstance(cmd, tuple) and cmd[0] == "SET_CONFIG":
+                        # Full config push from the GUI's Configure dialog: new car,
+                        # new cells, or both. Rejected while RUNNING so the physics
+                        # model cannot change underneath an in-progress lap.
+                        if fsm_state == "RUNNING":
+                            print("[LOGIC] Ignoring config change while RUNNING. Stop the run first.")
+                        else:
+                            try:
+                                new_config = RigConfig.from_dict(cmd[1])
+                                config = new_config
+                                pack = config.pack
+                                vehicle = config.vehicle
+
+                                limits = config.limits.to_command_dict()
+
+                                # A new pack is judged against the wiring the DAQ is
+                                # running, not the new DAQ section, which waits for a
+                                # restart. Straight after the swap, so nothing below
+                                # can leave it judging the old pack.
+                                config_problems = config_blockers(running_daq, pack, limits)
+
+                                # Capacity change invalidates the running coulomb
+                                # count, so rebaseline rather than carry a stale Ah.
+                                total_capacity_ah = pack.capacity_ah
+                                remaining_ah = total_capacity_ah
+                                last_coulomb_time = time.time()
+
+                                print(f"[LOGIC] Config updated -> {pack.cell_model} "
+                                      f"{pack.series_count}S{pack.parallel_count}P, "
+                                      f"{pack.capacity_ah:.1f} Ah, "
+                                      f"{vehicle.total_mass_kg:.0f} kg car+driver")
+                                for warning in config.limits.exceedances(pack):
+                                    print(f"[LOGIC WARNING] {warning}")
+
+                                report_config_problems(config_problems)
+                                if config.daq != running_daq:
+                                    print("[LOGIC] DAQ settings changed. They apply on restart; "
+                                          "until then ARM is judged against the wiring the DAQ "
+                                          "started with.")
+                            except Exception as exc:
+                                print(f"[LOGIC ERROR] Rejected bad config: {exc}")
+
+                    elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV":
+                        filepath = cmd[1]
                         try:
-                            new_config = RigConfig.from_dict(cmd[1])
-                            config = new_config
-                            pack = config.pack
-                            vehicle = config.vehicle
+                            lap_data, dropped = load_lap_profile(filepath)
+                            total_rows = len(lap_data)
+                            current_row_idx = 0
+                            print(f"\n[LOGIC] Successfully loaded new lap profile: {filepath}")
+                            print(f"[LOGIC] Total rows: {total_rows}"
+                                  + (f" ({dropped} unusable rows dropped)" if dropped else ""))
+                            if total_rows > 1:
+                                span = lap_row_interval(lap_data, 0)
+                                print(f"[LOGIC] Row interval from profile timestamps: {span:.3f} s")
+                        except Exception as e:
+                            print(f"\n[LOGIC ERROR] Failed to load new CSV: {e}")
 
-                            limits = config.limits.to_command_dict()
+                    elif cmd == "ARM" and is_valid_transition(fsm_state, "ARM"):
+                        # Refused outright rather than armed into an immediate
+                        # fault: nothing is wrong with the rig itself, it just
+                        # cannot watch all of it, so stay in IDLE.
+                        refusals = arm_refusals(data.get('hardware_status', {}), config_problems)
+                        for refusal in refusals:
+                            print(f"[LOGIC] Cannot ARM: {refusal}")
+                        if not refusals:
+                            fsm_state = "ARMED"
+                            print("[LOGIC] System ARMED.")
 
-                            # A new pack is judged against the wiring the DAQ is
-                            # running, not the new DAQ section, which waits for a
-                            # restart. Straight after the swap, so nothing below
-                            # can leave it judging the old pack.
-                            config_problems = config_blockers(running_daq, pack, limits)
+                    elif isinstance(cmd, tuple) and cmd[0] == "RUN" and is_valid_transition(fsm_state, "RUN"):
+                        if total_rows > 0:
+                            total_laps = cmd[1]
+                            fsm_state = "RUNNING"
+                            current_row_idx = 0
+                            current_lap = 1
+                            prev_velocity_ms = 0.0
+                            prev_time_s = 0.0
+                            row_interval = lap_row_interval(lap_data, 0)
+                            bank_steps = None
 
-                            # Capacity change invalidates the running coulomb
-                            # count, so rebaseline rather than carry a stale Ah.
-                            total_capacity_ah = pack.capacity_ah
-                            remaining_ah = total_capacity_ah
+                            # Coulomb count deliberately CARRIES OVER between runs.
+                            # Resetting to full here meant two manually-triggered
+                            # back-to-back laps both started at 100%, so the counter
+                            # forgot everything the first run drew -- overstating
+                            # remaining charge, which is the dangerous direction.
+                            # It rebaselines on a pack/config change or a restart.
                             last_coulomb_time = time.time()
 
-                            print(f"[LOGIC] Config updated -> {pack.cell_model} "
-                                  f"{pack.series_count}S{pack.parallel_count}P, "
-                                  f"{pack.capacity_ah:.1f} Ah, "
-                                  f"{vehicle.total_mass_kg:.0f} kg car+driver")
-                            for warning in config.limits.exceedances(pack):
-                                print(f"[LOGIC WARNING] {warning}")
-
-                            report_config_problems(config_problems)
-                            if config.daq != running_daq:
-                                print("[LOGIC] DAQ settings changed. They apply on restart; "
-                                      "until then ARM is judged against the wiring the DAQ "
-                                      "started with.")
-                        except Exception as exc:
-                            print(f"[LOGIC ERROR] Rejected bad config: {exc}")
-
-                elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV":
-                    filepath = cmd[1]
-                    try:
-                        lap_data, dropped = load_lap_profile(filepath)
-                        total_rows = len(lap_data)
-                        current_row_idx = 0
-                        print(f"\n[LOGIC] Successfully loaded new lap profile: {filepath}")
-                        print(f"[LOGIC] Total rows: {total_rows}"
-                              + (f" ({dropped} unusable rows dropped)" if dropped else ""))
-                        if total_rows > 1:
-                            span = lap_row_interval(lap_data, 0)
-                            print(f"[LOGIC] Row interval from profile timestamps: {span:.3f} s")
-                    except Exception as e:
-                        print(f"\n[LOGIC ERROR] Failed to load new CSV: {e}")
-
-                elif cmd == "ARM" and is_valid_transition(fsm_state, "ARM"):
-                    # Refused outright rather than armed into an immediate
-                    # fault: nothing is wrong with the rig itself, it just
-                    # cannot watch all of it, so stay in IDLE.
-                    refusals = arm_refusals(data.get('hardware_status', {}), config_problems)
-                    for refusal in refusals:
-                        print(f"[LOGIC] Cannot ARM: {refusal}")
-                    if not refusals:
-                        fsm_state = "ARMED"
-                        print("[LOGIC] System ARMED.")
-
-                elif isinstance(cmd, tuple) and cmd[0] == "RUN" and is_valid_transition(fsm_state, "RUN"):
-                    if total_rows > 0:
-                        total_laps = cmd[1]
-                        fsm_state = "RUNNING"
-                        current_row_idx = 0
-                        current_lap = 1
-                        prev_velocity_ms = 0.0
-                        prev_time_s = 0.0
-                        row_interval = lap_row_interval(lap_data, 0)
-                        bank_steps = None
-
-                        # Coulomb count deliberately CARRIES OVER between runs.
-                        # Resetting to full here meant two manually-triggered
-                        # back-to-back laps both started at 100%, so the counter
-                        # forgot everything the first run drew -- overstating
-                        # remaining charge, which is the dangerous direction.
-                        # It rebaselines on a pack/config change or a restart.
-                        last_coulomb_time = time.time()
-
-                        print(f"[LOGIC] Lap Simulation STARTED. Target: {total_laps} Laps | "
-                              f"row interval {row_interval:.3f} s | "
-                              f"starting SOC {(remaining_ah / total_capacity_ah) * 100:.1f}% "
-                              f"({remaining_ah:.2f} Ah)")
-                    else:
-                        print("[LOGIC] Cannot RUN: No lap data loaded!")
-
-                elif cmd == "STOP" and is_valid_transition(fsm_state, "STOP"):
-                    # Still accepted from the queue, for callers with no E-STOP
-                    # event (the bench tools); the GUI uses the event.
-                    fsm_state = "FAULT"
-                    kill_load(res_ser)
-                    print("[LOGIC] EMERGENCY STOP triggered via GUI.")
-
-                elif cmd == "RESET" and is_valid_transition(fsm_state, "RESET"):
-                    fsm_state = "IDLE"
-                    target_res = 0.0
-            except Empty:
-                break
-
-        # --- D. Safety Monitors ---
-        # Sensor-integrity checks only apply once the bank can actually be driven.
-        # In IDLE a missing temperature link is a not-connected-yet condition, and
-        # latching a fault for it would make the rig impossible to bring up.
-        # The per-bank power check needs the ladder setting the current reading
-        # belongs to, so only one that has been in circuit for BANK_SETTLE_S.
-        settled_steps = None
-        if (fsm_state == "RUNNING" and bank_steps is not None
-                and time.time() - bank_steps_at >= BANK_SETTLE_S):
-            settled_steps = bank_steps
-
-        is_fault, trigger_reason = evaluate_safety(
-            data, limits, armed=fsm_state in ("ARMED", "RUNNING"),
-            config_problems=config_problems, bank_steps=settled_steps)
-
-        if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
-            fsm_state = "FAULT"
-            print(f"\n[LOGIC] {trigger_reason} ALARM! Killing Load.")
-            if trigger_reason == "TEMP SENSOR FAULT":
-                dead = stale_temp_sensors(data.get('temp_sensor_ages_s', []),
-                                          limits['temp_stale_timeout'])
-                print("[LOGIC] No valid reading from: "
-                      + ", ".join(f"bus {b} sensor {s}" for b, s in dead))
-            elif trigger_reason == "RESISTOR OVERTEMP":
-                hot = hot_resistor_banks(data.get('resistor_temps', []),
-                                         limits['resistor_max_temp'])
-                print("[LOGIC] " + ", ".join(f"Bank {b} at {t:.0f} C (trip {lim:.0f} C)"
-                                             for b, t, lim in hot))
-            elif trigger_reason == "CONFIG FAULT":
-                for problem in config_problems:
-                    print(f"[LOGIC]   - {problem}")
-            elif trigger_reason == "BANK OVERPOWER":
-                volts, amps = data.get('voltage', 0.0), data.get('amps', 0.0)
-                factor = bank_power_factor(limits)
-                print(f"[LOGIC] Ladder at {volts * amps:.0f} W "
-                      f"(limit {VRB_MAX_POWER_W * factor:.0f} W)")
-                if settled_steps:
-                    for b, w, lim in overpowered_banks(volts, amps, settled_steps, factor):
-                        print(f"[LOGIC] Bank {b} at {w:.0f} W (limit {lim:.0f} W)")
-            elif trigger_reason == "RESISTOR TC FAULT":
-                dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
-                                            limits['temp_stale_timeout'])
-                print("[LOGIC] No valid thermocouple reading from: "
-                      + ", ".join(f"bank {b}" for b in dead))
-            if res_ser:
-                res_ser.write(b"KILL\n")
-
-        # --- E. Coulomb Counting Math ---
-        current_time = time.time()
-        dt = current_time - last_coulomb_time
-        last_coulomb_time = current_time
-
-        remaining_ah, true_soc = coulomb_step(data['amps'], dt, remaining_ah, total_capacity_ah)
-
-        # --- F. Finite State Machine Actions ---
-        if res_ser and res_ser.is_open:
-            if heartbeat_due(fsm_state, time.time() - last_heartbeat):
-                try:
-                    res_ser.write(b"alive\n")
-                except serial.SerialException:
-                    # Link dropped. Swallowed deliberately: the port check at
-                    # the top of the loop handles reconnection, and the
-                    # Arduino's own 2 s watchdog sheds the load meanwhile.
-                    # Narrowed from a bare except, which also caught
-                    # KeyboardInterrupt and SystemExit and would have made
-                    # this process ignore a shutdown request.
-                    pass
-                last_heartbeat = time.time()
-
-            if fsm_state == "RUNNING":
-                # Dwell on each row for the interval the profile itself declares,
-                # not a fixed second. A 10 Hz log played at 1 row/s would run ten
-                # times too slow and hold every power demand ten times too long.
-                if time.time() - last_physics_time >= row_interval:
-                    if current_row_idx < total_rows:
-                        row = lap_data[current_row_idx]
-
-                        # Standing start is the start of the RUN, not of a lap:
-                        # lap 2 onwards inherits the car's carried velocity.
-                        standing_start = (current_lap == 1 and current_row_idx == 0)
-
-                        # On a lap repeat the profile's clock restarts, so the
-                        # raw timestamp difference is large and negative. Bridge
-                        # that one frame with the profile's own sampling
-                        # interval rather than a literal, so this stays correct
-                        # whatever rate the loaded CSV was logged at.
-                        wrap_dt = None
-                        if current_row_idx == 0 and current_lap > 1:
-                            wrap_dt = lap_row_interval(lap_data, 0)
-
-                        velocity_ms, acceleration, current_time_s = compute_lap_physics(
-                            row, prev_velocity_ms, prev_time_s,
-                            standing_start, current_row_idx, lap_wrap_dt=wrap_dt
-                        )
-                        prev_velocity_ms = velocity_ms
-                        prev_time_s = current_time_s
-
-                        req_power = compute_required_power(velocity_ms, acceleration, vehicle)
-
-                        voltage = data['voltage']
-                        current_max_temp = data['max_temp']
-
-                        steps = command_steps(
-                            voltage, req_power, limits['max_amps'], current_max_temp,
-                            limits['derate_en'], limits['derate_start'], limits['max_temp'],
-                            modules_in_series=pack.modules_in_series,
-                            power_factor=bank_power_factor(limits)
-                        )
-
-                        # What the ladder is actually set to, not the continuous
-                        # request. Near the bottom of the ladder the two can
-                        # differ by a whole step.
-                        target_res = steps * RESISTOR_RESOLUTION
-
-                        send_binary_command(res_ser, steps)
-                        # The firmware ignores a repeat of its current setting,
-                        # so only a change restarts the settle time.
-                        if steps != bank_steps:
-                            bank_steps, bank_steps_at = steps, time.time()
-
-                        row_interval = lap_row_interval(lap_data, current_row_idx)
-                        current_row_idx += 1
-                        last_physics_time = time.time()
-                    else:
-                        if current_lap < total_laps:
-                            current_lap += 1
-                            current_row_idx = 0
-                            row_interval = lap_row_interval(lap_data, 0)
-                            print(f"[LOGIC] Starting Lap {current_lap} of {total_laps}")
+                            print(f"[LOGIC] Lap Simulation STARTED. Target: {total_laps} Laps | "
+                                  f"row interval {row_interval:.3f} s | "
+                                  f"starting SOC {(remaining_ah / total_capacity_ah) * 100:.1f}% "
+                                  f"({remaining_ah:.2f} Ah)")
                         else:
-                            fsm_state = "IDLE"
-                            target_res = 0.0
-                            res_ser.write(b"KILL\n")
-                            print(f"[LOGIC] All {total_laps} laps completed. System Idling.")
+                            print("[LOGIC] Cannot RUN: No lap data loaded!")
+
+                    elif cmd == "STOP" and is_valid_transition(fsm_state, "STOP"):
+                        # Still accepted from the queue, for callers with no E-STOP
+                        # event (the bench tools); the GUI uses the event.
+                        fsm_state = "FAULT"
+                        print("[LOGIC] EMERGENCY STOP triggered via GUI.")
+                        if not kill_load(res_ser):
+                            drop_resistor_link("KILL")
+
+                    elif cmd == "RESET" and is_valid_transition(fsm_state, "RESET"):
+                        fsm_state = "IDLE"
+                        target_res = 0.0
+                except Empty:
+                    break
+
+            # --- D. Safety Monitors ---
+            # Sensor-integrity checks only apply once the bank can actually be driven.
+            # In IDLE a missing temperature link is a not-connected-yet condition, and
+            # latching a fault for it would make the rig impossible to bring up.
+            # The per-bank power check needs the ladder setting the current reading
+            # belongs to, so only one that has been in circuit for BANK_SETTLE_S.
+            settled_steps = None
+            if (fsm_state == "RUNNING" and bank_steps is not None
+                    and time.time() - bank_steps_at >= BANK_SETTLE_S):
+                settled_steps = bank_steps
+
+            is_fault, trigger_reason = evaluate_safety(
+                data, limits, armed=fsm_state in ("ARMED", "RUNNING"),
+                config_problems=config_problems, bank_steps=settled_steps)
+
+            if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
+                fsm_state = "FAULT"
+                print(f"\n[LOGIC] {trigger_reason} ALARM! Killing Load.")
+                if trigger_reason == "TEMP SENSOR FAULT":
+                    dead = stale_temp_sensors(data.get('temp_sensor_ages_s', []),
+                                              limits['temp_stale_timeout'])
+                    print("[LOGIC] No valid reading from: "
+                          + ", ".join(f"bus {b} sensor {s}" for b, s in dead))
+                elif trigger_reason == "RESISTOR OVERTEMP":
+                    hot = hot_resistor_banks(data.get('resistor_temps', []),
+                                             limits['resistor_max_temp'])
+                    print("[LOGIC] " + ", ".join(f"Bank {b} at {t:.0f} C (trip {lim:.0f} C)"
+                                                 for b, t, lim in hot))
+                elif trigger_reason == "CONFIG FAULT":
+                    for problem in config_problems:
+                        print(f"[LOGIC]   - {problem}")
+                elif trigger_reason == "BANK OVERPOWER":
+                    volts, amps = data.get('voltage', 0.0), data.get('amps', 0.0)
+                    factor = bank_power_factor(limits)
+                    print(f"[LOGIC] Ladder at {volts * amps:.0f} W "
+                          f"(limit {VRB_MAX_POWER_W * factor:.0f} W)")
+                    if settled_steps:
+                        for b, w, lim in overpowered_banks(volts, amps, settled_steps, factor):
+                            print(f"[LOGIC] Bank {b} at {w:.0f} W (limit {lim:.0f} W)")
+                elif trigger_reason == "RESISTOR TC FAULT":
+                    dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
+                                                limits['temp_stale_timeout'])
+                    print("[LOGIC] No valid thermocouple reading from: "
+                          + ", ".join(f"bank {b}" for b in dead))
+                if not kill_load(res_ser):
+                    drop_resistor_link("KILL")
+
+            # --- E. Coulomb Counting Math ---
+            current_time = time.time()
+            dt = current_time - last_coulomb_time
+            last_coulomb_time = current_time
+
+            remaining_ah, true_soc = coulomb_step(data['amps'], dt, remaining_ah, total_capacity_ah)
+
+            # --- F. Finite State Machine Actions ---
+            if res_ser and res_ser.is_open:
+                if heartbeat_due(fsm_state, time.time() - last_heartbeat):
+                    # A failed heartbeat used to be swallowed, leaving the handle in
+                    # place and the rig RUNNING with nothing reaching the Arduino.
+                    if not write_resistor(res_ser, b"alive\n"):
+                        drop_resistor_link("heartbeat")
+                    last_heartbeat = time.time()
+
+                if fsm_state == "RUNNING":
+                    # Dwell on each row for the interval the profile itself declares,
+                    # not a fixed second. A 10 Hz log played at 1 row/s would run ten
+                    # times too slow and hold every power demand ten times too long.
+                    if time.time() - last_physics_time >= row_interval:
+                        if current_row_idx < total_rows:
+                            row = lap_data[current_row_idx]
+
+                            # Standing start is the start of the RUN, not of a lap:
+                            # lap 2 onwards inherits the car's carried velocity.
+                            standing_start = (current_lap == 1 and current_row_idx == 0)
+
+                            # On a lap repeat the profile's clock restarts, so the
+                            # raw timestamp difference is large and negative. Bridge
+                            # that one frame with the profile's own sampling
+                            # interval rather than a literal, so this stays correct
+                            # whatever rate the loaded CSV was logged at.
+                            wrap_dt = None
+                            if current_row_idx == 0 and current_lap > 1:
+                                wrap_dt = lap_row_interval(lap_data, 0)
+
+                            velocity_ms, acceleration, current_time_s = compute_lap_physics(
+                                row, prev_velocity_ms, prev_time_s,
+                                standing_start, current_row_idx, lap_wrap_dt=wrap_dt
+                            )
+                            prev_velocity_ms = velocity_ms
+                            prev_time_s = current_time_s
+
+                            req_power = compute_required_power(velocity_ms, acceleration, vehicle)
+
+                            voltage = data['voltage']
+                            current_max_temp = data['max_temp']
+
+                            steps = command_steps(
+                                voltage, req_power, limits['max_amps'], current_max_temp,
+                                limits['derate_en'], limits['derate_start'], limits['max_temp'],
+                                modules_in_series=pack.modules_in_series,
+                                power_factor=bank_power_factor(limits)
+                            )
+
+                            # What the ladder is actually set to, not the continuous
+                            # request. Near the bottom of the ladder the two can
+                            # differ by a whole step.
+                            target_res = steps * RESISTOR_RESOLUTION
+
+                            if send_binary_command(res_ser, steps):
+                                # The firmware ignores a repeat of its current
+                                # setting, so only a change restarts the settle time.
+                                if steps != bank_steps:
+                                    bank_steps, bank_steps_at = steps, time.time()
+                            else:
+                                drop_resistor_link("resistance command")
+
+                            row_interval = lap_row_interval(lap_data, current_row_idx)
+                            current_row_idx += 1
                             last_physics_time = time.time()
+                        else:
+                            if current_lap < total_laps:
+                                current_lap += 1
+                                current_row_idx = 0
+                                row_interval = lap_row_interval(lap_data, 0)
+                                print(f"[LOGIC] Starting Lap {current_lap} of {total_laps}")
+                            else:
+                                target_res = 0.0
+                                if kill_load(res_ser):
+                                    fsm_state = "IDLE"
+                                    print(f"[LOGIC] All {total_laps} laps completed. System Idling.")
+                                else:
+                                    # Still RUNNING here, so this latches a fault:
+                                    # the KILL that ends the run never went out.
+                                    drop_resistor_link("KILL at the end of the run")
+                                last_physics_time = time.time()
 
-        # --- G. Pipeline Forwarding ---
-        data['fsm_state'] = fsm_state
-        data['target_resistance'] = target_res
-        data['current_lap'] = current_lap
-        data['total_laps'] = total_laps
-        data['remaining_ah'] = remaining_ah
-        data['true_soc'] = true_soc
-        data['hardware_status']['res_arduino'] = (res_ser is not None)
-        data['arm_refusals'] = arm_refusals(data['hardware_status'], config_problems)
+            # --- G. Pipeline Forwarding ---
+            data['fsm_state'] = fsm_state
+            data['target_resistance'] = target_res
+            data['current_lap'] = current_lap
+            data['total_laps'] = total_laps
+            data['remaining_ah'] = remaining_ah
+            data['true_soc'] = true_soc
+            data['hardware_status']['res_arduino'] = (res_ser is not None)
+            data['arm_refusals'] = arm_refusals(data['hardware_status'], config_problems)
 
-        # Never blocks: a blocking get or put here would stall every trip, the
-        # E-STOP and the heartbeat behind the GUI's queue. See put_latest().
-        put_latest(telemetry_queue, data)
+            # Never blocks: a blocking get or put here would stall every trip, the
+            # E-STOP and the heartbeat behind the GUI's queue. See put_latest().
+            put_latest(telemetry_queue, data)
+        clean_exit = True
+    except Exception as exc:
+        # Unexpected, and fatal to this process. Tell the GUI before going, so it
+        # does not keep showing the last state it was sent -- RUNNING, say.
+        print(f"\n[LOGIC CRITICAL ERROR] {exc!r}. Killing the load and stopping the "
+              f"logic process.")
+        crashed = NEUTRAL_PACKET()
+        crashed['fsm_state'] = "FAULT"
+        crashed['hardware_status'] = {'res_arduino': False}
+        put_latest(telemetry_queue, crashed)
+        raise
+    finally:
+        # However the loop ended, the load is killed and the port released. An
+        # error used to skip all of this, leaving the bank to the watchdog.
+        logic_done.set()
 
-    # Take the handle out of the slot before closing it, so a discovery sweep
-    # that finishes during shutdown cannot hand back a port we are tearing down.
-    with slot_lock:
-        final_ser = resistor_slot['ser'] or res_ser
-        resistor_slot['ser'] = None
+        # Take the handle out of the slot before closing it, so a discovery sweep
+        # that finishes during shutdown cannot hand back a port we are tearing down.
+        with slot_lock:
+            final_ser = resistor_slot['ser'] or res_ser
+            resistor_slot['ser'] = None
 
-    if final_ser and final_ser.is_open:
-        try:
-            final_ser.write(b"KILL\n")
-        except serial.SerialException:
-            pass
-        final_ser.close()
+        if final_ser is not None:
+            kill_load(final_ser)
+            try:
+                final_ser.close()
+            except Exception:
+                pass
 
-    # The worker is a daemon and waits on stop_event, so it exits on its own;
-    # join briefly so its port handles are released before the process ends.
-    discovery.join(timeout=2.0)
-    print("[LOGIC] Process cleanly shutdown.")
+        # The worker is a daemon and waits on logic_done, so it exits on its
+        # own; join briefly so its port handles are released before the process
+        # ends.
+        discovery.join(timeout=2.0)
+        if clean_exit:
+            print("[LOGIC] Process cleanly shutdown.")

@@ -54,6 +54,9 @@ from control_logic import (
     RESISTOR_TOLERANCE,
     is_valid_transition,
     heartbeat_due,
+    write_resistor,
+    send_binary_command,
+    kill_load,
     HEARTBEAT_INTERVAL_S,
     VehicleParams,
     MAX_RESISTANCE,
@@ -1404,3 +1407,51 @@ class TestResistanceToSteps:
 
     def test_never_exceeds_an_8_bit_command(self):
         assert resistance_to_steps(1e6, min_r=1e6) == 255
+
+
+# ================= RESISTOR CONTROLLER WRITES =================
+
+class _Port:
+    """A serial handle that records writes, or raises what it is given."""
+    def __init__(self, raises=None):
+        self.raises = raises
+        self.writes = []
+
+    def write(self, data):
+        if self.raises is not None:
+            raise self.raises
+        self.writes.append(data)
+
+
+class TestResistorWrites:
+    """Every write reports failure instead of raising or swallowing it, so the
+    loop can drop the link and fault a loaded rig."""
+
+    def test_accepted_write(self):
+        port = _Port()
+        assert write_resistor(port, b"alive\n") is True
+        assert port.writes == [b"alive\n"]
+
+    def test_failures_return_false_and_never_raise(self):
+        import serial
+        for exc in (serial.SerialException("gone"), serial.SerialTimeoutException("stuck"),
+                    OSError("device removed")):
+            assert write_resistor(_Port(raises=exc), b"alive\n") is False
+
+    def test_no_handle_is_a_failed_write(self):
+        assert write_resistor(None, b"alive\n") is False
+
+    def test_command_reports_the_write(self):
+        import serial
+        port = _Port()
+        assert send_binary_command(port, 3) is True
+        assert port.writes == [b"11000000\n"]
+        assert send_binary_command(_Port(raises=serial.SerialException()), 3) is False
+
+    def test_kill_fails_only_on_a_failed_write(self):
+        import serial
+        assert kill_load(None) is True              # nothing connected, nothing lost
+        assert kill_load(_Port()) is True
+        assert kill_load(_Port(raises=serial.SerialException())) is False
+
+

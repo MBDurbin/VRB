@@ -387,6 +387,19 @@ Three independent layers. They must all be verified separately.
    kept displaying `RUNNING`. The Arduino's own 2 s watchdog still shed the load,
    but nothing in software noticed or reported it. The loop now carries the last
    packet forward tagged with its age, and `DAQ DATA STALE` faults on it.
+
+   **A failed write to the resistor controller is a lost link.** Every write
+   goes through `write_resistor()`, which returns False rather than raising. A
+   failed heartbeat, command or KILL, or a port that closes under the loop,
+   closes the handle, re-arms discovery and, if ARMED or RUNNING, latches FAULT
+   (`RESISTOR LINK LOST`). Heartbeat and command failures used to be swallowed,
+   leaving the GUI showing a connected controller and RUNNING; the KILL writes
+   were unguarded and could crash the process. Writes time out after 0.25 s
+   rather than blocking. The loop sits in `try/finally`, so however it ends the
+   load is killed and the port closed, and an unexpected error sends the GUI a
+   final FAULT packet. **Limit:** the firmware does not answer `alive`, so a
+   controller that hangs while still enumerated is not detected by the host;
+   its own 2 s watchdog is what sheds the load then.
 2. **Operator E-STOP** — GUI button, raises its own latched `estop_event`
    (`request_estop()`) rather than queueing a `STOP`, and the logic loop takes it
    ahead of every queued command. It used to go through

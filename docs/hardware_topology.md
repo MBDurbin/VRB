@@ -195,29 +195,57 @@ Banks 5–8 are not instrumented. Not recorded anywhere: which middle-row tube i
 bank 3, and where banks 4–8 sit on the flat bars. The map draws both in bank
 order (`MIDDLE_ROW_BANKS` and `FLAT_BAR_BANKS` in `gui_layout.py`).
 
-**3. The bank's 8 kW rating — now enforced in software.** The current limit
-derives from the cells alone. With the Reliance RS50 cells (70 A each) it works out
-to 275 A, about 14 kW at 50 V, so the cell limit can no longer protect the bank.
-`VRB_MAX_POWER_W = 8000` in `control_logic.py` is a code constant, deliberately
-*not* a `rig_config` field, so neither the config file nor the GUI can raise it.
-It is enforced twice:
+**3. The bank's power ratings — now enforced in software, per bank.** The
+current limit derives from the cells alone. With the Reliance RS50 cells (70 A
+each) it works out to 275 A, about 14 kW at 50 V, so the cell limit can no
+longer protect the bank. Two ratings apply, both code constants in
+`control_logic.py` rather than `rig_config` fields:
 
-- **Command floor.** The ladder is never set below V² / (0.95 × 8 kW), using the
-  measured module voltage. The 0.95 covers bank 1's ±5% elements. The floor
-  rounds up to the next 0.25 Ω step rather than to the nearest.
-- **Trip.** Measured V × I above 8 kW faults the rig as `BANK OVERPOWER` in any
-  state, like over-current.
+- **The ladder total**, `VRB_MAX_POWER_W = 8000`.
+- **Each bank's own rating**, `BANK_RATED_POWER_W`, from the bank table above.
+  The ladder is in series and a relay bypasses each bank, so a command of N
+  steps puts in circuit the banks whose bits are set in N, all carrying the same
+  current. A bank on its own carries all of it: 0.5 Ω is bank 2 alone, 5.1 kW at
+  50.4 V against its 4 kW. The 8 kW total used to allow that, and 1 Ω (bank 3,
+  2.5 kW against 2 kW) and 2 Ω (bank 4, 1.3 kW against 1 kW) likewise.
 
-The ladder has no step between 0.25 Ω and 0.5 Ω, so the cap costs more than the
-last kilowatt. Above **43.6 V** (3.63 V/cell) the 0.25 Ω step would exceed 8 kW,
-and the next step down, 0.5 Ω, cannot draw more than about **5 kW**. Peak load
-therefore tops out near 5 kW for the top of the charge range and returns to
-7–8 kW only once the module has sagged below 43.6 V. If bank 1's actual
-resistance is measured, setting `RESISTOR_TOLERANCE` to match recovers the
-margin between 43.6 V and 44.7 V.
+Both are enforced twice:
 
-Only bank 1 is rated 8 kW. The cap is a total, so it does not by itself keep the
-smaller banks inside *their* ratings; see the bank table above for each one.
+- **Command selection.** Every setting sent is checked against both, using the
+  measured module voltage with the elements at the low end of their ±5%. The
+  total is a floor (V² / (0.95 × 8 kW), rounded up to the next step), but the
+  per-bank ratings are not, because a lower resistance can split the power
+  across more banks. A setting that fails moves to the nearest one that passes,
+  the higher resistance on a tie.
+- **Trip.** Measured V × I above the total faults the rig as `BANK OVERPOWER`
+  in any state. While running, each bank's share of V × I (its fraction of the
+  ladder resistance) is checked against its own rating too, once a setting has
+  been in circuit for 0.5 s (`BANK_SETTLE_S`) so the current reading belongs to
+  it. The console names the bank.
+
+**Rated or 140%.** The sidebar's *Bank at rated power only* switch
+(`SafetyLimits.bank_rated_power_only`) holds both at 100%. Unticked, the default,
+allows 140% of both (`BANK_OVERLOAD_FACTOR`), so 11.2 kW for the ladder. 140% is
+chosen so that no setting is ever refused at a full 50.4 V module: banks 1–5
+each reach their rating alone at the same voltage (rating × resistance is 2000
+for all five), and at 50.4 V that takes 133.7% with the elements at the low end
+of their tolerance, 127% at nominal. Bank 1's elements then run at about 2.5 kW
+each. The TE ratings are continuous figures at 70 °C ambient in free air, with a
+short-term overload of 3× for 5 s; a lap holds full power for about 30 s at most,
+under 3500 CFM of forced air, and banks 1–3 trip at 225 °C against their
+elements' 275 °C. The switch chooses between the two fixed figures; nothing in
+the config can go past 140%.
+
+**Where 140% leans on margin rather than measurement:** bank 4 (two Uxcell
+500 W parts, 1.27 kW alone at 50.4 V) has a thermocouple but only a placeholder
+trip and no datasheet; bank 5 (Uxcell 500 W, 635 W alone) and bank 6 (Ohmite
+HS300, 318 W alone) have no thermocouple at all.
+
+At rated power the per-bank ratings cost load at the top of the charge: 0.5 Ω
+and 0.25 Ω only come back below **43.6 V** (3.63 V/cell), and above that the
+heaviest setting in rating is 0.75 Ω, banks 1 and 2 sharing about **3.4 kW** at
+50.4 V. At 140% nothing is refused below 51.6 V, so the whole charge range is
+unrestricted.
 
 **4. Side-of-cell temperature sensors are not fitted.** Only the top of each cell
 is instrumented. Planned.

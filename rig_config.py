@@ -871,6 +871,19 @@ class SafetyLimits:
     resistor_max_temp_c: List[float] = field(
         default_factory=lambda: list(DEFAULT_RESISTOR_MAX_TEMP_C))
 
+    # How hard the resistor bank is held to its power ratings: the 8 kW ladder
+    # total and each bank's own rating (BANK_RATED_POWER_W in control_logic.py,
+    # fixed in code). True holds both at 100%. False, the default, allows 140%
+    # of both (BANK_OVERLOAD_FACTOR): the ratings are continuous figures at a
+    # stated ambient, and the bank now has thermocouples with their own trips
+    # (resistor_max_temp_c above), so temperature rather than nameplate power is
+    # what bounds the elements. Banks 5-8 have no thermocouple; at 140% they
+    # rely on their rating margin and the fan alone.
+    #
+    # A switch between two fixed figures rather than a number, so nothing here
+    # can raise the bank past 140%. The GUI sidebar toggles it live.
+    bank_rated_power_only: bool = False
+
     def __post_init__(self):
         # rig_config.json is hand-edited, and a quoted "225" would otherwise reach
         # the safety check as a string. Failing here makes load() fall back to
@@ -1037,6 +1050,7 @@ class SafetyLimits:
             'derate_start': self.derate_start,
             # A copy, so the logic process never shares a list with this object.
             'resistor_max_temp': list(self.resistor_max_temp_c),
+            'bank_rated_only': self.bank_rated_power_only,
         }
 
 

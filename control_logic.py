@@ -35,6 +35,36 @@ RESISTOR_SCAN_COOLDOWN = 3.0
 # be edited from the GUI. The cells may support more current; the bank does not.
 VRB_MAX_POWER_W = 8000.0
 
+# Each bank's resistance and continuous rating, bank 1 first, from the bank
+# table in docs/hardware_topology.md. Hardware, like VRB_MAX_POWER_W.
+#
+# The ladder is in series and each bank's relay bypasses it, so a command of N
+# steps puts in circuit exactly the banks whose bits are set in N (bank 1 is
+# bit 0), and every one of them carries the same current. The 8 kW total does
+# not protect them: 0.5 ohm is bank 2 alone, 5.1 kW at 50.4 V against its 4 kW.
+BANK_RESISTANCE_OHM = tuple(RESISTOR_RESOLUTION * 2 ** k for k in range(8))
+BANK_RATED_POWER_W = (8000.0, 4000.0, 2000.0, 1000.0, 500.0, 300.0, 200.0, 400.0)
+
+# How far past the ratings above, and past VRB_MAX_POWER_W, the bank may run
+# unless SafetyLimits.bank_rated_power_only holds it to 100%. Fixed here, so the
+# config can choose between the two figures but not raise either.
+#
+# 140% so that no setting is ever refused at a full 50.4 V module: each of
+# banks 1-5 alone at 50.4 V needs 133.7% with its elements at the low end of
+# tolerance (127% at nominal resistance). The ratings are continuous figures at
+# 70 C ambient in free air, a lap holds full power for about 30 s at most against
+# element time constants of minutes, and the resistor thermocouple trips, not
+# this figure, are what bound a longer overload. Banks 5 and 6 have no
+# thermocouple, and bank 4's trip is a placeholder.
+BANK_OVERLOAD_FACTOR = 1.40
+
+# The per-bank overpower trip ignores a new ladder setting for this long. The
+# firmware takes ~100 ms to step the relays and the DAQ samples every 100 ms, so
+# until then a current reading belongs to the previous setting, and pairing it
+# with the new one would mis-share the power between banks. The 8 kW total trip
+# needs no setting and is never held off.
+BANK_SETTLE_S = 0.5
+
 # Bank 1's elements are +/-5% parts (TE2000B1R0J, the J). One 5% under its
 # nominal resistance draws 5% more power at the same voltage, so the resistance
 # floor assumes that worst case rather than tripping BANK OVERPOWER mid-run.
@@ -126,20 +156,59 @@ def check_thermal_and_current(max_temp, amps, max_safe_temp, max_safe_current, c
     return False, None
 
 
-def check_bank_power(voltage, amps):
+def bank_power_factor(limits):
+    """1.0 when the limits hold the bank to rated power, else BANK_OVERLOAD_FACTOR.
+
+    A missing key reads as rated power: fail safe.
+    """
+    return 1.0 if limits.get('bank_rated_only', True) else BANK_OVERLOAD_FACTOR
+
+
+def banks_in_circuit(steps):
+    """0-based indices of the banks a command of `steps` puts in circuit."""
+    return [k for k in range(len(BANK_RESISTANCE_OHM)) if (steps >> k) & 1]
+
+
+def bank_power_shares(steps, total_watts):
+    """Split `total_watts` across the banks in circuit, as (bank index, watts).
+
+    Series, so every bank carries the same current and takes the fraction of the
+    power that it is of the resistance. A tolerance shared by every element
+    cancels out of that fraction.
+    """
+    r_total = steps * RESISTOR_RESOLUTION
+    return [(k, total_watts * BANK_RESISTANCE_OHM[k] / r_total) for k in banks_in_circuit(steps)]
+
+
+def overpowered_banks(voltage, amps, steps, power_factor=1.0):
+    """(bank, watts, limit) for every bank in circuit past its rating; banks 1-based."""
+    return [(k + 1, watts, BANK_RATED_POWER_W[k] * power_factor)
+            for k, watts in bank_power_shares(steps, voltage * amps)
+            if watts > BANK_RATED_POWER_W[k] * power_factor]
+
+
+def check_bank_power(voltage, amps, steps=None, power_factor=1.0):
     """Resistor bank overload. Returns (is_fault, reason).
 
-    Checked against the fixed VRB_MAX_POWER_W, never against the configurable
-    limits: the current limit derives from the cells, and with high-rate cells
-    it sits well above anything the bank can absorb. Module voltage times
-    current is never less than what the bank itself dissipates, since wiring
-    and contact drops come out of the same total.
+    Two checks, both against fixed hardware ratings scaled by power_factor (1.0,
+    or BANK_OVERLOAD_FACTOR when not held to rated power), never against the
+    configurable current limit: that derives from the cells, and with high-rate
+    cells it sits well above anything the bank can absorb.
 
-    The resistance floor (see bank_power_floor) keeps a healthy rig under this
-    at steady state, so a trip here means something the floor could not see: a
-    bank element out of tolerance, a relay stuck closed, or a bad reading.
+      * The whole ladder against VRB_MAX_POWER_W. Module voltage times current is
+        never less than what the bank itself dissipates, since wiring and
+        contact drops come out of the same total. Needs no ladder setting, so
+        it applies in every state.
+      * Each bank against its own rating, which needs `steps`, the setting in
+        circuit. The 8 kW total let bank 2 alone run at 5.1 kW against its 4 kW.
+
+    The command selection (see command_steps) keeps a healthy rig under both at
+    steady state, so a trip here means something it could not see: an element
+    out of tolerance, a relay stuck, or a bad reading.
     """
-    if voltage * amps > VRB_MAX_POWER_W:
+    if voltage * amps > VRB_MAX_POWER_W * power_factor:
+        return True, "BANK OVERPOWER"
+    if steps and overpowered_banks(voltage, amps, steps, power_factor):
         return True, "BANK OVERPOWER"
     return False, None
 
@@ -342,7 +411,7 @@ def report_config_problems(problems):
         print("[LOGIC] The rig will not arm until the configuration errors above are fixed.")
 
 
-def evaluate_safety(data, limits, armed=True, config_problems=()):
+def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=None):
     """All safety checks against one telemetry packet. Returns (is_fault, reason).
 
     Measured dangers are reported ahead of data-integrity faults: if the pack is
@@ -370,6 +439,10 @@ def evaluate_safety(data, limits, armed=True, config_problems=()):
     `config_problems` is arm_blockers() for the running configuration. ARM is
     refused while it is non-empty, so it only faults here when a config or limits
     change lands while already armed.
+
+    `bank_steps` is the ladder setting in circuit, once it has settled (see
+    BANK_SETTLE_S), for the per-bank overpower check. None skips that check and
+    keeps the whole-ladder one.
     """
     fault, reason = check_thermal_and_current(
         data.get('max_temp', 0.0), data.get('amps', 0.0),
@@ -378,7 +451,8 @@ def evaluate_safety(data, limits, armed=True, config_problems=()):
     if fault:
         return True, reason
 
-    fault, reason = check_bank_power(data.get('voltage', 0.0), data.get('amps', 0.0))
+    fault, reason = check_bank_power(data.get('voltage', 0.0), data.get('amps', 0.0),
+                                     steps=bank_steps, power_factor=bank_power_factor(limits))
     if fault:
         return True, reason
 
@@ -540,8 +614,8 @@ def compute_required_power(velocity_ms, acceleration, params=None):
     return power_at_wheels * eta
 
 
-def bank_power_floor(voltage):
-    """Lowest resistance that keeps the bank within VRB_MAX_POWER_W.
+def bank_power_floor(voltage, power_factor=1.0):
+    """Lowest resistance that keeps the whole ladder within VRB_MAX_POWER_W.
 
     Bank power is V^2 / R. `voltage` is the measured module voltage, which is
     never below the voltage across the bank. Stepping to a lower resistance sags
@@ -552,25 +626,46 @@ def bank_power_floor(voltage):
     Sized for an element at the low end of its tolerance, so the floor rather
     than the BANK OVERPOWER trip is what holds the limit.
 
-    In practice this only ever removes the bottom step. At a full 50.4 V module
-    the 0.25 ohm step would dissipate about 10 kW, while the next step, 0.5 ohm,
-    cannot exceed about 5 kW at any charge. 0.25 ohm comes back once the module
-    is below sqrt(0.25 * 0.95 * 8000) = 43.6 V.
+    In practice this only ever removes the bottom step: at a full 50.4 V module
+    the 0.25 ohm step would dissipate about 10 kW, and it comes back once the
+    module is below sqrt(0.25 * 0.95 * 8000) = 43.6 V (51.6 V at 140%). It is a
+    floor because total power only falls as resistance rises. Each bank's own
+    rating is not like that, so command_steps() checks those per setting.
+
+    `power_factor` is 1.0, or BANK_OVERLOAD_FACTOR when not held to rated power.
     """
-    return voltage ** 2 / (VRB_MAX_POWER_W * (1.0 - RESISTOR_TOLERANCE))
+    return voltage ** 2 / (VRB_MAX_POWER_W * power_factor * (1.0 - RESISTOR_TOLERANCE))
+
+
+def steps_within_rating(steps, voltage, power_factor=1.0):
+    """Whether a ladder setting keeps the whole ladder and every bank in it in rating.
+
+    Worst case, as bank_power_floor(): the measured module voltage, with the
+    elements at the low end of their tolerance. A tolerance shared by every
+    element cancels out of each bank's share (bank_power_shares), so this bounds
+    what the per-bank trip will estimate as well as what the elements dissipate.
+    """
+    if steps <= 0:
+        return False
+    total = voltage ** 2 / (steps * RESISTOR_RESOLUTION * (1.0 - RESISTOR_TOLERANCE))
+    if not total <= VRB_MAX_POWER_W * power_factor:
+        return False
+    return all(watts <= BANK_RATED_POWER_W[k] * power_factor
+               for k, watts in bank_power_shares(steps, total))
 
 
 def resistance_floor(voltage, max_safe_current, current_max_temp, derate_enabled,
-                     derate_start_temp, max_safe_temp):
+                     derate_start_temp, max_safe_temp, power_factor=1.0):
     """Lowest resistance the bank may be set to right now.
 
     The highest of three floors, each dividing the MODULE voltage because that is
     what is across the bank:
       * the configured current limit, which comes from the cells;
-      * the bank's own power rating, which no configuration can change;
+      * the whole ladder's power rating, which configuration can only choose
+        100% or 140% of;
       * the thermal derate, when enabled and the cells are past its start.
     """
-    floor_r = max(voltage / max(max_safe_current, 1.0), bank_power_floor(voltage))
+    floor_r = max(voltage / max(max_safe_current, 1.0), bank_power_floor(voltage, power_factor))
 
     if derate_enabled and (current_max_temp > derate_start_temp):
         derate_range = max_safe_temp - derate_start_temp
@@ -590,7 +685,7 @@ def resistance_floor(voltage, max_safe_current, current_max_temp, derate_enabled
 
 def compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
                                derate_enabled, derate_start_temp, max_safe_temp,
-                               modules_in_series=1):
+                               modules_in_series=1, power_factor=1.0):
     """Resistance needed to reproduce the car's duty on ONE module.
 
     The bench loads a single module (`voltage` is the measured module voltage,
@@ -622,24 +717,45 @@ def compute_target_resistance(voltage, req_power, max_safe_current, current_max_
         req_r = min(MAX_RESISTANCE, (modules * voltage ** 2) / req_power)
 
     return max(req_r, resistance_floor(voltage, max_safe_current, current_max_temp,
-                                       derate_enabled, derate_start_temp, max_safe_temp))
+                                       derate_enabled, derate_start_temp, max_safe_temp,
+                                       power_factor))
 
 
 def command_steps(voltage, req_power, max_safe_current, current_max_temp,
-                  derate_enabled, derate_start_temp, max_safe_temp, modules_in_series=1):
+                  derate_enabled, derate_start_temp, max_safe_temp, modules_in_series=1,
+                  power_factor=1.0):
     """Ladder steps to send for one profile row.
 
     The request rounds to the nearest 0.25 ohm step, but the floor rounds UP.
     Rounding everything to nearest used to undercut the floor at the bottom of
     the ladder: a 0.29 ohm current-limit clamp became the 0.25 ohm step, which
     draws 192 A from a full module.
+
+    Then every bank the setting puts in circuit must be within its own rating
+    (steps_within_rating). That is not a floor: a bank alone carries the whole
+    current, so 0.5 ohm (bank 2 alone, 5.1 kW at 50.4 V against 4 kW) can be out
+    of rating while 0.75 ohm (banks 1 and 2 sharing 3.4 kW) is fine. A setting
+    that fails moves to the nearest one at or above the floor that passes, the
+    higher resistance on a tie.
     """
     req_r = compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
                                       derate_enabled, derate_start_temp, max_safe_temp,
-                                      modules_in_series=modules_in_series)
+                                      modules_in_series=modules_in_series,
+                                      power_factor=power_factor)
     floor_r = resistance_floor(voltage, max_safe_current, current_max_temp,
-                               derate_enabled, derate_start_temp, max_safe_temp)
-    return resistance_to_steps(req_r, min_r=floor_r)
+                               derate_enabled, derate_start_temp, max_safe_temp, power_factor)
+    steps = resistance_to_steps(req_r, min_r=floor_r)
+    if steps_within_rating(steps, voltage, power_factor):
+        return steps
+
+    max_steps = int(round(MAX_RESISTANCE / RESISTOR_RESOLUTION))
+    floor_steps = max(1, math.ceil(floor_r / RESISTOR_RESOLUTION - 1e-9))
+    allowed = [s for s in range(floor_steps, max_steps + 1)
+               if steps_within_rating(s, voltage, power_factor)]
+    if not allowed:
+        # Only an unreadable voltage gets here. Least load the ladder has.
+        return max_steps
+    return min(allowed, key=lambda s: (abs(s * RESISTOR_RESOLUTION - req_r), -s))
 
 
 def NEUTRAL_PACKET():
@@ -819,7 +935,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
           f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V module | "
           f"{limits['min_cell_volts']:.2f} V/cell | "
           f"temp stale > {limits['temp_stale_timeout']:.1f} s | "
-          f"bank {VRB_MAX_POWER_W / 1000:.1f} kW (fixed) | resistors "
+          f"bank {VRB_MAX_POWER_W * bank_power_factor(limits) / 1000:.1f} kW total and "
+          f"{bank_power_factor(limits) * 100:.0f}% of each bank's rating | resistors "
           + "/".join(f"{t:.0f}" for t in limits['resistor_max_temp']) + " C")
     for warning in config.limits.exceedances(pack):
         print(f"[LOGIC WARNING] {warning}")
@@ -851,6 +968,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     # Physics Tracking Variables
     prev_velocity_ms = 0.0
     prev_time_s = 0.0
+
+    # The ladder setting in circuit, for the per-bank overpower trip, and when it
+    # was sent. None until a run commands one; the contactor is open otherwise.
+    bank_steps = None
+    bank_steps_at = 0.0
 
     try:
         lap_data, dropped = load_lap_profile(CSV_FILENAME)
@@ -917,7 +1039,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     print(f"[LOGIC] Limits updated -> {limits['max_amps']:.0f} A | "
                           f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V | "
                           f"{limits['min_cell_volts']:.2f} V/cell | "
-                          f"derate={limits['derate_en']}")
+                          f"derate={limits['derate_en']} | "
+                          f"bank power {bank_power_factor(limits) * 100:.0f}% of rating")
                     # Staleness timeouts and resistor trips arrive here too.
                     previous = config_problems
                     config_problems = config_blockers(running_daq, pack, limits)
@@ -1001,6 +1124,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         prev_velocity_ms = 0.0
                         prev_time_s = 0.0
                         row_interval = lap_row_interval(lap_data, 0)
+                        bank_steps = None
 
                         # Coulomb count deliberately CARRIES OVER between runs.
                         # Resetting to full here meant two manually-triggered
@@ -1032,9 +1156,16 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         # Sensor-integrity checks only apply once the bank can actually be driven.
         # In IDLE a missing temperature link is a not-connected-yet condition, and
         # latching a fault for it would make the rig impossible to bring up.
+        # The per-bank power check needs the ladder setting the current reading
+        # belongs to, so only one that has been in circuit for BANK_SETTLE_S.
+        settled_steps = None
+        if (fsm_state == "RUNNING" and bank_steps is not None
+                and time.time() - bank_steps_at >= BANK_SETTLE_S):
+            settled_steps = bank_steps
+
         is_fault, trigger_reason = evaluate_safety(
             data, limits, armed=fsm_state in ("ARMED", "RUNNING"),
-            config_problems=config_problems)
+            config_problems=config_problems, bank_steps=settled_steps)
 
         if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
             fsm_state = "FAULT"
@@ -1052,6 +1183,14 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             elif trigger_reason == "CONFIG FAULT":
                 for problem in config_problems:
                     print(f"[LOGIC]   - {problem}")
+            elif trigger_reason == "BANK OVERPOWER":
+                volts, amps = data.get('voltage', 0.0), data.get('amps', 0.0)
+                factor = bank_power_factor(limits)
+                print(f"[LOGIC] Ladder at {volts * amps:.0f} W "
+                      f"(limit {VRB_MAX_POWER_W * factor:.0f} W)")
+                if settled_steps:
+                    for b, w, lim in overpowered_banks(volts, amps, settled_steps, factor):
+                        print(f"[LOGIC] Bank {b} at {w:.0f} W (limit {lim:.0f} W)")
             elif trigger_reason == "RESISTOR TC FAULT":
                 dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
                                             limits['temp_stale_timeout'])
@@ -1118,7 +1257,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         steps = command_steps(
                             voltage, req_power, limits['max_amps'], current_max_temp,
                             limits['derate_en'], limits['derate_start'], limits['max_temp'],
-                            modules_in_series=pack.modules_in_series
+                            modules_in_series=pack.modules_in_series,
+                            power_factor=bank_power_factor(limits)
                         )
 
                         # What the ladder is actually set to, not the continuous
@@ -1127,6 +1267,10 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         target_res = steps * RESISTOR_RESOLUTION
 
                         send_binary_command(res_ser, steps)
+                        # The firmware ignores a repeat of its current setting,
+                        # so only a change restarts the settle time.
+                        if steps != bank_steps:
+                            bank_steps, bank_steps_at = steps, time.time()
 
                         row_interval = lap_row_interval(lap_data, current_row_idx)
                         current_row_idx += 1

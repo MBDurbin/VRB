@@ -214,6 +214,10 @@ arm; an armed rig whose thermocouples deliver nothing still faults as
 `NO RESISTOR TEMP DATA`. A config with blockers can still be saved, so a team
 mid-rewire can save and restart.
 
+**The resistor bank is held to its power ratings per bank**, not just to its
+8 kW total, and a sidebar switch chooses between 100% and 140% of them. See
+"The bank's power ratings" in [docs/hardware_topology.md](docs/hardware_topology.md).
+
 DAQ changes only take effect on restart, because the NI task and sensor buffers
 are built once at process start. The GUI tells you this after saving rather than
 letting you believe a rewiring change is already live. ARM is judged against the

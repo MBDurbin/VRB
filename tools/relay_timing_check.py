@@ -81,10 +81,11 @@ SCENARIOS = [
 ]
 
 
-def healthy_packet():
+def healthy_packet(amps=50.0):
     """A DAQ packet that passes every safety check once armed."""
     return {
-        'amps': 50.0, 'voltage': 46.0, 'cell_voltages': [3.85] * 12, 'power_kw': 2.3,
+        'amps': amps, 'voltage': 46.0, 'cell_voltages': [3.85] * 12,
+        'power_kw': 46.0 * amps / 1000.0,
         'temperatures': [[30.0] * 8 for _ in range(6)], 'max_temp': 30.0,
         'temp_age_s': 0.05, 'temp_sensor_ages_s': [[0.05] * 8 for _ in range(6)],
         'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.05] * 4,
@@ -105,6 +106,13 @@ def run_scenario(sc):
     hung = threading.Event()
     sent_cmds = [0]
 
+    # The bank as the DAQ would see it: current follows the last setting that
+    # reached the controller, 46 V / R, and stops on KILL. A fixed 50 A stopped
+    # being a healthy reading once each bank's power was checked: through the
+    # 16 and 32 ohm banks it is 2.3 kW they could never draw, and the per-bank
+    # trip rightly faulted on it.
+    plant = {'ohms': None}
+
     def is_command(text):
         return len(text) == COMMAND_LENGTH and set(text) <= {"0", "1"}
 
@@ -119,6 +127,12 @@ def run_scenario(sc):
                 if sent_cmds[0] == sc.corrupt_cmd:
                     data = b"10\x8311x0\n"
             writes.append((time.monotonic(), bytes(data)))
+            line = data.decode(errors="replace").strip()
+            if is_command(line):
+                # Least significant bit first: character k is bank k + 1.
+                plant['ohms'] = sum(0.25 * 2 ** k for k, c in enumerate(line) if c == "1")
+            elif line == "KILL":
+                plant['ohms'] = None
 
         def close(self):
             self.is_open = False
@@ -133,7 +147,8 @@ def run_scenario(sc):
             if daq_q.full():
                 with contextlib.suppress(queue.Empty):
                     daq_q.get_nowait()
-            daq_q.put(healthy_packet())
+            ohms = plant['ohms']
+            daq_q.put(healthy_packet(46.0 / ohms if ohms else 0.0))
             time.sleep(0.1)
 
     def drain_telemetry():

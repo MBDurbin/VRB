@@ -41,6 +41,14 @@ from control_logic import (
     command_steps,
     bank_power_floor,
     check_bank_power,
+    bank_power_factor,
+    banks_in_circuit,
+    bank_power_shares,
+    overpowered_banks,
+    steps_within_rating,
+    BANK_RESISTANCE_OHM,
+    BANK_RATED_POWER_W,
+    BANK_OVERLOAD_FACTOR,
     resistance_to_steps,
     VRB_MAX_POWER_W,
     RESISTOR_TOLERANCE,
@@ -1022,20 +1030,23 @@ class TestBankPowerCap:
                 steps = command_steps(v, max_safe_current=max_amps, **self.MAX_DEMAND)
                 assert _worst_case_bank_watts(v, steps) <= VRB_MAX_POWER_W, (v, max_amps, steps)
 
-    def test_full_module_loses_the_bottom_step(self):
-        # 50.4 V across 0.25 ohm is ~10 kW, so the floor is the 0.5 ohm step.
-        assert command_steps(50.4, max_safe_current=275.0, **self.MAX_DEMAND) == 2
+    def test_full_module_loses_the_bottom_two_steps(self):
+        # 50.4 V across 0.25 ohm is ~10 kW, past the 8 kW total. 0.5 ohm is bank 2
+        # alone at ~5.3 kW worst case, past its own 4 kW, so 0.75 ohm (banks 1
+        # and 2 sharing ~3.6 kW) is the heaviest load in rating.
+        assert command_steps(50.4, max_safe_current=275.0, **self.MAX_DEMAND) == 3
 
     def test_bottom_step_returns_once_the_module_sags(self):
         # sqrt(0.25 * 0.95 * 8000) = 43.6 V. Below that 0.25 ohm is within rating.
+        # Just above it, 0.5 ohm puts bank 2 at 4.02 kW, so 0.75 ohm again.
         assert command_steps(43.5, max_safe_current=275.0, **self.MAX_DEMAND) == 1
-        assert command_steps(43.7, max_safe_current=275.0, **self.MAX_DEMAND) == 2
+        assert command_steps(43.7, max_safe_current=275.0, **self.MAX_DEMAND) == 3
 
     def test_cap_ignores_the_configured_current_limit(self):
         # Raising max_amps from the GUI must not move the cap.
         low = command_steps(50.4, max_safe_current=200.0, **self.MAX_DEMAND)
         absurd = command_steps(50.4, max_safe_current=1e9, **self.MAX_DEMAND)
-        assert low == absurd == 2
+        assert low == absurd == 3
 
     def test_floor_is_rounded_up_not_to_nearest(self):
         # A 175 A limit at 50.4 V floors at 0.288 ohm. Rounding to nearest used to
@@ -1088,10 +1099,116 @@ class TestBankOverpowerTrip:
         data = self._packet(amps=300.0)
         assert evaluate_safety(data, _limits(max_amps=275.0)) == (True, "OVERCURRENT")
 
-    def test_cannot_be_raised_through_the_limits_dict(self):
-        # SET_LIMITS replaces these keys wholesale; none of them is the bank cap.
+    def test_limits_dict_can_choose_140_percent_and_no_more(self):
+        # SET_LIMITS replaces keys wholesale. The only bank key is a switch
+        # between the rated figure and BANK_OVERLOAD_FACTOR of it.
         assert not any('power' in key or 'kw' in key for key in _limits())
-        assert check_bank_power(46.0, 180.0) == (True, "BANK OVERPOWER")
+        relaxed = _limits(max_amps=275.0, bank_rated_only=False)
+        rated = _limits(max_amps=275.0, bank_rated_only=True)
+        assert evaluate_safety(self._packet(amps=8500.0 / 46.0), relaxed) == (False, None)
+        assert evaluate_safety(self._packet(amps=8500.0 / 46.0), rated) \
+            == (True, "BANK OVERPOWER")
+        assert evaluate_safety(self._packet(amps=11300.0 / 46.0), relaxed) \
+            == (True, "BANK OVERPOWER")
+
+    def test_missing_switch_reads_as_rated_power(self):
+        assert bank_power_factor({}) == 1.0
+        assert bank_power_factor({'bank_rated_only': True}) == 1.0
+        assert bank_power_factor({'bank_rated_only': False}) == BANK_OVERLOAD_FACTOR == 1.40
+
+
+# ================= PER-BANK POWER =================
+
+class TestPerBankPower:
+    """Each bank against its own rating, not just the ladder against 8 kW.
+
+    The ladder is series and a command of N steps puts in circuit the banks
+    whose bits are set in N, so a bank on its own carries the whole current.
+    """
+
+    MAX_DEMAND = TestBankPowerCap.MAX_DEMAND
+
+    def test_banks_in_circuit_follow_the_bits(self):
+        assert banks_in_circuit(1) == [0]
+        assert banks_in_circuit(2) == [1]
+        assert banks_in_circuit(3) == [0, 1]
+        assert banks_in_circuit(255) == list(range(8))
+
+    def test_ratings_match_the_hardware_table(self):
+        assert BANK_RESISTANCE_OHM == (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+        assert BANK_RATED_POWER_W == (8000.0, 4000.0, 2000.0, 1000.0, 500.0, 300.0,
+                                      200.0, 400.0)
+
+    def test_power_shares_follow_resistance(self):
+        # 0.75 ohm: bank 1 takes a third, bank 2 two thirds.
+        shares = dict(bank_power_shares(3, 3000.0))
+        assert math.isclose(shares[0], 1000.0) and math.isclose(shares[1], 2000.0)
+
+    def test_settings_the_8_kw_cap_used_to_allow_are_refused_at_rated_power(self):
+        # From the review: bank 2 alone at 5.1 kW, bank 3 at 2.5 kW, bank 4 at
+        # 1.3 kW, each past its rating at a full module. Under the 8 kW total all
+        # three passed.
+        for steps in (2, 4, 8):
+            assert _worst_case_bank_watts(50.4, steps) < VRB_MAX_POWER_W
+            assert not steps_within_rating(steps, 50.4, 1.0)
+
+    def test_140_percent_refuses_nothing_at_a_full_module(self):
+        # Chosen for exactly this: a full module needs 133.7%.
+        assert all(steps_within_rating(s, 50.4, BANK_OVERLOAD_FACTOR) for s in range(1, 256))
+        assert not all(steps_within_rating(s, 50.4, 1.33) for s in range(1, 256))
+
+    def test_trip_sees_a_bank_over_its_rating_under_the_total(self):
+        # Bank 2 alone at 50.4 V draws 100.8 A: 5.1 kW, far under 8 kW.
+        assert check_bank_power(50.4, 100.8) == (False, None)
+        assert check_bank_power(50.4, 100.8, steps=2) == (True, "BANK OVERPOWER")
+        # At 140% that is in rating; 120 A (6.0 kW, an element far out of
+        # tolerance or a bad reading) is not.
+        assert check_bank_power(50.4, 100.8, steps=2, power_factor=BANK_OVERLOAD_FACTOR) \
+            == (False, None)
+        assert check_bank_power(50.4, 120.0, steps=2, power_factor=BANK_OVERLOAD_FACTOR) \
+            == (True, "BANK OVERPOWER")
+        over = overpowered_banks(50.4, 100.8, 2)
+        assert [(b, round(w), lim) for b, w, lim in over] == [(2, 5080, 4000.0)]
+
+    def test_shared_setting_is_judged_bank_by_bank(self):
+        # 0.75 ohm at 50.4 V: 3.4 kW split 1:2, both banks well in rating.
+        assert check_bank_power(50.4, 67.2, steps=3) == (False, None)
+
+    def test_evaluate_safety_applies_it_when_given_the_setting(self):
+        data = {'voltage': 50.4, 'amps': 100.8, 'max_temp': 30.0}
+        assert evaluate_safety(data, _limits(), armed=False) == (False, None)
+        assert evaluate_safety(data, _limits(), armed=False, bank_steps=2) \
+            == (True, "BANK OVERPOWER")
+
+    def test_nearest_setting_in_rating_wins_and_ties_go_up(self):
+        # 1 ohm is bank 3 alone, over its rating at 50.4 V. 0.75 and 1.25 ohm are
+        # equally near and both in rating; the higher resistance is less load.
+        def steps_for(ohms):
+            return command_steps(50.4, 50.4 ** 2 / ohms, 1000.0, 25.0, False, 55.0, 60.0)
+        assert steps_for(1.0) == 5
+        assert steps_for(0.5) == 3
+
+    def test_140_percent_gives_back_load_the_rating_takes(self):
+        # At 45 V: 0.25 ohm is ~8.5 kW worst case, inside 11.2 kW but not 8 kW.
+        assert command_steps(45.0, max_safe_current=275.0, power_factor=1.0,
+                             **self.MAX_DEMAND) == 3
+        assert command_steps(45.0, max_safe_current=275.0,
+                             power_factor=BANK_OVERLOAD_FACTOR, **self.MAX_DEMAND) == 1
+
+    def test_no_commanded_setting_puts_any_bank_past_its_rating(self):
+        # Every request the ladder can express, across the charge range, with
+        # both power settings. And the trip, fed the worst-case current that
+        # setting can draw, stays quiet: the selection keeps clear of it.
+        for v in (30.0, 36.0, 40.0, 43.0, 44.0, 45.0, 46.0, 48.0, 50.4):
+            for factor in (1.0, BANK_OVERLOAD_FACTOR):
+                for target_steps in list(range(1, 256)) + [None]:
+                    req = 1e12 if target_steps is None else \
+                        v ** 2 / (target_steps * RESISTOR_RESOLUTION)
+                    steps = command_steps(v, req, 275.0, 25.0, False, 55.0, 60.0,
+                                          power_factor=factor)
+                    assert steps_within_rating(steps, v, factor), (v, factor, target_steps)
+                    worst_amps = v / (steps * RESISTOR_RESOLUTION * (1 - RESISTOR_TOLERANCE))
+                    assert check_bank_power(v, worst_amps, steps, factor) == (False, None)
 
 
 # ================= REQUIRED POWER =================

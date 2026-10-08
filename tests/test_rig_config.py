@@ -180,7 +180,7 @@ class TestLimitDerivation:
         assert keys == {'max_amps', 'amp_buffer', 'max_temp', 'min_volts',
                         'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout',
                         'daq_stale_timeout', 'derate_en', 'derate_start',
-                        'resistor_max_temp'}
+                        'resistor_max_temp', 'bank_rated_only'}
 
     def test_per_cell_trip_derives_above_cell_cutoff(self):
         pack = PackConfig()
@@ -656,5 +656,21 @@ class TestArmBlockers:
         problems = cfg.validate()
         assert problems == cfg.arm_blockers() + cfg.advisories()
         assert "voltage channels" in problems[0]
+
+
+class TestBankRatingToggle:
+    def test_defaults_to_110_percent(self):
+        limits = SafetyLimits()
+        assert limits.bank_rated_power_only is False
+        assert limits.to_command_dict()['bank_rated_only'] is False
+
+    def test_survives_round_trip_and_pack_derivation(self, tmp_path):
+        cfg = RigConfig.defaults()
+        cfg.limits.bank_rated_power_only = True
+        loaded = RigConfig.load(cfg.save(str(tmp_path / "rig_config.json")))
+        assert loaded.limits.bank_rated_power_only is True
+
+    def test_config_written_before_it_existed_gets_the_default(self):
+        assert RigConfig.from_dict({'limits': {}}).limits.bank_rated_power_only is False
 
 

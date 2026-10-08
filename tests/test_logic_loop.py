@@ -22,10 +22,10 @@ import control_logic as cl
 from rig_config import RigConfig
 
 
-def daq_packet(ni_daq):
+def daq_packet(ni_daq, amps=50.0):
     """A healthy rig with the DAQ up, or what hardware_manager sends without it."""
     packet = {
-        'amps': 50.0, 'voltage': 46.0, 'cell_voltages': [3.85] * 12, 'power_kw': 2.3,
+        'amps': amps, 'voltage': 46.0, 'cell_voltages': [3.85] * 12, 'power_kw': 2.3,
         'temperatures': [[30.0] * 8 for _ in range(6)], 'max_temp': 30.0,
         'temp_age_s': 0.05, 'temp_sensor_ages_s': [[0.05] * 8 for _ in range(6)],
         'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.05] * 4,
@@ -71,6 +71,7 @@ class Rig:
         monkeypatch.setattr(RigConfig, "load", staticmethod(lambda *a, **k: self.config))
 
         self.ni_daq = True
+        self.amps = 50.0
         self.daq_q = queue.Queue(maxsize=5)
         self.tel_q = queue.Queue(maxsize=50)
         self.cmd_q = queue.Queue(maxsize=10)
@@ -86,7 +87,7 @@ class Rig:
                     self.daq_q.get_nowait()
                 except queue.Empty:
                     pass
-            self.daq_q.put(daq_packet(self.ni_daq))
+            self.daq_q.put(daq_packet(self.ni_daq, self.amps))
             time.sleep(0.05)
 
     def _tap(self):
@@ -237,3 +238,49 @@ def test_config_change_while_armed_faults_and_kills_the_load(rig, capsys):
     out = capsys.readouterr().out
     assert "CONFIG FAULT ALARM! Killing Load." in out
     assert "12 voltage channels configured but the pack is 14S" in out
+
+
+def test_bank_over_its_own_rating_trips_once_the_setting_settles(rig, monkeypatch, capsys):
+    # Force 0.5 ohm, bank 2 alone, and feed a current that puts it at 5.8 kW:
+    # past its 5.6 kW (140%) though nowhere near the 11.2 kW ladder total.
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 2)
+    rig.amps = 5800.0 / 46.0
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put("ARM")
+    rig.wait_for("ARMED")
+    rig.cmd_q.put(("RUN", 1))
+    rig.wait_for("RUNNING")
+
+    deadline = time.monotonic() + 3.0
+    while not any(is_resistance_command(w) for w in rig.resistor.written()):
+        assert time.monotonic() < deadline, "the run never commanded the bank"
+        time.sleep(0.01)
+    commanded_at = time.monotonic()
+
+    rig.wait_for("FAULT")
+    # Held off until the relays and the DAQ have caught up with the setting.
+    assert time.monotonic() - commanded_at >= cl.BANK_SETTLE_S - 0.1
+    out = capsys.readouterr().out
+    assert "BANK OVERPOWER ALARM! Killing Load." in out
+    assert "Bank 2 at 5800 W (limit 5600 W)" in out
+
+
+def test_sidebar_switch_to_rated_power_reaches_the_trip(rig, monkeypatch, capsys):
+    # 4.2 kW in bank 2: inside 140% of its 4 kW, outside 100%.
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 2)
+    rig.amps = 4200.0 / 46.0
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put("ARM")
+    rig.wait_for("ARMED")
+    rig.cmd_q.put(("RUN", 1))
+    rig.wait_for("RUNNING")
+    time.sleep(cl.BANK_SETTLE_S + 0.5)
+    assert rig.state == "RUNNING"
+
+    rated = RigConfig.defaults().limits
+    rated.bank_rated_power_only = True
+    rig.cmd_q.put(("SET_LIMITS", rated.to_command_dict()))
+    rig.wait_for("FAULT")
+    assert "Bank 2 at 4200 W (limit 4000 W)" in capsys.readouterr().out

@@ -10,7 +10,8 @@ from rig_config import (
     RigConfig, VehicleParams, PackConfig, DaqConfig,
     VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, DAQ_FIELD_LABELS, field_label,
 )
-from control_logic import DEFAULT_LAP_CSV, PROFILES_DIR, PROJECT_DIR, VRB_MAX_POWER_W
+from control_logic import (DEFAULT_LAP_CSV, PROFILES_DIR, PROJECT_DIR, VRB_MAX_POWER_W,
+                           BANK_OVERLOAD_FACTOR)
 import theme
 from PyQt6 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
@@ -349,8 +350,10 @@ class ConfigDialog(QtWidgets.QDialog):
             f"(+{candidate.limits.amp_buffer:.0f} buffer)  |  "
             f"{candidate.limits.max_temp:.0f} C  |  "
             f"{candidate.limits.min_volts:.1f} V\n"
-            f"BANK LIMIT        {VRB_MAX_POWER_W / 1000:.1f} kW, fixed in control_logic.py and "
-            f"applied whatever the current limit above\n"
+            f"BANK LIMIT        {VRB_MAX_POWER_W / 1000:.1f} kW total and each bank's own rating, "
+            f"fixed in control_logic.py and applied whatever the current limit above "
+            f"({'100%' if candidate.limits.bank_rated_power_only else f'{BANK_OVERLOAD_FACTOR * 100:.0f}%'}"
+            f"; see the sidebar)\n"
             f"RESISTOR TRIPS    "
             + "  |  ".join(f"B{i + 1} {t:.0f} C"
                            for i, t in enumerate(candidate.limits.resistor_max_temp_c))
@@ -1042,6 +1045,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.sb_t_derate = self.create_sidebar_spinbox(self.lim_t_derate, 0.0, 200.0)
         self.sb_t_crit = self.create_sidebar_spinbox(self.lim_t_crit, 0.0, 200.0)
 
+        self.chk_bank_rated = QtWidgets.QCheckBox("Bank at rated power only")
+        self.chk_bank_rated.setChecked(self.config.limits.bank_rated_power_only)
+        self.chk_bank_rated.setToolTip(
+            f"Ticked: the ladder is held to {VRB_MAX_POWER_W / 1000:.0f} kW and every bank "
+            f"to its own rating.\nUnticked: {BANK_OVERLOAD_FACTOR * 100:.0f}% of both, "
+            f"leaning on the resistor thermocouple trips.")
+
         form_layout.addRow(self._field_label("V warn", "display only"), self.sb_v_warn)
         form_layout.addRow(self._field_label("V crit", "module trip"), self.sb_v_crit)
         form_layout.addRow(self._field_label("Cell min", "per-cell trip"), self.sb_cell_min)
@@ -1052,6 +1062,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         limits_inner.addLayout(form_layout)
         limits_inner.addWidget(self.chk_derate)
+        limits_inner.addWidget(self.chk_bank_rated)
         cell_layout.addWidget(limits_card)
 
         self.sb_v_warn.valueChanged.connect(self.handle_limit_change)
@@ -1062,6 +1073,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.sb_t_crit.valueChanged.connect(self.handle_limit_change)
         self.sb_t_derate.valueChanged.connect(self.handle_limit_change)
         self.chk_derate.stateChanged.connect(self.handle_limit_change)
+        self.chk_bank_rated.stateChanged.connect(self.handle_bank_rating_change)
 
         cell_layout.addStretch()
         mid_layout.addWidget(sidebar)
@@ -1208,6 +1220,10 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.chk_derate.setChecked(limits.derate_enabled)
         self.chk_derate.blockSignals(False)
 
+        self.chk_bank_rated.blockSignals(True)
+        self.chk_bank_rated.setChecked(limits.bank_rated_power_only)
+        self.chk_bank_rated.blockSignals(False)
+
         self.lim_v_warn = limits.warn_volts
         self.lim_v_crit = limits.min_volts
         self.lim_cell_min = limits.min_cell_volts
@@ -1250,6 +1266,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         limits.derate_enabled = self.derate_enabled
 
         self.send_command(("SET_LIMITS", limits.to_command_dict()))
+
+    def handle_bank_rating_change(self):
+        # Its own handler rather than handle_limit_change: the bank's ratings are
+        # not derived from the pack, so this is no override of the derived cell
+        # limits and must not switch derive_from_pack off.
+        self.config.limits.bank_rated_power_only = self.chk_bank_rated.isChecked()
+        self.send_command(("SET_LIMITS", self.config.limits.to_command_dict()))
 
     def toggle_heatmap(self):
         if self.heatmap_window is None:

@@ -11,6 +11,7 @@ from queue import Empty
 # VehicleParams lives in rig_config so every user-tunable value sits in one
 # place. Re-exported here because callers and tests import it from this module.
 from rig_config import RigConfig, VehicleParams, PackConfig, SafetyLimits  # noqa: F401
+from rig_config import arm_blockers
 
 # ================= CONFIGURATION =================
 RESISTOR_BAUD_RATE = 9600
@@ -307,7 +308,41 @@ def check_resistor_tc_health(tc_ages, stale_timeout_s):
     return False, None
 
 
-def evaluate_safety(data, limits, armed=True):
+def arm_refusals(hardware_status, config_problems):
+    """Why ARM would be refused right now, one line each. Empty means it would arm.
+
+    `config_problems` is arm_blockers() for the running wiring and the live pack
+    and limits. Forwarded to the GUI as well, so the operator sees why ARM does
+    nothing without reading the console.
+    """
+    reasons = []
+    no_daq, reason = check_ni_daq(hardware_status)
+    if no_daq:
+        reasons.append(f"{reason}: current and voltage are not being measured.")
+    return reasons + list(config_problems)
+
+
+def config_blockers(daq_cfg, pack, limits):
+    """rig_config.arm_blockers(), failing closed.
+
+    The config is hand-edited JSON. A value of the wrong type (a quoted number,
+    say) would raise inside the checks, and a configuration that cannot be
+    checked must block ARM rather than take down the logic process.
+    """
+    try:
+        return arm_blockers(daq_cfg, pack, limits)
+    except Exception as exc:
+        return [f"The configuration could not be checked ({exc!r}). Fix rig_config.json."]
+
+
+def report_config_problems(problems):
+    for problem in problems:
+        print(f"[LOGIC CONFIG ERROR] {problem}")
+    if problems:
+        print("[LOGIC] The rig will not arm until the configuration errors above are fixed.")
+
+
+def evaluate_safety(data, limits, armed=True, config_problems=()):
     """All safety checks against one telemetry packet. Returns (is_fault, reason).
 
     Measured dangers are reported ahead of data-integrity faults: if the pack is
@@ -331,6 +366,10 @@ def evaluate_safety(data, limits, armed=True):
 
     Once armed, all of them apply, and missing data is a fault rather than a
     reason to skip a check.
+
+    `config_problems` is arm_blockers() for the running configuration. ARM is
+    refused while it is non-empty, so it only faults here when a config or limits
+    change lands while already armed.
     """
     fault, reason = check_thermal_and_current(
         data.get('max_temp', 0.0), data.get('amps', 0.0),
@@ -356,6 +395,11 @@ def evaluate_safety(data, limits, armed=True):
     fault, reason = check_ni_daq(data.get('hardware_status', {}))
     if fault:
         return True, reason
+
+    # Also ahead of the readings: a miswired channel list skews the module
+    # voltage and the cells, and the cause is the useful thing to report.
+    if config_problems:
+        return True, "CONFIG FAULT"
 
     if data.get('voltage', 0.0) <= limits['min_volts']:
         return True, "UNDERVOLTAGE"
@@ -780,6 +824,15 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     for warning in config.limits.exceedances(pack):
         print(f"[LOGIC WARNING] {warning}")
 
+    # The DAQ process loaded this same file at startup and keeps that wiring
+    # until it restarts (see DaqConfig), so this copy -- not whatever a later
+    # SET_CONFIG brings -- is what the cells and banks are actually read through.
+    # Fixing a channel list in the GUI therefore does not unblock ARM until the
+    # DAQ is really reading the fixed list.
+    running_daq = config.daq
+    config_problems = config_blockers(running_daq, pack, limits)
+    report_config_problems(config_problems)
+
     last_heartbeat = time.time()
     last_physics_time = time.time()
 
@@ -865,6 +918,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                           f"{limits['max_temp']:.0f} C | {limits['min_volts']:.1f} V | "
                           f"{limits['min_cell_volts']:.2f} V/cell | "
                           f"derate={limits['derate_en']}")
+                    # Staleness timeouts and resistor trips arrive here too.
+                    previous = config_problems
+                    config_problems = config_blockers(running_daq, pack, limits)
+                    if config_problems != previous:
+                        report_config_problems(config_problems)
 
                 elif isinstance(cmd, tuple) and cmd[0] == "SET_CONFIG":
                     # Full config push from the GUI's Configure dialog: new car,
@@ -881,6 +939,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
                             limits = config.limits.to_command_dict()
 
+                            # A new pack is judged against the wiring the DAQ is
+                            # running, not the new DAQ section, which waits for a
+                            # restart. Straight after the swap, so nothing below
+                            # can leave it judging the old pack.
+                            config_problems = config_blockers(running_daq, pack, limits)
+
                             # Capacity change invalidates the running coulomb
                             # count, so rebaseline rather than carry a stale Ah.
                             total_capacity_ah = pack.capacity_ah
@@ -893,6 +957,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                   f"{vehicle.total_mass_kg:.0f} kg car+driver")
                             for warning in config.limits.exceedances(pack):
                                 print(f"[LOGIC WARNING] {warning}")
+
+                            report_config_problems(config_problems)
+                            if config.daq != running_daq:
+                                print("[LOGIC] DAQ settings changed. They apply on restart; "
+                                      "until then ARM is judged against the wiring the DAQ "
+                                      "started with.")
                         except Exception as exc:
                             print(f"[LOGIC ERROR] Rejected bad config: {exc}")
 
@@ -913,13 +983,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
                 elif cmd == "ARM" and is_valid_transition(fsm_state, "ARM"):
                     # Refused outright rather than armed into an immediate
-                    # fault: nothing about the rig is wrong except that it
-                    # cannot see current or voltage, so stay in IDLE.
-                    no_daq, reason = check_ni_daq(data.get('hardware_status', {}))
-                    if no_daq:
-                        print(f"[LOGIC] Cannot ARM: {reason}. "
-                              "Current and voltage are not being measured.")
-                    else:
+                    # fault: nothing is wrong with the rig itself, it just
+                    # cannot watch all of it, so stay in IDLE.
+                    refusals = arm_refusals(data.get('hardware_status', {}), config_problems)
+                    for refusal in refusals:
+                        print(f"[LOGIC] Cannot ARM: {refusal}")
+                    if not refusals:
                         fsm_state = "ARMED"
                         print("[LOGIC] System ARMED.")
 
@@ -964,7 +1033,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         # In IDLE a missing temperature link is a not-connected-yet condition, and
         # latching a fault for it would make the rig impossible to bring up.
         is_fault, trigger_reason = evaluate_safety(
-            data, limits, armed=fsm_state in ("ARMED", "RUNNING"))
+            data, limits, armed=fsm_state in ("ARMED", "RUNNING"),
+            config_problems=config_problems)
 
         if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
             fsm_state = "FAULT"
@@ -979,6 +1049,9 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                          limits['resistor_max_temp'])
                 print("[LOGIC] " + ", ".join(f"Bank {b} at {t:.0f} C (trip {lim:.0f} C)"
                                              for b, t, lim in hot))
+            elif trigger_reason == "CONFIG FAULT":
+                for problem in config_problems:
+                    print(f"[LOGIC]   - {problem}")
             elif trigger_reason == "RESISTOR TC FAULT":
                 dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
                                             limits['temp_stale_timeout'])
@@ -1079,6 +1152,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         data['remaining_ah'] = remaining_ah
         data['true_soc'] = true_soc
         data['hardware_status']['res_arduino'] = (res_ser is not None)
+        data['arm_refusals'] = arm_refusals(data['hardware_status'], config_problems)
 
         if telemetry_queue.full():
             telemetry_queue.get()

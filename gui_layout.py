@@ -97,6 +97,33 @@ def send_command_nonblocking(cmd_queue, cmd):
         return False
 
 
+# ================= CONFIGURATION PROBLEMS =================
+
+def config_problem_text(config):
+    """A config's problems for display, ARM blockers first. Empty if none.
+
+    The two groups are labelled apart because they behave differently: the rig
+    refuses to arm on the first, and runs with the second.
+    """
+    sections = []
+    blockers = config.arm_blockers()
+    if blockers:
+        sections.append("WILL NOT ARM -- part of the module or bank is unwatched\n"
+                        + "\n".join(f"  - {p}" for p in blockers))
+    advisories = config.advisories()
+    if advisories:
+        sections.append("WARNING\n" + "\n".join(f"  - {p}" for p in advisories))
+    return "\n\n".join(sections)
+
+
+def arm_refusal_summary(refusals):
+    """One line for the main window: the first reason ARM is refused, and a count."""
+    if not refusals:
+        return ""
+    more = f"  (+{len(refusals) - 1} more)" if len(refusals) > 1 else ""
+    return f"WILL NOT ARM: {refusals[0]}{more}"
+
+
 # ================= CONFIGURATION DIALOG =================
 
 class ConfigDialog(QtWidgets.QDialog):
@@ -330,12 +357,9 @@ class ConfigDialog(QtWidgets.QDialog):
             + "   (edit in rig_config.json)"
         )
 
-        warnings = candidate.validate()
-        if warnings:
-            self.lbl_warnings.setText("WARNING\n" + "\n".join(f"  - {w}" for w in warnings))
-            self.lbl_warnings.setVisible(True)
-        else:
-            self.lbl_warnings.setVisible(False)
+        text = config_problem_text(candidate)
+        self.lbl_warnings.setText(text)
+        self.lbl_warnings.setVisible(bool(text))
 
     def restore_defaults(self):
         confirm = QtWidgets.QMessageBox.question(
@@ -878,7 +902,20 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         hw_layout.addWidget(self.lbl_stat_daq)
         hw_layout.addWidget(self.lbl_stat_temp)
         hw_layout.addWidget(self.lbl_stat_res)
-        hw_layout.addStretch()
+
+        # Why ARM is being refused, from the logic process. Without it a refused
+        # ARM only shows on the console, which nobody sees when the app is
+        # launched from a shortcut. Full list in the tooltip.
+        self.lbl_arm_refused = QtWidgets.QLabel()
+        self.lbl_arm_refused.setStyleSheet(
+            f"color: {theme.DANGER}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+        self.lbl_arm_refused.setVisible(False)
+        # Ignored, so a long reason clips instead of widening the window.
+        self.lbl_arm_refused.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                           QtWidgets.QSizePolicy.Policy.Preferred)
+        self.shown_arm_refusals = []
+        hw_layout.addSpacing(theme.GAP_MD)
+        hw_layout.addWidget(self.lbl_arm_refused, 1)
         main_layout.addLayout(hw_layout)
 
         # 3. MIDDLE (Graphs & Cells Sidebar)
@@ -1106,9 +1143,10 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         daq_changed = new_config.daq != self.config.daq
 
-        warnings = new_config.validate()
-        if warnings:
-            body = "\n".join(f"  - {w}" for w in warnings)
+        # Saving is still allowed with blockers -- a team mid-rewire has to be
+        # able to save and restart -- but the rig will not arm on them.
+        body = config_problem_text(new_config)
+        if body:
             confirm = QtWidgets.QMessageBox.warning(
                 self, "Configuration problems",
                 f"This configuration has problems:\n\n{body}\n\n"
@@ -1296,6 +1334,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.update_status_pill(self.lbl_stat_daq, "NI DAQ", hw_status.get('ni_daq', False))
             self.update_status_pill(self.lbl_stat_temp, "TEMP SENSOR", hw_status.get('temp_arduino', False))
             self.update_status_pill(self.lbl_stat_res, "RESISTOR CTRL", hw_status.get('res_arduino', False))
+
+            refusals = latest_data.get('arm_refusals', [])
+            if refusals != self.shown_arm_refusals:
+                self.shown_arm_refusals = refusals
+                self.lbl_arm_refused.setText(arm_refusal_summary(refusals))
+                self.lbl_arm_refused.setToolTip("\n".join(f"- {r}" for r in refusals))
+                self.lbl_arm_refused.setVisible(bool(refusals))
 
             fsm_state = latest_data.get('fsm_state', 'DISCONNECTED')
             self.lbl_fsm_state.setStyleSheet(theme.fsm_style(fsm_state))

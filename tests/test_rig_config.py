@@ -21,6 +21,8 @@ from rig_config import (
     DaqConfig,
     RigConfig,
     field_label,
+    DEFAULT_VOLTAGE_CHANNELS,
+    DEFAULT_RESISTOR_TC_CHANNELS,
 )
 
 
@@ -192,12 +194,13 @@ class TestLimitDerivation:
                               min_volts=36.0)
         assert any("Per-cell trip" in w for w in limits.exceedances(pack))
 
-    def test_non_positive_stale_timeout_is_flagged(self):
-        pack = PackConfig()
-        limits = SafetyLimits(derive_from_pack=False, temp_stale_timeout_s=0.0,
-                              amp_buffer=0.0, max_amps=180.0, max_temp=60.0,
-                              min_volts=36.0, min_cell_volts=2.7)
-        assert any("staleness" in w for w in limits.exceedances(pack))
+    def test_non_positive_stale_timeout_blocks_arm(self):
+        # It switches a monitor off rather than moving a trip, so it is an ARM
+        # blocker, not an exceedance.
+        cfg = RigConfig.defaults()
+        cfg.limits.temp_stale_timeout_s = 0.0
+        assert any("staleness" in p for p in cfg.arm_blockers())
+        assert not any("staleness" in w for w in cfg.limits.exceedances(cfg.pack))
 
 
 # ================= DERIVATION CONFLICTS =================
@@ -542,3 +545,116 @@ class TestResistorTrips:
     def test_duplicate_thermocouple_channels_are_reported(self):
         daq = DaqConfig(resistor_tc_channels=["cDAQ1Mod3/ai0", "cDAQ1Mod3/ai0"])
         assert any("Duplicate thermocouple" in p for p in daq.validate(PackConfig()))
+
+
+# ================= ARM BLOCKERS VS ADVISORIES =================
+
+def _blocked_by(**daq_overrides):
+    cfg = RigConfig.defaults()
+    for name, value in daq_overrides.items():
+        setattr(cfg.daq, name, value)
+    return cfg.arm_blockers()
+
+
+class TestArmBlockers:
+    """Configuration problems that leave part of the module or bank unwatched
+    block ARM. Everything else is an advisory: shown, never blocking."""
+
+    def test_defaults_are_clean(self):
+        cfg = RigConfig.defaults()
+        assert cfg.arm_blockers() == []
+        assert cfg.advisories() == []
+
+    def test_voltage_channel_count_mismatch_blocks(self):
+        assert any("voltage channels" in p
+                   for p in _blocked_by(voltage_channels=DEFAULT_VOLTAGE_CHANNELS[:11]))
+        # Extra taps block too: the per-cell readings no longer line up.
+        extra = DEFAULT_VOLTAGE_CHANNELS + ["cDAQ1Mod4/ai0"]
+        assert any("voltage channels" in p for p in _blocked_by(voltage_channels=extra))
+
+    def test_temperature_sensor_shortfall_is_only_advisory(self):
+        # By choice: a rig still being instrumented must be able to arm.
+        cfg = RigConfig.defaults()
+        cfg.daq.sensors_per_bus = 7
+        assert cfg.arm_blockers() == []
+        assert any("no temperature sensor" in p for p in cfg.advisories())
+
+    def test_temperature_sensor_surplus_is_only_advisory(self):
+        cfg = RigConfig.defaults()
+        cfg.daq.sensors_per_bus = 9
+        assert cfg.arm_blockers() == []
+        assert any("thermistors configured" in p for p in cfg.advisories())
+
+    def test_current_on_a_voltage_channel_blocks(self):
+        assert any("also listed" in p
+                   for p in _blocked_by(current_channel=DEFAULT_VOLTAGE_CHANNELS[3]))
+
+    def test_duplicate_voltage_channel_blocks(self):
+        chans = list(DEFAULT_VOLTAGE_CHANNELS)
+        chans[5] = chans[0]
+        assert any("Duplicate voltage" in p for p in _blocked_by(voltage_channels=chans))
+
+    def test_thermocouple_problems_block(self):
+        assert any("also used" in p for p in _blocked_by(
+            resistor_tc_channels=[DEFAULT_VOLTAGE_CHANNELS[0]] + DEFAULT_RESISTOR_TC_CHANNELS[1:]))
+        assert any("Duplicate thermocouple" in p for p in _blocked_by(
+            resistor_tc_channels=[DEFAULT_RESISTOR_TC_CHANNELS[0]] * 4))
+        assert any("Thermocouple type" in p for p in _blocked_by(thermocouple_type="Q"))
+        assert any("Cold-junction" in p for p in _blocked_by(resistor_tc_cjc_source="GUESS"))
+
+    def test_no_thermocouples_is_only_advisory(self):
+        # The runtime check still faults an armed rig with no thermocouple data.
+        cfg = RigConfig.defaults()
+        cfg.daq.resistor_tc_channels = []
+        cfg.limits.resistor_max_temp_c = []
+        assert cfg.arm_blockers() == []
+        assert any("No resistor thermocouple" in p for p in cfg.advisories())
+
+    def test_bank_with_a_trip_but_no_thermocouple_is_only_advisory(self):
+        cfg = RigConfig.defaults()
+        cfg.daq.resistor_tc_channels = DEFAULT_RESISTOR_TC_CHANNELS[:3]
+        assert cfg.arm_blockers() == []
+        assert any("bank(s) 4-4" in p for p in cfg.advisories())
+
+    def test_thermocouple_without_its_own_trip_is_only_advisory(self):
+        # Held to the strictest trip, so nothing is unwatched.
+        cfg = RigConfig.defaults()
+        cfg.limits.resistor_max_temp_c = [225.0, 225.0, 225.0]
+        assert cfg.arm_blockers() == []
+        assert any("thermocouple channel" in p for p in cfg.advisories())
+
+    def test_non_positive_scaling_blocks(self):
+        assert any("Divider multiplier" in p for p in _blocked_by(voltage_multiplier=0.0))
+        assert any("Current transducer" in p for p in _blocked_by(current_amps_per_volt=-100.0))
+        assert any("Divider multiplier" in p
+                   for p in _blocked_by(voltage_multiplier=float('nan')))
+
+    def test_non_positive_daq_stale_timeout_blocks(self):
+        cfg = RigConfig.defaults()
+        cfg.limits.daq_stale_timeout_s = 0.0
+        assert any("DAQ staleness" in p for p in cfg.arm_blockers())
+
+    def test_limits_past_a_rating_are_only_advisory(self):
+        # The trip still fires where it is set: a deliberate operator choice.
+        cfg = RigConfig.defaults()
+        cfg.limits.derive_from_pack = False
+        cfg.limits.max_temp = 999.0
+        cfg.limits.resistor_max_temp_c = [300.0, 225.0, 225.0, 150.0]
+        assert cfg.arm_blockers() == []
+        assert len(cfg.advisories()) == 2
+
+    def test_sample_period_is_only_advisory(self):
+        cfg = RigConfig.defaults()
+        cfg.daq.sample_period_s = 0.0
+        assert cfg.arm_blockers() == []
+        assert any("Sample period" in p for p in cfg.advisories())
+
+    def test_validate_lists_blockers_first(self):
+        cfg = RigConfig.defaults()
+        cfg.daq.sample_period_s = 0.0                                   # advisory
+        cfg.daq.voltage_channels = DEFAULT_VOLTAGE_CHANNELS[:11]        # blocker
+        problems = cfg.validate()
+        assert problems == cfg.arm_blockers() + cfg.advisories()
+        assert "voltage channels" in problems[0]
+
+

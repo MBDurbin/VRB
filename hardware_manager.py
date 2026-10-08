@@ -135,7 +135,10 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
           f"{daq_cfg.channel_count} voltage channels | "
           f"{daq_cfg.temp_bus_count}x{daq_cfg.sensors_per_bus} = "
           f"{daq_cfg.sensor_count} thermistors")
-    for problem in daq_cfg.validate(pack):
+    # The logic process refuses ARM on the first group; see rig_config.arm_blockers.
+    for problem in daq_cfg.safety_problems(pack):
+        print(f"[DAQ CONFIG ERROR] {problem}")
+    for problem in daq_cfg.advisories(pack):
         print(f"[DAQ WARNING] {problem}")
 
     hardware_state = {

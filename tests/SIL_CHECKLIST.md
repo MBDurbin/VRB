@@ -57,7 +57,9 @@ plant-model window and the main telemetry GUI appear.
 | B16 | RESET, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~192 A | `FAULT` logging `BANK OVERPOWER` once V × I passes 8 kW, in `IDLE` as well. No Max Amp setting moves this trip |
 | B17 | RESET, ARM, drag SIL **Bank 1 resistor** past 225 °C | `FAULT` logging `RESISTOR OVERTEMP` and `Bank 1 at ... C (trip 225 C)`. Fires in `IDLE` as well |
 | B18 | Open **Resistor Map** while dragging the Bank 1 slider | Bank 1's four top-row elements recolour toward red as they near 225 °C; banks 5–8 read `NO SENSOR` |
-| B19 | RESET, tick **Simulate hardware interlock fault** in `IDLE`, press **ARM** | ARM **refused**: state stays `IDLE` (no FAULT, nothing to reset), console logs `Cannot ARM: NI-DAQ OFFLINE`. Untick, press ARM again: `ARMED` |
+| B19 | RESET, tick **Simulate hardware interlock fault** in `IDLE`, press **ARM** | ARM **refused**: state stays `IDLE` (no FAULT, nothing to reset), console logs `Cannot ARM: NI-DAQ OFFLINE`, and `WILL NOT ARM: NI-DAQ OFFLINE` shows in red beside the hardware pills. Untick, press ARM again: `ARMED` |
+| B20 | From `IDLE`, **Configure → Battery Pack**, set series count to 14, Save (accept the problems prompt) | Dialog lists the voltage-channel mismatch under `WILL NOT ARM` and the thermistor shortfall under `WARNING`. Main window shows `WILL NOT ARM: 12 voltage channels configured but the pack is 14S ...`; pressing **ARM** is refused. Set it back to 12: the label clears and ARM works |
+| B21 | ARM, then repeat B20's change to 14S | `FAULT` logging `CONFIG FAULT` and naming the voltage-channel mismatch — a config change that leaves cells unwatched while armed kills the load |
 
 **Not reachable from the SIL sliders** — the plant model generates uniform cells
 and always-fresh timestamps, so these need either a unit test or real hardware:

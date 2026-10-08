@@ -26,6 +26,8 @@ from control_logic import (
     stale_temp_sensors,
     check_daq_health,
     check_ni_daq,
+    arm_refusals,
+    config_blockers,
     evaluate_safety,
     lap_row_interval,
     load_lap_profile,
@@ -49,6 +51,7 @@ from control_logic import (
     MAX_RESISTANCE,
     RESISTOR_RESOLUTION,
 )
+from rig_config import RigConfig
 
 
 # ================= THERMAL & CURRENT TRIPS =================
@@ -578,6 +581,53 @@ class TestEvaluateSafety:
         assert check_ni_daq({'ni_daq': False}) == (True, "NI-DAQ OFFLINE")
         assert check_ni_daq({}) == (True, "NI-DAQ OFFLINE")
 
+    # ----- configuration that leaves part of the module unwatched -----
+
+    PROBLEMS = ["11 voltage channels configured but the pack is 12S."]
+
+    def test_config_problem_faults_once_armed(self):
+        # ARM is refused on these, so this is a config change landing mid-arm.
+        assert evaluate_safety(self._packet(), _limits(), config_problems=self.PROBLEMS) \
+            == (True, "CONFIG FAULT")
+
+    def test_config_problem_does_not_fault_unarmed(self):
+        assert evaluate_safety(self._packet(), _limits(), armed=False,
+                               config_problems=self.PROBLEMS) == (False, None)
+
+    def test_config_fault_reported_ahead_of_the_readings_it_skews(self):
+        # A missing tap makes the module total read low; the cause is the config.
+        data = self._packet(voltage=30.0)
+        assert evaluate_safety(data, _limits(), config_problems=self.PROBLEMS) \
+            == (True, "CONFIG FAULT")
+
+    def test_measured_danger_and_no_daq_outrank_config_fault(self):
+        assert evaluate_safety(self._packet(amps=500.0), _limits(),
+                               config_problems=self.PROBLEMS) == (True, "OVERCURRENT")
+        assert evaluate_safety(self._packet(**self.NO_DAQ), _limits(),
+                               config_problems=self.PROBLEMS) == (True, "NI-DAQ OFFLINE")
+
+
+class TestArmRefusals:
+    def test_clean_rig_arms(self):
+        assert arm_refusals({'ni_daq': True}, []) == []
+
+    def test_every_reason_is_listed(self):
+        refusals = arm_refusals({'ni_daq': False}, ["a", "b"])
+        assert len(refusals) == 3
+        assert refusals[0].startswith("NI-DAQ OFFLINE")
+        assert refusals[1:] == ["a", "b"]
+
+    def test_default_config_has_no_blockers(self):
+        cfg = RigConfig.defaults()
+        assert config_blockers(cfg.daq, cfg.pack, cfg.limits.to_command_dict()) == []
+
+    def test_unreadable_config_blocks_rather_than_raising(self):
+        # A quoted number in the hand-edited JSON. Raising here would take down
+        # the logic process; passing it would arm on an unchecked config.
+        cfg = RigConfig.defaults()
+        cfg.daq.voltage_multiplier = "11"
+        blockers = config_blockers(cfg.daq, cfg.pack, cfg.limits.to_command_dict())
+        assert len(blockers) == 1 and "could not be checked" in blockers[0]
 
 
 # ================= FSM TRANSITION GUARDS =================

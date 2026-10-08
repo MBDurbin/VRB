@@ -90,7 +90,9 @@ any state ──STOP/trip──> FAULT ──RESET──> IDLE
 ```
 
 Guards live in `is_valid_transition()`. `ARM` only from `IDLE`, `RUN` only from
-`ARMED`, `RESET` only from `FAULT`, `STOP` always accepted.
+`ARMED`, `RESET` only from `FAULT`, `STOP` always accepted. `ARM` is also refused,
+staying in `IDLE`, while `arm_refusals()` is non-empty: the NI-DAQ is offline or
+the configuration has ARM blockers (see Retargeting below).
 
 ## Hardware
 
@@ -193,9 +195,30 @@ loop period. These describe physical wiring, so they cannot be *derived* from
 S/P counts — but they must agree with them, and the dialog says so in red when
 they do not (e.g. "12 voltage channels configured but the pack is 14S").
 
+**Configuration problems come in two classes, and one of them blocks ARM.**
+`RigConfig.arm_blockers()` lists the ones that leave part of the module or bank
+unwatched: a voltage-tap count that does not match the series count, the
+current channel or a thermocouple on a voltage input, duplicate channels, an
+invalid thermocouple type or cold-junction source, a non-positive divider or
+transducer scale, or a staleness timeout at zero (which switches that monitor
+off). These used to be printed as warnings and the rig armed anyway. Now the
+logic process refuses `ARM` while any stand, the main window says why in red
+beside the hardware pills, and a config change that introduces one while armed
+faults as `CONFIG FAULT` and kills the load. Everything else is an advisory
+(`RigConfig.advisories()`), shown and left to the operator: a trip set past a
+datasheet rating (it still fires where it is set), a thermistor count that does
+not match the cell count, no resistor thermocouples or a bank with a trip and no
+thermocouple, and a bad sample period. Fewer thermistors than cells and missing
+thermocouples are advisories by choice, so a rig still being instrumented can
+arm; an armed rig whose thermocouples deliver nothing still faults as
+`NO RESISTOR TEMP DATA`. A config with blockers can still be saved, so a team
+mid-rewire can save and restart.
+
 DAQ changes only take effect on restart, because the NI task and sensor buffers
 are built once at process start. The GUI tells you this after saving rather than
-letting you believe a rewiring change is already live.
+letting you believe a rewiring change is already live. ARM is judged against the
+wiring the DAQ is actually running, so correcting a channel list in the dialog
+does not unblock it until after the restart.
 
 ### What retargeting does NOT cover
 

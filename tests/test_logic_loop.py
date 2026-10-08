@@ -66,8 +66,9 @@ class Rig:
         self.resistor = FakeResistor()
         monkeypatch.setattr(cl, "auto_detect_resistor",
                             lambda discovery_lock=None: self.resistor)
-        monkeypatch.setattr(RigConfig, "load",
-                            staticmethod(lambda *a, **k: RigConfig.defaults()))
+        # What the logic process loads at startup. Replace before start().
+        self.config = RigConfig.defaults()
+        monkeypatch.setattr(RigConfig, "load", staticmethod(lambda *a, **k: self.config))
 
         self.ni_daq = True
         self.daq_q = queue.Queue(maxsize=5)
@@ -75,6 +76,7 @@ class Rig:
         self.cmd_q = queue.Queue(maxsize=10)
         self.stop = threading.Event()
         self.seen = []          # every fsm_state forwarded, in order
+        self.last = None        # the latest packet forwarded
         self.threads = []
 
     def _feed(self):
@@ -90,7 +92,8 @@ class Rig:
     def _tap(self):
         while not self.stop.is_set():
             try:
-                self.seen.append(self.tel_q.get(timeout=0.1)['fsm_state'])
+                self.last = self.tel_q.get(timeout=0.1)
+                self.seen.append(self.last['fsm_state'])
             except queue.Empty:
                 pass
 
@@ -174,3 +177,63 @@ def test_ni_daq_lost_mid_run_faults_and_kills_the_load(rig, capsys):
     kill = after.index(b"KILL\n")
     assert not any(is_resistance_command(w) for w in after[kill:])
     assert "NI-DAQ OFFLINE ALARM! Killing Load." in capsys.readouterr().out
+
+
+def eleven_taps():
+    """The default config with one cell's voltage tap missing from the list."""
+    cfg = RigConfig.defaults()
+    cfg.daq.voltage_channels = cfg.daq.voltage_channels[:11]
+    return cfg
+
+
+def test_arm_is_refused_while_the_config_leaves_a_cell_unwatched(rig, capsys):
+    rig.config = eleven_taps()
+    rig.start()
+    rig.wait_for("IDLE")
+
+    rig.cmd_q.put("ARM")
+    time.sleep(0.5)
+
+    assert rig.state == "IDLE"
+    assert "ARMED" not in rig.seen and "FAULT" not in rig.seen
+    assert "Cannot ARM: 11 voltage channels configured but the pack is 12S" \
+        in capsys.readouterr().out
+    # The GUI is told why, not just the console.
+    assert any("11 voltage channels" in r for r in rig.last['arm_refusals'])
+
+
+def test_fixing_the_wiring_in_the_gui_waits_for_a_restart(rig, capsys):
+    # The DAQ process keeps the channel list it started with, so a corrected
+    # list in the Configure dialog does not make those cells measured yet.
+    rig.config = eleven_taps()
+    rig.start()
+    rig.wait_for("IDLE")
+
+    rig.cmd_q.put(("SET_CONFIG", RigConfig.defaults().to_dict()))
+    time.sleep(0.3)
+    rig.cmd_q.put("ARM")
+    time.sleep(0.5)
+
+    assert rig.state == "IDLE"
+    out = capsys.readouterr().out
+    assert "DAQ settings changed. They apply on restart" in out
+    assert "Cannot ARM: 11 voltage channels" in out
+
+
+def test_config_change_while_armed_faults_and_kills_the_load(rig, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put("ARM")
+    rig.wait_for("ARMED")
+
+    # Reconfigured for a 14S module while armed; the DAQ still reads 12 taps.
+    fourteen_s = RigConfig.defaults()
+    fourteen_s.pack.series_count = 14
+    before = len(rig.resistor.written())
+    rig.cmd_q.put(("SET_CONFIG", fourteen_s.to_dict()))
+    rig.wait_for("FAULT")
+
+    assert b"KILL\n" in rig.resistor.written()[before:]
+    out = capsys.readouterr().out
+    assert "CONFIG FAULT ALARM! Killing Load." in out
+    assert "12 voltage channels configured but the pack is 14S" in out

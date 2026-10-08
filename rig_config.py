@@ -626,10 +626,19 @@ class DaqConfig:
         return self.sensors_per_bus + 1
 
     def validate(self, pack: PackConfig):
-        """Report mismatches between the wiring and the configured pack."""
-        # Collected rather than raised: a mismatch should be shouted about at
-        # startup and shown in red in the GUI, but must not stop the rig running.
-        # A team mid-rewire needs to be able to see the warning AND boot.
+        """Every mismatch between the wiring and the configured pack, blocking first."""
+        # Collected rather than raised: a team mid-rewire needs to be able to see
+        # the problem AND boot. The ones in safety_problems() stop it arming.
+        return self.safety_problems(pack) + self.advisories(pack)
+
+    def safety_problems(self, pack: PackConfig):
+        """Wiring problems that leave a cell, the current or a bank unwatched.
+
+        Each one means a measurement a trip depends on is missing or wrong, so a
+        trip that looks armed is not watching what it should. control_logic
+        refuses ARM while any stand (see arm_blockers()). They used to be printed
+        as warnings and the rig armed anyway.
+        """
         problems = []
 
         # One voltage tap per series group. Fewer means some cells are never
@@ -641,15 +650,6 @@ class DaqConfig:
                 f"{pack.series_count}S. Cell voltages will be read for "
                 f"{self.channel_count} groups only -- add or remove channels in "
                 f"rig_config.json to match."
-            )
-        # One thermistor per cell is the design intent, so the thermal map covers
-        # the whole module. A shortfall means hot cells with no sensor on them.
-        if self.sensor_count != pack.cell_count: #CHANGE THIS WHEN WE ADD THE INBETWEEN SENSORS FOR THE MODULES
-            problems.append(
-                f"{self.temp_bus_count} buses x {self.sensors_per_bus} sensors = "
-                f"{self.sensor_count} thermistors, but the pack has "
-                f"{pack.cell_count} cells ({pack.series_count}S{pack.parallel_count}P). "
-                f"The thermal map will not cover every cell."
             )
         # A channel cannot be both the current input and a voltage tap. If it is,
         # one of the two readings is meaningless and it is impossible to tell
@@ -678,16 +678,56 @@ class DaqConfig:
         if tc_dupes:
             problems.append(f"Duplicate thermocouple channels: {', '.join(sorted(tc_dupes))}; "
                             f"two banks would show the same temperature.")
+        # Either one stops the thermocouple task starting, so no bank is read.
         if self.thermocouple_type not in THERMOCOUPLE_TYPES:
             problems.append(f"Thermocouple type '{self.thermocouple_type}' is not one of "
                             f"{', '.join(THERMOCOUPLE_TYPES)}.")
         if self.resistor_tc_cjc_source not in CJC_SOURCES:
             problems.append(f"Cold-junction source '{self.resistor_tc_cjc_source}' is not one "
                             f"of {', '.join(CJC_SOURCES)}.")
+        # Zero reads every cell and the current as zero. A negative current scale
+        # reads discharge as negative, which never reaches the over-current trip.
+        # `not > 0` rather than `<= 0` so a NaN from the JSON is caught too.
+        if not self.voltage_multiplier > 0:
+            problems.append(f"Divider multiplier {self.voltage_multiplier} must be positive; "
+                            f"every voltage reading is scaled by it.")
+        if not self.current_amps_per_volt > 0:
+            problems.append(f"Current transducer scale {self.current_amps_per_volt} A/V must "
+                            f"be positive, or discharge current never reaches the "
+                            f"over-current trip.")
+
+        return problems
+
+    def advisories(self, pack: PackConfig):
+        """Wiring problems that are shown but never block ARM.
+
+        Fewer thermistors than cells and no resistor thermocouples are here by
+        choice, not because they leave nothing unwatched: they can describe a rig
+        still being instrumented, and stay warnings. Once armed, a thermocouple
+        list that delivers nothing still faults as NO RESISTOR TEMP DATA.
+        """
+        problems = []
+        # One thermistor per cell is the design intent, so the thermal map covers
+        # the whole module. A shortfall means hot cells with no sensor on them.
+        if self.sensor_count < pack.cell_count: #CHANGE THIS WHEN WE ADD THE INBETWEEN SENSORS FOR THE MODULES
+            problems.append(
+                f"{self.temp_bus_count} buses x {self.sensors_per_bus} sensors = "
+                f"{self.sensor_count} thermistors, but the pack has "
+                f"{pack.cell_count} cells ({pack.series_count}S{pack.parallel_count}P). "
+                f"Some cells have no temperature sensor."
+            )
+        if self.sensor_count > pack.cell_count:
+            problems.append(
+                f"{self.sensor_count} thermistors configured for {pack.cell_count} cells. "
+                f"Any that are not fitted will read as failed sensors once armed."
+            )
+        # The bank has no thermal protection of its own (docs/hardware_topology.md).
+        if not self.resistor_tc_channels:
+            problems.append("No resistor thermocouple channels: nothing is watching the "
+                            "bank temperatures.")
         # A zero or negative period would make the DAQ loop spin without pausing.
         if self.sample_period_s <= 0:
             problems.append("Sample period must be greater than zero.")
-
         return problems
 
 
@@ -948,13 +988,9 @@ class SafetyLimits:
                 f"{pack.cell_min_voltage:.2f} V cutoff -- a cell would be damaged "
                 f"before the trip fires."
             )
-        # A non-positive timeout disables the staleness check entirely, which
-        # would let a dead temperature sensor go unnoticed indefinitely.
-        if self.temp_stale_timeout_s <= 0:
-            warnings.append(
-                "Temperature staleness timeout must be positive, or a lost "
-                "temperature link or failed sensor will never be detected."
-            )
+        # A non-positive staleness timeout is not here: it switches a monitor off
+        # rather than setting a trip past a rating, so it blocks ARM instead (see
+        # arm_blockers()).
         # Derating needs a temperature band to ramp across.
         if self.derate_enabled and self.derate_start >= self.max_temp:
             warnings.append(
@@ -1004,6 +1040,35 @@ class SafetyLimits:
         }
 
 
+# ================= ARM BLOCKERS =================
+
+def arm_blockers(daq: DaqConfig, pack: PackConfig, limits: dict):
+    """Every configuration problem that must stop the rig arming.
+
+    Two classes of configuration problem, and only this one blocks. These leave
+    a cell voltage, a cell temperature, the current or a bank temperature
+    unmeasured, measured wrong, or its monitor switched off -- the rig would arm
+    with part of the module or bank unprotected. Everything else is an advisory,
+    shown and left to the operator: a trip set past a datasheet rating (it still
+    fires where it is set), spare sensors, and -- by choice, for a rig still being
+    instrumented -- fewer thermistors than cells or no resistor thermocouples.
+
+    `limits` is the command dict from SafetyLimits.to_command_dict(), because
+    that is what the logic process holds and trips on.
+    """
+    problems = daq.safety_problems(pack)
+
+    # A non-positive timeout switches the staleness check off entirely, so a
+    # dead link or sensor would keep its last reading forever.
+    if not limits['temp_stale_timeout'] > 0:
+        problems.append("Temperature staleness timeout must be positive, or a lost "
+                        "temperature link or failed sensor will never be detected.")
+    if not limits['daq_stale_timeout'] > 0:
+        problems.append("DAQ staleness timeout must be positive, or a hung DAQ's last "
+                        "readings will be trusted forever.")
+    return problems
+
+
 # ================= TOP-LEVEL CONFIG =================
 
 @dataclass
@@ -1051,20 +1116,35 @@ class RigConfig:
         }
 
     def validate(self):
-        """All cross-cutting consistency problems, as human-readable strings."""
-        # Two independent checks concatenated: limits versus what the cells can
-        # take, and wiring versus what the pack needs. Both return lists, so an
-        # empty result means the whole configuration is coherent.
-        problems = self.limits.exceedances(self.pack) + self.daq.validate(self.pack)
+        """All cross-cutting consistency problems, the ones that block ARM first.
+
+        An empty result means the whole configuration is coherent.
+        """
+        return self.arm_blockers() + self.advisories()
+
+    def arm_blockers(self):
+        """Problems that stop the rig arming. See the module-level arm_blockers()."""
+        return arm_blockers(self.daq, self.pack, self.limits.to_command_dict())
+
+    def advisories(self):
+        """Problems worth showing that leave nothing unwatched. Never block ARM."""
+        # Limits versus what the cells can take, and wiring versus what the pack
+        # needs.
+        problems = self.limits.exceedances(self.pack) + self.daq.advisories(self.pack)
         # Limits and channels live in different sections, so only this level can
         # see whether every thermocoupled bank has a trip of its own.
         n_tc, n_lim = len(self.daq.resistor_tc_channels), len(self.limits.resistor_max_temp_c)
-        if n_tc != n_lim:
+        if n_tc > n_lim:
             problems.append(
                 f"{n_tc} resistor thermocouple channel(s) but {n_lim} resistor trip "
                 f"temperature(s). A bank without its own trip uses the lowest one set; "
                 f"with none set, any reading trips."
             )
+        elif 0 < n_tc < n_lim:
+            problems.append(
+                f"{n_lim} resistor trip temperatures but only {n_tc} thermocouple "
+                f"channel(s): bank(s) {n_tc + 1}-{n_lim} have a trip and nothing measuring "
+                f"them.")
         return problems
 
     @staticmethod

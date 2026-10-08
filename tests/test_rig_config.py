@@ -714,3 +714,28 @@ class TestBankRatingToggle:
         assert RigConfig.from_dict({'limits': {}}).limits.bank_rated_power_only is False
 
 
+class TestSettingsInForce:
+    def test_fingerprint_survives_the_trip_to_the_controller(self):
+        # The GUI and the logic process must agree when nothing has changed.
+        cfg = RigConfig.defaults()
+        assert RigConfig.from_dict(cfg.to_dict()).settings_fingerprint() == \
+            cfg.settings_fingerprint()
+
+    def test_fingerprint_follows_pack_vehicle_and_wiring_not_limits(self):
+        base = RigConfig.defaults().settings_fingerprint()
+        for change in (lambda c: setattr(c.pack, 'series_count', 14),
+                       lambda c: setattr(c.vehicle, 'mass_car_kg', 300.0),
+                       lambda c: c.daq.voltage_channels.pop()):
+            cfg = RigConfig.defaults()
+            change(cfg)
+            assert cfg.settings_fingerprint() != base
+        cfg = RigConfig.defaults()
+        cfg.limits.max_temp = 60.0          # compared value by value instead
+        assert cfg.settings_fingerprint() == base
+
+    def test_moved_warning_line_is_not_a_discarded_hand_edit(self):
+        # Display-only, so derivation moving it back is not worth a warning.
+        pack = PackConfig()
+        limits = SafetyLimits().apply_pack_derivation(pack)
+        limits.warn_volts += 3.0
+        assert limits.derivation_conflicts(pack) == []

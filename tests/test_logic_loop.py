@@ -478,3 +478,54 @@ def test_sidebar_edit_past_a_rating_while_running_faults(rig, capsys):
     out = capsys.readouterr().out
     assert "CONFIG FAULT ALARM!" in out
     assert "Undervoltage trip 0.0 V is below" in out
+
+
+# ================= SETTINGS IN FORCE =================
+
+def test_controller_reports_the_settings_in_force(rig):
+    rig.start()
+    rig.wait_for("IDLE")
+    assert rig.last['active_settings'] == RigConfig.defaults().settings_fingerprint()
+    assert rig.last['active_limits'] == RigConfig.defaults().limits.to_command_dict()
+
+    rig.cmd_q.put(sidebar_limits(max_temp=60.0))
+    deadline = time.monotonic() + 1.0
+    while rig.last['active_limits']['max_temp'] != 60.0:
+        assert time.monotonic() < deadline, "the new limit was never reported"
+        time.sleep(0.02)
+
+
+def test_config_rejected_mid_run_stays_visibly_not_in_force(rig, capsys):
+    # The controller ignores a new config while RUNNING. What it reports keeps
+    # the old one, so the GUI can see its own copy is not in force.
+    from gui_layout import settings_mismatch
+
+    run_to_running(rig)
+    cooler = RigConfig.defaults()
+    cooler.pack.cell_max_temp_c = 60.0
+    cooler.limits.apply_pack_derivation(cooler.pack)
+    rig.cmd_q.put(("SET_CONFIG", cooler.to_dict()))
+    time.sleep(0.5)
+
+    assert "Ignoring config change while RUNNING" in capsys.readouterr().out
+    assert rig.last['active_settings'] == RigConfig.defaults().settings_fingerprint()
+    mismatch = settings_mismatch(cooler, rig.last)
+    assert any(line.startswith("Max temp: shown 60.0, in force 80.0") for line in mismatch)
+    assert any("previous configuration" in line for line in mismatch)
+
+
+def test_config_accepted_in_idle_shows_no_mismatch(rig):
+    # The common path must not raise a false alarm once the change lands.
+    from gui_layout import settings_mismatch
+
+    rig.start()
+    rig.wait_for("IDLE")
+    cooler = RigConfig.defaults()
+    cooler.pack.cell_max_temp_c = 60.0
+    cooler.limits.apply_pack_derivation(cooler.pack)
+    rig.cmd_q.put(("SET_CONFIG", cooler.to_dict()))
+
+    deadline = time.monotonic() + 1.0
+    while settings_mismatch(cooler, rig.last):
+        assert time.monotonic() < deadline, settings_mismatch(cooler, rig.last)
+        time.sleep(0.02)

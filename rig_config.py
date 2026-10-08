@@ -42,6 +42,7 @@ UNITS
 # json: reads and writes rig_config.json. Chosen over pickle/YAML deliberately --
 # a student should be able to open the config in Notepad and understand it, and
 # a corrupt file should be fixable by hand rather than requiring this program.
+import hashlib
 import json
 import math
 
@@ -943,6 +944,12 @@ class SafetyLimits:
     DERIVED_FIELDS = ('max_amps', 'max_temp', 'min_volts', 'warn_volts',
                       'min_cell_volts', 'derate_start')
 
+    # Derived, but protecting nothing: the dashed warning line on the voltage
+    # plot. Editing it is no override of the protection limits, so it neither
+    # switches derivation off nor counts as a discarded hand edit when derivation
+    # moves it again.
+    DISPLAY_ONLY_FIELDS = ('warn_volts',)
+
     def derivation_conflicts(self, pack: PackConfig):
         """Values that pack derivation would overwrite, as (field, loaded, derived).
 
@@ -965,6 +972,8 @@ class SafetyLimits:
 
         conflicts = []
         for name in self.DERIVED_FIELDS:
+            if name in self.DISPLAY_ONLY_FIELDS:
+                continue
             loaded, after = getattr(self, name), getattr(derived, name)
             # Float tolerance rather than != : values that round-trip through
             # JSON can differ in the last bit without being a real edit.
@@ -1178,6 +1187,19 @@ class RigConfig:
             'limits': asdict(self.limits),
             'daq': asdict(self.daq),
         }
+
+    def settings_fingerprint(self):
+        """A short hash of the vehicle, pack and wiring.
+
+        The logic process reports its own in every telemetry packet, so the GUI
+        can tell whether the controller is using what the window shows: a config
+        it rejected mid-run, or one the bounded command queue dropped, leaves the
+        two different. Limits are left out and compared value by value instead,
+        since the sidebar changes them without a new config.
+        """
+        body = json.dumps({k: v for k, v in self.to_dict().items() if k != 'limits'},
+                          sort_keys=True)
+        return hashlib.sha1(body.encode('utf-8')).hexdigest()[:12]
 
     def validate(self):
         """All cross-cutting consistency problems, the ones that block ARM first.

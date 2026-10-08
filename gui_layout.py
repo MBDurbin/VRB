@@ -1,13 +1,14 @@
 import sys
 import csv
+import math
 import time
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 from queue import Empty, Full
 from multiprocessing import Queue, Event
 
 from rig_config import (
-    RigConfig, VehicleParams, PackConfig, DaqConfig,
+    RigConfig, VehicleParams, PackConfig, DaqConfig, SafetyLimits,
     VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, DAQ_FIELD_LABELS, field_label,
 )
 from control_logic import (DEFAULT_LAP_CSV, PROFILES_DIR, PROJECT_DIR, VRB_MAX_POWER_W,
@@ -138,6 +139,54 @@ def config_problem_text(config):
     if advisories:
         sections.append("WARNING\n" + "\n".join(f"  - {p}" for p in advisories))
     return "\n\n".join(sections)
+
+
+# How each limit is named on screen, for the settings-mismatch warning.
+LIMIT_LABELS = {
+    'max_amps': "Max current", 'amp_buffer': "E-stop buffer", 'max_temp': "Max temp",
+    'min_volts': "V crit", 'min_cell_volts': "Cell min", 'cell_sense_floor': "Cell sense floor",
+    'temp_stale_timeout': "Temp stale timeout", 'daq_stale_timeout': "DAQ stale timeout",
+    'derate_en': "Thermal derate", 'derate_start': "Derate start",
+    'resistor_max_temp': "Resistor trips", 'bank_rated_only': "Bank at rated power only",
+}
+
+# How long the controller may take to acknowledge a settings change before the
+# window says it is not in force. A command normally lands within ~0.2 s.
+SETTINGS_ACK_GRACE_S = 1.0
+
+
+def _same_setting(a, b):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a == b
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_setting(x, y) for x, y in zip(a, b))
+    try:
+        return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-6)
+    except TypeError:
+        return a == b
+
+
+def settings_mismatch(config, data):
+    """Where the controller's settings in force differ from what the window shows.
+
+    One line per difference, empty when they agree or when the packet does not
+    say. The controller rejects a new config while RUNNING, and the bounded
+    command queue can drop a SET_LIMITS or SET_CONFIG, so the window's own copy
+    is not proof of what is protecting the rig; the controller reports its own
+    in every packet.
+    """
+    lines = []
+    active = data.get('active_limits')
+    if active:
+        for key, shown in config.limits.to_command_dict().items():
+            if key not in active or not _same_setting(shown, active[key]):
+                lines.append(f"{LIMIT_LABELS.get(key, key)}: shown {shown}, "
+                             f"in force {active.get(key, 'unset')}")
+    in_force = data.get('active_settings')
+    if in_force and in_force != config.settings_fingerprint():
+        lines.append("Vehicle, pack or wiring: the controller is still using the previous "
+                     "configuration")
+    return lines
 
 
 def arm_refusal_summary(refusals):
@@ -330,7 +379,11 @@ class ConfigDialog(QtWidgets.QDialog):
             name: self._read_widget(w) for name, w in self.daq_widgets.items()
         })
 
-        limits = self.config.limits
+        # A copy. This runs on every keystroke to refresh the preview, and
+        # deriving into the window's own limits object changed the live limits
+        # whether or not the dialog was saved -- Cancel undid nothing, and the
+        # next sidebar edit sent the previewed limits to the controller.
+        limits = replace(self.config.limits)
         limits.apply_pack_derivation(pack)
         return RigConfig(vehicle=vehicle, pack=pack, limits=limits, daq=daq)
 
@@ -739,6 +792,9 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.stop_event = stop_event
         # The E-STOP's own signal to the logic process; see request_estop().
         self.estop_event = estop_event
+        # The controller's state as last reported; Configure is refused while
+        # it is RUNNING.
+        self.last_fsm_state = "DISCONNECTED"
 
         self.is_logging = False
         self.csv_file = None
@@ -910,10 +966,23 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.lbl_active_config.setStyleSheet(f"color: {theme.ACCENT};")
         self.refresh_config_label()
 
+        # Shown when the controller is not using the settings this window shows:
+        # a config it rejected mid-run, or a command the queue dropped. Without
+        # it the label beside it could describe a pack the rig is not running.
+        self.lbl_settings_mismatch = QtWidgets.QLabel()
+        self.lbl_settings_mismatch.setStyleSheet(
+            f"color: {theme.DANGER}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+        self.lbl_settings_mismatch.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                                 QtWidgets.QSizePolicy.Policy.Preferred)
+        self.lbl_settings_mismatch.setVisible(False)
+        self.mismatch_since = None
+        self.shown_mismatch = []
+
         sub_top_layout.addWidget(self.lbl_active_csv)
         sub_top_layout.addWidget(self._divider())
         sub_top_layout.addWidget(self.lbl_active_config)
-        sub_top_layout.addStretch()
+        sub_top_layout.addSpacing(theme.GAP_MD)
+        sub_top_layout.addWidget(self.lbl_settings_mismatch, 1)
         main_layout.addLayout(sub_top_layout)
 
         # 2. STATUS PILLS
@@ -1092,7 +1161,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         limits_inner.addWidget(self.chk_bank_rated)
         cell_layout.addWidget(limits_card)
 
-        self.sb_v_warn.valueChanged.connect(self.handle_limit_change)
+        self.sb_v_warn.valueChanged.connect(self.handle_warn_change)
         self.sb_v_crit.valueChanged.connect(self.handle_limit_change)
         self.sb_cell_min.valueChanged.connect(self.handle_limit_change)
         self.sb_c_crit.valueChanged.connect(self.handle_limit_change)
@@ -1168,9 +1237,53 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             f"({pack.capacity_ah:.1f} Ah, {pack.max_current_a:.0f} A)"
         )
 
+    def update_settings_mismatch(self, latest_data):
+        """Warn when the controller is not using what this window shows.
+
+        Only once a difference has outlasted SETTINGS_ACK_GRACE_S, so the moment
+        between sending a change and the controller taking it does not flash.
+        """
+        mismatch = settings_mismatch(self.config, latest_data)
+        now = time.time()
+        if not mismatch:
+            self.mismatch_since = None
+        elif self.mismatch_since is None:
+            self.mismatch_since = now
+        show = mismatch if (mismatch and now - self.mismatch_since >= SETTINGS_ACK_GRACE_S) else []
+
+        if show != self.shown_mismatch:
+            self.shown_mismatch = show
+            more = f"  (+{len(show) - 1} more)" if len(show) > 1 else ""
+            self.lbl_settings_mismatch.setText(
+                f"NOT IN FORCE ON THE CONTROLLER: {show[0]}{more}" if show else "")
+            self.lbl_settings_mismatch.setToolTip("\n".join(f"- {line}" for line in show))
+            self.lbl_settings_mismatch.setVisible(bool(show))
+
+    def refuse_config_while_running(self):
+        """True, after telling the operator, if a run is in progress.
+
+        The controller ignores a new config while RUNNING. This window used to
+        apply and save it anyway, so it showed limits that were not protecting
+        the rig -- a lowered max temp that was not in force, say.
+        """
+        if self.last_fsm_state != "RUNNING":
+            return False
+        QtWidgets.QMessageBox.information(
+            self, "Run in progress",
+            "Stop the run before changing the configuration.\n\n"
+            "The controller does not take a new configuration mid-run, so only "
+            "this window would change.")
+        return True
+
     def open_config_dialog(self):
+        if self.refuse_config_while_running():
+            return
         dialog = ConfigDialog(self.config, self)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        # Again: a run cannot start behind a modal dialog, but the state is only
+        # as fresh as the last packet.
+        if self.refuse_config_while_running():
             return
 
         try:
@@ -1264,34 +1377,47 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.crit_line_v.setValue(self.lim_v_crit)
         self.crit_line_c.setValue(self.lim_c_crit)
 
-    def handle_limit_change(self):
+    def handle_warn_change(self):
+        # The warning line protects nothing and never reaches the controller, so
+        # moving it is no override: it used to switch off pack derivation of
+        # every protection limit along with it.
         self.lim_v_warn = self.sb_v_warn.value()
-        self.lim_v_crit = self.sb_v_crit.value()
-        self.lim_cell_min = self.sb_cell_min.value()
-        self.lim_c_crit = self.sb_c_crit.value()
-        self.lim_c_buffer = self.sb_c_buffer.value()
-        self.lim_t_crit = self.sb_t_crit.value()
-        self.lim_t_derate = self.sb_t_derate.value()
-        self.derate_enabled = self.chk_derate.isChecked()
-
+        self.config.limits.warn_volts = self.lim_v_warn
         self.warn_line_v.setValue(self.lim_v_warn)
-        self.crit_line_v.setValue(self.lim_v_crit)
-        self.crit_line_c.setValue(self.lim_c_crit)
 
-        # Hand-edited limits are an intentional override, so stop re-deriving
-        # them from the pack -- otherwise the next config load would silently
-        # revert the operator's values.
+    def handle_limit_change(self):
         limits = self.config.limits
-        limits.derive_from_pack = False
-        limits.warn_volts = self.lim_v_warn
-        limits.min_volts = self.lim_v_crit
-        limits.min_cell_volts = self.lim_cell_min
-        limits.max_amps = self.lim_c_crit
-        limits.amp_buffer = self.lim_c_buffer
-        limits.max_temp = self.lim_t_crit
-        limits.derate_start = self.lim_t_derate
-        limits.derate_enabled = self.derate_enabled
+        boxes = {
+            'min_volts': self.sb_v_crit,
+            'min_cell_volts': self.sb_cell_min,
+            'max_amps': self.sb_c_crit,
+            'amp_buffer': self.sb_c_buffer,
+            'max_temp': self.sb_t_crit,
+            'derate_start': self.sb_t_derate,
+        }
+        # Only what actually moved, within the boxes' two-decimal display, so an
+        # edit to one box does not round another limit it did not touch.
+        changed = {name: box.value() for name, box in boxes.items()
+                   if abs(getattr(limits, name) - box.value()) > 0.0051}
+        for name, value in changed.items():
+            setattr(limits, name, value)
+        limits.derate_enabled = self.chk_derate.isChecked()
 
+        # Editing a threshold that pack derivation writes is an intentional
+        # override, so stop re-deriving -- otherwise the next config load would
+        # silently revert the operator's value. The E-stop buffer and the derate
+        # switch are not derived: editing them keeps derivation, and re-running
+        # it moves max current with a new buffer so the trip stays on the
+        # cells' rating.
+        overrides = [name for name in changed
+                     if name in SafetyLimits.DERIVED_FIELDS
+                     and name not in SafetyLimits.DISPLAY_ONLY_FIELDS]
+        if overrides:
+            limits.derive_from_pack = False
+        elif limits.derive_from_pack:
+            limits.apply_pack_derivation(self.config.pack)
+
+        self.apply_config_to_widgets()
         self.send_command(("SET_LIMITS", limits.to_command_dict()))
 
     def handle_bank_rating_change(self):
@@ -1392,7 +1518,10 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 self.lbl_arm_refused.setToolTip("\n".join(f"- {r}" for r in refusals))
                 self.lbl_arm_refused.setVisible(bool(refusals))
 
+            self.update_settings_mismatch(latest_data)
+
             fsm_state = latest_data.get('fsm_state', 'DISCONNECTED')
+            self.last_fsm_state = fsm_state
             self.lbl_fsm_state.setStyleSheet(theme.fsm_style(fsm_state))
             self.lbl_fsm_state.setText(fsm_state)
 

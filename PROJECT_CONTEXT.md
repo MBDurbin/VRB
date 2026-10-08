@@ -175,9 +175,27 @@ derives to 175 A and the trip lands exactly on 180 A. Deriving the limit as the
 raw rating would put the real trip at 185 A — above the cells — which is exactly
 the bug that shipped originally as 182 A / 187 A.
 
-Hand-editing a threshold in the sidebar sets `derive_from_pack = False`, so your
-override is not reverted the next time the config loads. Re-enable derivation by
-editing that flag in `rig_config.json`.
+Hand-editing a threshold in the sidebar that derivation computes (V crit, cell
+min, max current, max temp, derate start) sets `derive_from_pack = False`, so
+your override is not reverted the next time the config loads. Re-enable
+derivation by editing that flag in `rig_config.json`. The other sidebar controls
+are not overrides and leave derivation on: **V warn** only moves a dashed line on
+the plot and never reaches the controller (it used to switch derivation off for
+every limit), and changing the **E-stop buffer** or the **thermal derate**
+switch re-derives, so max current follows a new buffer and the trip stays on the
+cells' rating.
+
+**What the window shows is checked against what the controller is using.** The
+logic process reports its limits in force and a fingerprint of its vehicle, pack
+and wiring (`settings_fingerprint()`) in every telemetry packet. If they differ
+from the window's for more than a second, a red `NOT IN FORCE ON THE
+CONTROLLER` line appears beside the car and pack label, naming the setting. That
+catches a config the controller rejected and a `SET_LIMITS` or `SET_CONFIG` the
+bounded command queue dropped. Configure is refused outright while RUNNING,
+because the controller ignores a new config mid-run; it used to apply and save
+it in the window anyway, so a lowered max temp could look active when it was
+not. The Configure preview also works on a copy of the limits now: it used to
+re-derive into the live limits on every keystroke, so Cancel undid nothing.
 
 **Editing `rig_config.json` by hand is different.** If you change a limit there
 and leave `derive_from_pack: true`, derivation still wins — that is deliberate,

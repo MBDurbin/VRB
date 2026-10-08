@@ -1158,6 +1158,9 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     report_config_problems(config_problems)
     # What a complete packet holds for that wiring and this pack.
     expected = expected_measurements(running_daq, pack)
+    # Reported in every packet so the GUI can see whether this process is using
+    # the vehicle, pack and wiring its window shows. See settings_fingerprint().
+    settings_id = config.settings_fingerprint()
 
     last_heartbeat = time.time()
     last_physics_time = time.time()
@@ -1293,6 +1296,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                 # can leave it judging the old pack.
                                 config_problems = config_blockers(running_daq, pack, limits)
                                 expected = expected_measurements(running_daq, pack)
+                                settings_id = config.settings_fingerprint()
 
                                 # Capacity change invalidates the running coulomb
                                 # count, so rebaseline rather than carry a stale Ah.
@@ -1530,6 +1534,14 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             data['true_soc'] = true_soc
             data['hardware_status']['res_arduino'] = (res_ser is not None)
             data['arm_refusals'] = arm_refusals(data['hardware_status'], config_problems)
+            # The settings actually in force, as the acknowledgement for
+            # SET_LIMITS and SET_CONFIG: either can be rejected (a config while
+            # RUNNING) or dropped by the bounded command queue, and the GUI
+            # compares these against what it shows. Copies, so the GUI never
+            # holds this process's own objects.
+            data['active_limits'] = {k: (list(v) if isinstance(v, list) else v)
+                                     for k, v in limits.items()}
+            data['active_settings'] = settings_id
 
             # Never blocks: a blocking get or put here would stall every trip, the
             # E-STOP and the heartbeat behind the GUI's queue. See put_latest().

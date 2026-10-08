@@ -108,6 +108,10 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
 | D4 | Set `Derate Start` above `Max Temp`, enable derate, then RUN | No crash. Logic process stays alive (fail-safe full derate) |
 | D5 | Set `Max Amp` to 0, then RUN | No crash, no divide-by-zero |
 | D8 | Set `V Crit` to 45 V while running at 4.20 V/cell OCV | Trips `UNDERVOLTAGE` — confirms the spinbox actually reaches the logic process |
+| D9 | While `RUNNING`, press **Configure** | Refused with "Run in progress"; nothing changes or saves. The controller ignores a new config mid-run |
+| D10 | From `IDLE`, **Configure**, change the cell's max temp, press **Cancel**. Then nudge `E-stop buffer` | Sidebar `Max Temp` is unchanged before and after the nudge, and no `NOT IN FORCE` line appears: the cancelled preview did not leak into the live limits |
+| D11 | Drag `V Warn` to a new value | Only the dashed plot line moves. Console shows no `Limits updated`, and after a restart there is no "Hand-edited limits were replaced" dialog |
+| D12 | Use the rig normally through C and D | The red `NOT IN FORCE ON THE CONTROLLER` line beside the car and pack label never appears. If it does, the controller is not using the settings shown |
 | D6 | Toggle heatmap open/closed 10x while `RUNNING` | No crash, temps keep updating, run continues |
 | D7 | Close the heatmap window via its X while `RUNNING` | Main GUI unaffected, run continues |
 

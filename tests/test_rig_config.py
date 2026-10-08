@@ -320,7 +320,9 @@ class TestExceedances:
         limits = SafetyLimits(derive_from_pack=False, derate_enabled=True,
                               derate_start=60.0, max_temp=60.0, amp_buffer=0.0,
                               max_amps=180.0, min_volts=36.0)
-        assert any("derate" in w.lower() for w in limits.exceedances(pack))
+        # An advisory: resistance_floor() fails safe to full derate.
+        assert any("derate" in w.lower() for w in limits.advisories())
+        assert not any("derate" in w.lower() for w in limits.exceedances(pack))
 
 
 # ================= PERSISTENCE =================
@@ -634,14 +636,52 @@ class TestArmBlockers:
         cfg.limits.daq_stale_timeout_s = 0.0
         assert any("DAQ staleness" in p for p in cfg.arm_blockers())
 
-    def test_limits_past_a_rating_are_only_advisory(self):
-        # The trip still fires where it is set: a deliberate operator choice.
+    def test_limits_past_a_rating_block(self):
+        # Each fires only after the damage is done. These used to be warnings,
+        # so the sidebar could arm the rig with any of them.
+        for name, value, words in (
+                ('max_amps', 2000.0, "pack rating"),
+                ('max_temp', 150.0, "discharge ceiling"),
+                ('min_volts', 0.0, "absolute cutoff"),
+                ('min_cell_volts', 0.0, "Per-cell trip")):
+            cfg = RigConfig.defaults()
+            cfg.limits.derive_from_pack = False
+            setattr(cfg.limits, name, value)
+            assert any(words in p for p in cfg.arm_blockers()), name
+            assert not any(words in p for p in cfg.advisories()), name
+
         cfg = RigConfig.defaults()
-        cfg.limits.derive_from_pack = False
-        cfg.limits.max_temp = 999.0
         cfg.limits.resistor_max_temp_c = [300.0, 225.0, 225.0, 150.0]
-        assert cfg.arm_blockers() == []
-        assert len(cfg.advisories()) == 2
+        assert any("Bank 1 resistor trip" in p for p in cfg.arm_blockers())
+
+    def test_limits_at_their_ratings_are_clean(self):
+        # The pack-derived limits sit exactly on the ratings.
+        assert RigConfig.defaults().arm_blockers() == []
+
+    def test_non_finite_limit_blocks(self):
+        # NaN loses every comparison: a NaN max temp could never trip.
+        for name in ('max_amps', 'max_temp', 'min_volts', 'min_cell_volts', 'amp_buffer'):
+            cfg = RigConfig.defaults()
+            cfg.limits.derive_from_pack = False
+            setattr(cfg.limits, name, float('nan'))
+            assert any("not finite" in p and name in p for p in cfg.arm_blockers()), name
+        cfg = RigConfig.defaults()
+        cfg.limits.resistor_max_temp_c = [225.0, float('inf'), 225.0, 150.0]
+        assert any("resistor_max_temp" in p for p in cfg.arm_blockers())
+
+    def test_quoted_limit_in_the_file_becomes_a_number(self, tmp_path):
+        raw = RigConfig.defaults().to_dict()
+        raw['limits'].update(derive_from_pack=False, max_temp="60")
+        path = tmp_path / "rig_config.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        assert RigConfig.load(str(path)).limits.max_temp == 60.0
+
+    def test_unreadable_limit_in_the_file_falls_back_to_defaults(self, tmp_path):
+        raw = RigConfig.defaults().to_dict()
+        raw['limits'].update(derive_from_pack=False, max_temp="hot")
+        path = tmp_path / "rig_config.json"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        assert RigConfig.load(str(path)).limits.max_temp == RigConfig.defaults().limits.max_temp
 
     def test_sample_period_is_only_advisory(self):
         cfg = RigConfig.defaults()

@@ -43,6 +43,7 @@ UNITS
 # a student should be able to open the config in Notepad and understand it, and
 # a corrupt file should be fixable by hand rather than requiring this program.
 import json
+import math
 
 # os: used for path handling (building CONFIG_PATH, checking the file exists,
 # and shortening the filename in warning messages).
@@ -888,7 +889,16 @@ class SafetyLimits:
         # rig_config.json is hand-edited, and a quoted "225" would otherwise reach
         # the safety check as a string. Failing here makes load() fall back to
         # defaults with a message, instead of a TypeError inside the logic loop.
+        # NaN converts without failing; limit_problems() blocks ARM on it.
+        for name in self.NUMERIC_FIELDS:
+            setattr(self, name, float(getattr(self, name)))
         self.resistor_max_temp_c = [float(t) for t in self.resistor_max_temp_c]
+
+    # Every float field. The switches are left alone: float() would happily turn
+    # the string "false" into an error and True into 1.0.
+    NUMERIC_FIELDS = ('max_amps', 'amp_buffer', 'max_temp', 'min_volts', 'warn_volts',
+                      'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout_s',
+                      'daq_stale_timeout_s', 'derate_start')
 
     def apply_pack_derivation(self, pack: PackConfig):
         """Recompute limits from the cell datasheet. No-op if derivation is off."""
@@ -963,62 +973,23 @@ class SafetyLimits:
         return conflicts
 
     def exceedances(self, pack: PackConfig):
-        """Return human-readable warnings where limits exceed cell ratings.
+        """Trips set past the cells' or the bank's ratings. These block ARM.
 
-        The E-STOP fires at max_amps + amp_buffer, so the buffer is checked as
-        part of the current limit rather than ignored.
+        The same checks limit_problems() applies to the limits the logic process
+        holds; see rating_exceedances().
         """
-        warnings = []
+        return rating_exceedances(self.to_command_dict(), pack)
 
-        # Check the value the trip ACTUALLY fires at, not the operating limit.
-        # Checking max_amps alone was how a 182 A limit with a 5 A buffer passed
-        # review while really tripping at 187 A, above the cells' 180 A rating.
-        trip_current = self.max_amps + self.amp_buffer
-        if trip_current > pack.max_current_a:
-            warnings.append(
-                f"Over-current trip at {trip_current:.1f} A exceeds the "
-                f"{pack.max_current_a:.1f} A pack rating "
-                f"({trip_current / pack.parallel_count:.2f} A/cell vs "
-                f"{pack.cell_max_continuous_a:.1f} A rated)."
-            )
-        # Running hotter than the datasheet's discharge ceiling.
-        if self.max_temp > pack.cell_max_temp_c:
-            warnings.append(
-                f"Max temp {self.max_temp:.1f} C exceeds the cell's "
-                f"{pack.cell_max_temp_c:.1f} C discharge ceiling."
-            )
-        # A trip below the absolute cutoff can only fire after cells are damaged.
-        if self.min_volts < pack.min_voltage:
-            warnings.append(
-                f"Undervoltage trip {self.min_volts:.1f} V is below the "
-                f"{pack.min_voltage:.1f} V absolute cutoff -- cells would be "
-                f"damaged before the trip fires."
-            )
-        # Same reasoning at the individual cell level.
-        if self.min_cell_volts < pack.cell_min_voltage:
-            warnings.append(
-                f"Per-cell trip {self.min_cell_volts:.2f} V is below the cell's "
-                f"{pack.cell_min_voltage:.2f} V cutoff -- a cell would be damaged "
-                f"before the trip fires."
-            )
-        # A non-positive staleness timeout is not here: it switches a monitor off
-        # rather than setting a trip past a rating, so it blocks ARM instead (see
-        # arm_blockers()).
-        # Derating needs a temperature band to ramp across.
+    def advisories(self):
+        """Limit settings worth a warning that leave every trip working."""
+        warnings = []
+        # Derating needs a temperature band to ramp across. Without one
+        # resistance_floor() fails safe to full derate: no load, not no trip.
         if self.derate_enabled and self.derate_start >= self.max_temp:
             warnings.append(
                 f"Derate start {self.derate_start:.1f} C is not below max temp "
                 f"{self.max_temp:.1f} C; derating cannot ramp."
             )
-        # A resistor trip above what the element is rated for only fires once
-        # the element is already past its limit.
-        for bank, (limit, rated) in enumerate(
-                zip(self.resistor_max_temp_c, RESISTOR_ELEMENT_MAX_C), start=1):
-            if rated is not None and limit > rated:
-                warnings.append(
-                    f"Bank {bank} resistor trip {limit:.0f} C is above its elements' "
-                    f"{rated:.0f} C rating."
-                )
         return warnings
 
     def to_command_dict(self):
@@ -1056,22 +1027,83 @@ class SafetyLimits:
 
 # ================= ARM BLOCKERS =================
 
-def arm_blockers(daq: DaqConfig, pack: PackConfig, limits: dict):
-    """Every configuration problem that must stop the rig arming.
+# The command-dict keys every trip compares a reading against.
+NUMERIC_LIMIT_KEYS = ('max_amps', 'amp_buffer', 'max_temp', 'min_volts', 'min_cell_volts',
+                      'cell_sense_floor', 'temp_stale_timeout', 'daq_stale_timeout',
+                      'derate_start')
 
-    Two classes of configuration problem, and only this one blocks. These leave
-    a cell voltage, a cell temperature, the current or a bank temperature
-    unmeasured, measured wrong, or its monitor switched off -- the rig would arm
-    with part of the module or bank unprotected. Everything else is an advisory,
-    shown and left to the operator: a trip set past a datasheet rating (it still
-    fires where it is set), spare sensors, and -- by choice, for a rig still being
-    instrumented -- fewer thermistors than cells or no resistor thermocouples.
 
-    `limits` is the command dict from SafetyLimits.to_command_dict(), because
-    that is what the logic process holds and trips on.
+def _finite(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def rating_exceedances(limits, pack: PackConfig):
+    """Trips set past the cells' or the bank's ratings, so they fire only after
+    the damage is done. `limits` is the command dict.
     """
-    problems = daq.safety_problems(pack)
+    problems = []
 
+    # Check the value the trip ACTUALLY fires at, not the operating limit.
+    # Checking max_amps alone was how a 182 A limit with a 5 A buffer passed
+    # review while really tripping at 187 A, above the cells' 180 A rating.
+    trip_current = limits['max_amps'] + limits['amp_buffer']
+    if trip_current > pack.max_current_a:
+        problems.append(
+            f"Over-current trip at {trip_current:.1f} A exceeds the "
+            f"{pack.max_current_a:.1f} A pack rating "
+            f"({trip_current / pack.parallel_count:.2f} A/cell vs "
+            f"{pack.cell_max_continuous_a:.1f} A rated)."
+        )
+    # Running hotter than the datasheet's discharge ceiling.
+    if limits['max_temp'] > pack.cell_max_temp_c:
+        problems.append(
+            f"Max temp {limits['max_temp']:.1f} C exceeds the cell's "
+            f"{pack.cell_max_temp_c:.1f} C discharge ceiling."
+        )
+    # A trip below the absolute cutoff can only fire after cells are damaged.
+    if limits['min_volts'] < pack.min_voltage:
+        problems.append(
+            f"Undervoltage trip {limits['min_volts']:.1f} V is below the "
+            f"{pack.min_voltage:.1f} V absolute cutoff -- cells would be "
+            f"damaged before the trip fires."
+        )
+    # Same reasoning at the individual cell level.
+    if limits['min_cell_volts'] < pack.cell_min_voltage:
+        problems.append(
+            f"Per-cell trip {limits['min_cell_volts']:.2f} V is below the cell's "
+            f"{pack.cell_min_voltage:.2f} V cutoff -- a cell would be damaged "
+            f"before the trip fires."
+        )
+    # A resistor trip above what the element is rated for only fires once the
+    # element is already past its limit.
+    for bank, (limit, rated) in enumerate(
+            zip(limits['resistor_max_temp'], RESISTOR_ELEMENT_MAX_C), start=1):
+        if rated is not None and limit > rated:
+            problems.append(
+                f"Bank {bank} resistor trip {limit:.0f} C is above its elements' "
+                f"{rated:.0f} C rating."
+            )
+    return problems
+
+
+def limit_problems(limits, pack: PackConfig):
+    """Limit settings that leave protection ineffective. Every one blocks ARM.
+
+    Run on the limits the logic process actually holds, so a sidebar edit is
+    judged the moment it arrives, the same as a config file. A trip set past a
+    rating used to be only a warning, so the sidebar could arm the rig with a
+    2000 A over-current trip or a 0 V undervoltage trip.
+    """
+    bad = [k for k in NUMERIC_LIMIT_KEYS if not _finite(limits.get(k))]
+    if not all(_finite(t) for t in limits.get('resistor_max_temp', [])):
+        bad.append('resistor_max_temp')
+    if bad:
+        # NaN loses every comparison, so a trip compared against one never
+        # fires. The checks below would compare against them too.
+        return [f"Limit(s) {', '.join(bad)} are not finite numbers; a trip set to one "
+                f"never fires."]
+
+    problems = rating_exceedances(limits, pack)
     # A non-positive timeout switches the staleness check off entirely, so a
     # dead link or sensor would keep its last reading forever.
     if not limits['temp_stale_timeout'] > 0:
@@ -1081,6 +1113,24 @@ def arm_blockers(daq: DaqConfig, pack: PackConfig, limits: dict):
         problems.append("DAQ staleness timeout must be positive, or a hung DAQ's last "
                         "readings will be trusted forever.")
     return problems
+
+
+def arm_blockers(daq: DaqConfig, pack: PackConfig, limits: dict):
+    """Every configuration problem that must stop the rig arming.
+
+    Two classes of configuration problem, and only this one blocks: wiring that
+    leaves a cell voltage, the current or a bank temperature unmeasured or
+    measured wrong, and limits that leave a trip unable to protect
+    (limit_problems()). Either way the rig would arm with part of the module or
+    bank unprotected. Everything else is an advisory, shown and left to the
+    operator: spare sensors, a derate that cannot ramp, and -- by choice, for a
+    rig still being instrumented -- fewer thermistors than cells or no resistor
+    thermocouples.
+
+    `limits` is the command dict from SafetyLimits.to_command_dict(), because
+    that is what the logic process holds and trips on.
+    """
+    return daq.safety_problems(pack) + limit_problems(limits, pack)
 
 
 # ================= TOP-LEVEL CONFIG =================
@@ -1142,9 +1192,7 @@ class RigConfig:
 
     def advisories(self):
         """Problems worth showing that leave nothing unwatched. Never block ARM."""
-        # Limits versus what the cells can take, and wiring versus what the pack
-        # needs.
-        problems = self.limits.exceedances(self.pack) + self.daq.advisories(self.pack)
+        problems = self.limits.advisories() + self.daq.advisories(self.pack)
         # Limits and channels live in different sections, so only this level can
         # see whether every thermocoupled bank has a trip of its own.
         n_tc, n_lim = len(self.daq.resistor_tc_channels), len(self.limits.resistor_max_temp_c)

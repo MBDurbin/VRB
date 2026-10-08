@@ -54,7 +54,7 @@ plant-model window and the main telemetry GUI appear.
 | B13 | From B12, press **ARM** | `FAULT` — arming on a 0.0 V reading must not be silently permitted |
 | B14 | ARM+RUN, then close the SIL window so the plant stops feeding | `FAULT` logging `DAQ DATA STALE` within ~1 s, and the GUI keeps updating rather than freezing |
 | B15 | Repeat B14 but press **E-STOP** while the plant is stopped | E-STOP is still processed — the logic loop no longer skips its body on an empty queue |
-| B16 | RESET, tick **Bank at rated power only**, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~192 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 8000 W)` once V × I passes 8 kW, in `IDLE` as well. Console logs `bank power 100% of rating` when the box is ticked. No Max Amp setting moves this trip |
+| B16 | RESET, tick **Bank at rated power only**, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~192 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 8000 W)` once V × I passes 8 kW, in `IDLE` as well. Console logs `bank power 100% of rating` when the box is ticked. No Max Amp setting moves this trip. 2000 A is past the cells' rating, so `WILL NOT ARM: Over-current trip ...` shows beside the pills until Max Amp is set back |
 | B16a | Untick **Bank at rated power only**, RESET, drag current to the slider's 250 A | **No** fault: the trip is now 11.2 kW (140%), and the plant tops out near 9.8 kW. Console logs `bank power 140% of rating` |
 | B17 | RESET, ARM, drag SIL **Bank 1 resistor** past 225 °C | `FAULT` logging `RESISTOR OVERTEMP` and `Bank 1 at ... C (trip 225 C)`. Fires in `IDLE` as well |
 | B18 | Open **Resistor Map** while dragging the Bank 1 slider | Bank 1's four top-row elements recolour toward red as they near 225 °C; banks 5–8 read `NO SENSOR` |
@@ -101,7 +101,8 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
 
 | # | Step | Expected |
 |---|------|----------|
-| D1 | **Type** a new value into `Max Temp` (select-all, type `100`, press Enter) | No fault while typing. Limit applies only on Enter/focus-out (regression test for Risk #1) |
+| D1 | **Type** a new value into `Max Temp` (select-all, type `70`, press Enter) | No fault while typing. Limit applies only on Enter/focus-out (regression test for Risk #1). Keep it at or below the cell's ceiling: past it, the limit itself blocks ARM, and faults a running rig as `CONFIG FAULT` |
+| D1a | From `IDLE`, set `Max Temp` past the cell's ceiling (e.g. 100 with RS50 cells), press **ARM** | ARM refused; `WILL NOT ARM: Max temp 100.0 C exceeds the cell's ...` beside the pills. Set it back: the label clears |
 | D2 | Rapidly spin `Max Amp` up/down ~30x fast | GUI stays responsive; no queue backlog; limits settle on final value |
 | D3 | Immediately after D2, press **E-STOP** | Responds instantly, never freezes (regression test for Risk #2) |
 | D4 | Set `Derate Start` above `Max Temp`, enable derate, then RUN | No crash. Logic process stays alive (fail-safe full derate) |

@@ -1144,7 +1144,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
           f"bank {VRB_MAX_POWER_W * bank_power_factor(limits) / 1000:.1f} kW total and "
           f"{bank_power_factor(limits) * 100:.0f}% of each bank's rating | resistors "
           + "/".join(f"{t:.0f}" for t in limits['resistor_max_temp']) + " C")
-    for warning in config.limits.exceedances(pack):
+    # Trips past a rating block ARM, and print with the config errors below.
+    for warning in config.limits.advisories():
         print(f"[LOGIC WARNING] {warning}")
 
     # The DAQ process loaded this same file at startup and keeps that wiring
@@ -1303,7 +1304,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                       f"{pack.series_count}S{pack.parallel_count}P, "
                                       f"{pack.capacity_ah:.1f} Ah, "
                                       f"{vehicle.total_mass_kg:.0f} kg car+driver")
-                                for warning in config.limits.exceedances(pack):
+                                for warning in config.limits.advisories():
                                     print(f"[LOGIC WARNING] {warning}")
 
                                 report_config_problems(config_problems)

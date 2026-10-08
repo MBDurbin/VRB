@@ -441,3 +441,40 @@ def test_nan_current_mid_run_faults_and_kills_the_load(rig, capsys):
     out = capsys.readouterr().out
     assert "INVALID READING ALARM! Killing Load." in out
     assert "current reads nan" in out
+
+
+# ================= SIDEBAR LIMITS =================
+
+def sidebar_limits(**changes):
+    """The SET_LIMITS payload the GUI sidebar sends after an edit."""
+    limits = RigConfig.defaults().limits
+    limits.derive_from_pack = False
+    for name, value in changes.items():
+        setattr(limits, name, value)
+    return ("SET_LIMITS", limits.to_command_dict())
+
+
+def test_sidebar_trip_past_the_cell_rating_refuses_arm(rig, capsys):
+    # The sidebar used to bypass validation: a 2000 A over-current trip armed.
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(sidebar_limits(max_amps=2000.0))
+    time.sleep(0.3)
+    rig.cmd_q.put("ARM")
+    time.sleep(0.5)
+
+    assert rig.state == "IDLE" and "ARMED" not in rig.seen
+    assert "Cannot ARM: Over-current trip at 2005.0 A exceeds" in capsys.readouterr().out
+    assert any("Over-current trip" in r for r in rig.last['arm_refusals'])
+
+
+def test_sidebar_edit_past_a_rating_while_running_faults(rig, capsys):
+    run_to_running(rig)
+    before = len(rig.resistor.written())
+    rig.cmd_q.put(sidebar_limits(min_volts=0.0))
+    rig.wait_for("FAULT", timeout=1.0)
+
+    assert b"KILL\n" in rig.resistor.written()[before:]
+    out = capsys.readouterr().out
+    assert "CONFIG FAULT ALARM!" in out
+    assert "Undervoltage trip 0.0 V is below" in out

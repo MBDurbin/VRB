@@ -200,15 +200,21 @@ they do not (e.g. "12 voltage channels configured but the pack is 14S").
 unwatched: a voltage-tap count that does not match the series count, the
 current channel or a thermocouple on a voltage input, duplicate channels, an
 invalid thermocouple type or cold-junction source, a non-positive divider or
-transducer scale, or a staleness timeout at zero (which switches that monitor
-off). These used to be printed as warnings and the rig armed anyway. Now the
-logic process refuses `ARM` while any stand, the main window says why in red
-beside the hardware pills, and a config change that introduces one while armed
-faults as `CONFIG FAULT` and kills the load. Everything else is an advisory
-(`RigConfig.advisories()`), shown and left to the operator: a trip set past a
-datasheet rating (it still fires where it is set), a thermistor count that does
-not match the cell count, no resistor thermocouples or a bank with a trip and no
-thermocouple, and a bad sample period. Fewer thermistors than cells and missing
+transducer scale (zero reads no current; negative reads discharge as negative,
+which never reaches the over-current trip), a staleness timeout at zero (which
+switches that monitor off), any limit that is not a finite number (a trip set to
+NaN never fires), and any trip set past a rating, so that it fires only after the
+damage: over-current above the pack rating, max temp above the cell's ceiling,
+undervoltage below the cutoff, or a resistor trip above its element's rating.
+These used to be printed as warnings and the rig armed anyway. They are judged
+on the limits the logic process actually holds, so a **sidebar edit** counts the
+same as the config file. The logic refuses `ARM` while any stand, the main
+window says why in red beside the hardware pills, and a config or sidebar change
+that introduces one while armed faults as `CONFIG FAULT` and kills the load.
+Everything else is an advisory (`RigConfig.advisories()`), shown and left to the
+operator: a derate that cannot ramp (it fails safe to no load), a thermistor
+count that does not match the cell count, no resistor thermocouples or a bank
+with a trip and no thermocouple, and a bad sample period. Fewer thermistors than cells and missing
 thermocouples are advisories by choice, so a rig still being instrumented can
 arm; an armed rig whose thermocouples deliver nothing still faults as
 `NO RESISTOR TEMP DATA`. A config with blockers can still be saved, so a team

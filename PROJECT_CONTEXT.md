@@ -387,8 +387,14 @@ Three independent layers. They must all be verified separately.
    kept displaying `RUNNING`. The Arduino's own 2 s watchdog still shed the load,
    but nothing in software noticed or reported it. The loop now carries the last
    packet forward tagged with its age, and `DAQ DATA STALE` faults on it.
-2. **Operator E-STOP** — GUI button, routes through `send_command_nonblocking()`
-   so a backed-up command queue can never freeze it.
+2. **Operator E-STOP** — GUI button, raises its own latched `estop_event`
+   (`request_estop()`) rather than queueing a `STOP`, and the logic loop takes it
+   ahead of every queued command. It used to go through
+   `send_command_nonblocking()`, which makes room in a full queue by taking an
+   old command out; a `multiprocessing.Queue` can refuse that for a moment after
+   its own puts, so a STOP pressed into a full queue could be dropped while
+   heartbeats carried on and the Arduino watchdog never fired. An Event has no
+   capacity to run out of.
 3. **Arduino serial watchdog** — 2 s of host silence opens the main contactor
    and sheds all load, independent of the host entirely.
 

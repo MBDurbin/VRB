@@ -135,8 +135,16 @@ killing the load mid-run. Same hazard on `Max Amp`. Now
 the logic process was busy — notably during `auto_detect_resistor()`, which
 blocks ~2-4s **per COM port** while probing. A full queue meant the E-STOP press
 froze the GUI. All commands now route through `send_command_nonblocking()`,
-which drops the oldest command rather than blocking, and never evicts a queued
-STOP. Covered by `tests/test_gui_dispatch.py`.
+which drops the oldest command rather than blocking. Covered by
+`tests/test_gui_dispatch.py`.
+
+**Risk #2b — E-STOP could be dropped by a full queue. FIXED.** Making room in a
+full `multiprocessing.Queue` is not guaranteed — `get_nowait()` can raise Empty
+for a moment after the queue's own puts — so a STOP pressed into a full queue
+could be lost, with heartbeats carrying on so the Arduino watchdog never fired.
+E-STOP no longer uses the queue: it sets a latched `estop_event` that the logic
+loop takes ahead of every queued command. Covered by `TestEstopSignal` and
+`test_estop_gets_through_a_jammed_command_queue`.
 
 **Risk #3 — no undervoltage protection existed at all. FIXED.**
 `V Warn` and `V Crit` were wired only to the dashed lines on the voltage plot and

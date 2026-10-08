@@ -69,6 +69,11 @@ def send_command_nonblocking(cmd_queue, cmd):
     room, since the commands that realistically pile up (SET_LIMITS) are
     latest-wins anyway. A queued STOP is never discarded.
 
+    Not the E-STOP's path: see request_estop(). Making room is not guaranteed
+    with a multiprocessing.Queue, whose get_nowait() can raise Empty for a moment
+    after its own puts while the feeder thread flushes them, so this CAN drop a
+    command, STOP included.
+
     Returns True if the command was enqueued, False if it had to be dropped.
     """
     try:
@@ -96,6 +101,24 @@ def send_command_nonblocking(cmd_queue, cmd):
         return True
     except Full:
         return False
+
+
+def request_estop(estop_event, cmd_queue):
+    """Raise the E-STOP. Never blocks and is never dropped. Returns True if raised.
+
+    A shared Event rather than a "STOP" on the command queue. The queue is
+    bounded, and send_command_nonblocking() can fail to make room in a full
+    multiprocessing.Queue, which dropped the STOP while heartbeats carried on,
+    so the Arduino's watchdog never shed the load either. An Event has no
+    capacity to run out of: it is set here, stays set until the logic process
+    takes it, and the logic checks it ahead of every queued command.
+
+    Falls back to the queue only when no event was wired up.
+    """
+    if estop_event is not None:
+        estop_event.set()
+        return True
+    return send_command_nonblocking(cmd_queue, "STOP")
 
 
 # ================= CONFIGURATION PROBLEMS =================
@@ -708,11 +731,14 @@ class ResistorMapWindow(QtWidgets.QWidget):
 
 # ================= MAIN TELEMETRY GUI =================
 class TelemetryGUI(QtWidgets.QMainWindow):
-    def __init__(self, telemetry_queue: Queue, gui_cmd_queue: Queue, stop_event: Event):
+    def __init__(self, telemetry_queue: Queue, gui_cmd_queue: Queue, stop_event: Event,
+                 estop_event: Event = None):
         super().__init__()
         self.queue = telemetry_queue
         self.gui_cmd_queue = gui_cmd_queue
         self.stop_event = stop_event
+        # The E-STOP's own signal to the logic process; see request_estop().
+        self.estop_event = estop_event
 
         self.is_logging = False
         self.csv_file = None
@@ -833,7 +859,8 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.btn_stop = QtWidgets.QPushButton("E-STOP")
         self.btn_stop.setProperty("variant", "danger")
         self.btn_stop.setToolTip("Immediately shed all load and latch a fault")
-        self.btn_stop.clicked.connect(lambda: self.send_command("STOP"))
+        self.btn_stop.clicked.connect(
+            lambda: request_estop(self.estop_event, self.gui_cmd_queue))
 
         self.btn_reset = QtWidgets.QPushButton("Reset")
         self.btn_reset.setToolTip("Clear a latched fault and return to idle")
@@ -1491,9 +1518,10 @@ def apply_theme(app):
     app.setStyleSheet(theme.app_stylesheet())
 
 
-def run_gui_process(telemetry_queue: Queue, gui_cmd_queue: Queue, stop_event: Event):
+def run_gui_process(telemetry_queue: Queue, gui_cmd_queue: Queue, stop_event: Event,
+                    estop_event: Event = None):
     app = QtWidgets.QApplication(sys.argv)
     apply_theme(app)
-    window = TelemetryGUI(telemetry_queue, gui_cmd_queue, stop_event)
+    window = TelemetryGUI(telemetry_queue, gui_cmd_queue, stop_event, estop_event)
     window.show()
     sys.exit(app.exec())

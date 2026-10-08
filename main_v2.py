@@ -38,6 +38,9 @@ if __name__ == '__main__':
     gui_cmd_queue = Queue(maxsize=10) #GUI to Logic
     daq_queue = Queue(maxsize=10) #houses voltages, temps, and current
     stop_event = Event() #Kill Switch
+    # The operator's E-STOP, GUI to logic. Its own latched flag rather than a
+    # "STOP" on gui_cmd_queue, which is bounded and could drop it when full.
+    estop_event = Event()
 
     # Serialises COM-port probing between the two processes that do it. Both
     # sweep every port sending ?WHOAMI -- control_logic looking for the resistor
@@ -48,7 +51,7 @@ if __name__ == '__main__':
     discovery_lock = Lock()
 
     # 1. Start the FSM Control Logic Process
-    logic_process = Process(target=run_logic_process, args=(daq_queue, telemetry_queue, gui_cmd_queue, stop_event, discovery_lock)) #pakage queues and send to logic in seperate CPU
+    logic_process = Process(target=run_logic_process, args=(daq_queue, telemetry_queue, gui_cmd_queue, stop_event, discovery_lock, estop_event)) #pakage queues and send to logic in seperate CPU
     logic_process.start() #initialize ^
 
     # 2. Check for the Developer Dongle
@@ -69,7 +72,7 @@ if __name__ == '__main__':
 
         from gui_layout import TelemetryGUI
 
-        main_gui = TelemetryGUI(telemetry_queue, gui_cmd_queue, stop_event)
+        main_gui = TelemetryGUI(telemetry_queue, gui_cmd_queue, stop_event, estop_event)
         main_gui.show() #Pull up the telemetry view on the GUI
 
         sys.exit(app.exec()) #wait for input from the GUI
@@ -81,7 +84,7 @@ if __name__ == '__main__':
         daq_process.start()
 
         # Start the Main GUI in its own process
-        gui_process = Process(target=run_gui_process, args=(telemetry_queue, gui_cmd_queue, stop_event)) #run on its own CPU core
+        gui_process = Process(target=run_gui_process, args=(telemetry_queue, gui_cmd_queue, stop_event, estop_event)) #run on its own CPU core
         gui_process.start()
 
         gui_process.join()

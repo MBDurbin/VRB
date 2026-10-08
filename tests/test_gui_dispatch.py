@@ -11,7 +11,9 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from gui_layout import send_command_nonblocking
+import threading
+
+from gui_layout import send_command_nonblocking, request_estop
 
 
 def drain(q):
@@ -96,3 +98,44 @@ class TestNonBlockingDispatch:
 
         assert send_command_nonblocking(q, "STOP") is True
         assert "STOP" in drain(q)
+
+
+# ================= E-STOP SIGNAL =================
+
+class UnflushedQueue:
+    """Full, and get_nowait() raises Empty anyway.
+
+    What a multiprocessing.Queue can do just after its own puts, before the
+    feeder thread has flushed them to the pipe: the queue's capacity is used up
+    but nothing is readable yet. queue.Queue never does this, which is why the
+    tests above pass while the GUI could still drop a STOP in production.
+    """
+    def put_nowait(self, item):
+        raise queue.Full
+
+    def get_nowait(self):
+        raise queue.Empty
+
+
+class TestEstopSignal:
+    def test_queue_path_can_drop_stop(self):
+        # The reported hazard, made deterministic: no room, and none can be made.
+        assert send_command_nonblocking(UnflushedQueue(), "STOP") is False
+
+    def test_estop_event_cannot_be_dropped(self):
+        event = threading.Event()
+        assert request_estop(event, UnflushedQueue()) is True
+        assert event.is_set()
+
+    def test_estop_event_leaves_the_queue_alone(self):
+        # Nothing evicted to make room, and nothing for the logic to act on twice.
+        q = queue.Queue(maxsize=3)
+        for i in range(3):
+            q.put_nowait(("SET_LIMITS", i))
+        request_estop(threading.Event(), q)
+        assert drain(q) == [("SET_LIMITS", 0), ("SET_LIMITS", 1), ("SET_LIMITS", 2)]
+
+    def test_without_an_event_it_falls_back_to_the_queue(self):
+        q = queue.Queue(maxsize=3)
+        assert request_estop(None, q) is True
+        assert drain(q) == ["STOP"]

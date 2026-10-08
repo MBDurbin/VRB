@@ -869,8 +869,21 @@ def is_valid_transition(current_state, command):
     return False
 
 
+def kill_load(res_ser):
+    """Send KILL to the resistor controller, if connected. Never raises.
+
+    A dead link must not take down the logic process on its way to a fault; the
+    Arduino's own 2 s watchdog sheds the load when the host goes quiet.
+    """
+    if res_ser:
+        try:
+            res_ser.write(b"KILL\n")
+        except serial.SerialException:
+            pass
+
+
 def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Queue,
-                      stop_event: Event, discovery_lock=None):
+                      stop_event: Event, discovery_lock=None, estop_event=None):
     fsm_state = "DISCONNECTED"
     target_res = 0.0
 
@@ -1027,6 +1040,17 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             if fsm_state == "DISCONNECTED" and data['hardware_status'].get('temp_arduino', False):
                 fsm_state = "IDLE"
 
+        # --- B. Operator E-STOP, ahead of every queued command ---
+        # A latched Event rather than a queued "STOP": the bounded command queue
+        # could drop it when full (see gui_layout.request_estop). Cleared as it is
+        # taken, so each press is acted on once; a press landing between the
+        # check and the clear is the same stop.
+        if estop_event is not None and estop_event.is_set():
+            estop_event.clear()
+            fsm_state = "FAULT"
+            kill_load(res_ser)
+            print("[LOGIC] EMERGENCY STOP triggered via GUI.")
+
         # --- C. Process GUI Commands ---
         while not gui_cmd_queue.empty():
             try:
@@ -1142,8 +1166,10 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         print("[LOGIC] Cannot RUN: No lap data loaded!")
 
                 elif cmd == "STOP" and is_valid_transition(fsm_state, "STOP"):
+                    # Still accepted from the queue, for callers with no E-STOP
+                    # event (the bench tools); the GUI uses the event.
                     fsm_state = "FAULT"
-                    if res_ser: res_ser.write(b"KILL\n")
+                    kill_load(res_ser)
                     print("[LOGIC] EMERGENCY STOP triggered via GUI.")
 
                 elif cmd == "RESET" and is_valid_transition(fsm_state, "RESET"):

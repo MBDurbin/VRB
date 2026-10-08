@@ -76,6 +76,7 @@ class Rig:
         self.tel_q = queue.Queue(maxsize=50)
         self.cmd_q = queue.Queue(maxsize=10)
         self.stop = threading.Event()
+        self.estop = threading.Event()   # the GUI's E-STOP signal
         self.seen = []          # every fsm_state forwarded, in order
         self.last = None        # the latest packet forwarded
         self.threads = []
@@ -103,7 +104,8 @@ class Rig:
             threading.Thread(target=self._feed, daemon=True),
             threading.Thread(target=self._tap, daemon=True),
             threading.Thread(target=cl.run_logic_process,
-                             args=(self.daq_q, self.tel_q, self.cmd_q, self.stop),
+                             args=(self.daq_q, self.tel_q, self.cmd_q, self.stop,
+                                   None, self.estop),
                              daemon=True),
         ]
         for t in self.threads:
@@ -284,3 +286,26 @@ def test_sidebar_switch_to_rated_power_reaches_the_trip(rig, monkeypatch, capsys
     rig.cmd_q.put(("SET_LIMITS", rated.to_command_dict()))
     rig.wait_for("FAULT")
     assert "Bank 2 at 4200 W (limit 4000 W)" in capsys.readouterr().out
+
+
+def test_estop_gets_through_a_jammed_command_queue(rig, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put("ARM")
+    rig.wait_for("ARMED")
+    rig.cmd_q.put(("RUN", 1))
+    rig.wait_for("RUNNING")
+
+    # Fill the command queue the way spinbox spam would, then press E-STOP.
+    limits = RigConfig.defaults().limits.to_command_dict()
+    while not rig.cmd_q.full():
+        rig.cmd_q.put_nowait(("SET_LIMITS", limits))
+    before = len(rig.resistor.written())
+    pressed = time.monotonic()
+    rig.estop.set()
+
+    rig.wait_for("FAULT")
+    assert time.monotonic() - pressed < 0.5
+    assert b"KILL\n" in rig.resistor.written()[before:]
+    assert not rig.estop.is_set()           # taken, so one press acts once
+    assert capsys.readouterr().out.count("EMERGENCY STOP triggered via GUI.") == 1

@@ -427,3 +427,17 @@ def test_unexpected_error_still_kills_the_load_and_tells_the_gui(rig, monkeypatc
     out = capsys.readouterr().out
     assert "LOGIC CRITICAL ERROR" in out
     assert "Process cleanly shutdown" not in out
+
+
+# ================= MEASUREMENT INTEGRITY =================
+
+def test_nan_current_mid_run_faults_and_kills_the_load(rig, capsys):
+    run_to_running(rig)
+    before = len(rig.resistor.written())
+    rig.amps = float('nan')
+    rig.wait_for("FAULT", timeout=1.0)
+
+    assert b"KILL\n" in rig.resistor.written()[before:]
+    out = capsys.readouterr().out
+    assert "INVALID READING ALARM! Killing Load." in out
+    assert "current reads nan" in out

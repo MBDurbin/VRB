@@ -380,6 +380,34 @@ Three independent layers. They must all be verified separately.
    returning safe — a broken harness or empty channel list would otherwise run a
    high-power profile blind to exactly what that check exists for.
 
+   **Readings are checked before any trip trusts them** (`measurement_problems()`,
+   once armed). NaN loses every comparison, so a packet of NaN current, voltage
+   and cells used to pass every trip; and a packet with one cell, one sensor and
+   one thermocouple passed too, because nothing counted them. Now:
+   `INVALID READING` for anything not a finite number, a current below −20 A
+   (a reversed or saturated transducer hides over-current), a module above 110%
+   of full or a cell more than 0.8 V above full (either can never trip
+   undervoltage), or a cell temperature below the DS18B20's −55 °C; and
+   `INCOMPLETE DATA` when the counts of cells, temperature sensors or
+   thermocouples differ from the wiring. Empty arrays keep their own names
+   (`NO CELL DATA` and its siblings). The temperature parser also drops any
+   value outside −55…125 °C, so the library's −127 "disconnected" value can
+   never count as a fresh reading (the sketch already sends `ERR` for it). A
+   NaN current sample is skipped by the coulomb count rather than freezing the
+   SOC at 100%.
+
+   **No simulated pack without the NI-DAQ.** `hardware_manager` used to
+   substitute a healthy pack at rest (15 A, every cell at nominal + 0.5 V) when
+   the DAQ failed to start, so a rig started without its DAQ drove the real bank
+   while the overcurrent, undervoltage and cell trips watched made-up numbers.
+   It now publishes zero readings with `hardware_status['ni_daq']` False. `ARM`
+   is refused on them (the state stays `IDLE`, nothing to reset), and a DAQ lost
+   after arming faults as `NI-DAQ OFFLINE` on the next packet and kills the load
+   rather than waiting out `DAQ DATA STALE`. A failed read no longer ends the DAQ
+   process, so temperatures keep reaching the GUI; it does not retry, so restart
+   once the DAQ is back. Desk testing on simulated data is what the SIL dongle
+   is for.
+
    **The logic loop never skips its body.** It previously did `continue` when the
    DAQ queue was empty, which jumped past GUI commands, every safety check, the
    resistor heartbeat and telemetry forwarding. A hung DAQ therefore paralysed

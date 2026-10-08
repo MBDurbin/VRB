@@ -75,6 +75,10 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
   stays fresh). On the bench, ARM and then pull one sensor's data lead: the rig
   should fault within ~3 s and the console should name that bus and sensor.
   Covered by `test_one_frozen_sensor_trips_despite_a_fresh_stream`.
+- `INVALID READING` / `INCOMPLETE DATA` (NaN or implausible readings, or fewer
+  readings than the wiring has). The SIL sliders only produce clean, complete
+  packets. Covered by `TestMeasurementIntegrity` and
+  `test_nan_current_mid_run_faults_and_kills_the_load`.
 - `RESISTOR LINK LOST` (the resistor controller stops taking writes mid-run).
   The SIL rig has no controller to unplug. On the bench, RUN, then pull the
   resistor Arduino's USB: the rig should latch `FAULT` (not `DISCONNECTED`), the

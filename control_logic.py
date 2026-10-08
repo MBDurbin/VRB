@@ -406,6 +406,128 @@ def check_resistor_tc_health(tc_ages, stale_timeout_s):
     return False, None
 
 
+# Readings past these cannot be real, and each lies in the direction that hides
+# a danger, so measurement_problems() refuses them rather than trusting them.
+#
+# The bench only discharges. A few amps of negative offset is calibration;
+# beyond this the transducer is reversed, miswired or saturated, and over-current
+# can no longer be seen.
+CURRENT_MIN_PLAUSIBLE_A = -20.0
+# The DS18B20's measurable range starts here. Below it, a reading would make the
+# hottest cell look cooler than it is.
+CELL_TEMP_MIN_PLAUSIBLE_C = -55.0
+# Above a full module by this fraction, or a full cell by this many volts, the
+# tap or divider is wrong, and a reading that high can never trip undervoltage.
+# Loose on purpose: per-cell voltages are differences of two divided taps, so an
+# honest calibration error can approach half a volt at the top of the stack.
+VOLTAGE_PLAUSIBLE_MARGIN = 0.10
+CELL_PLAUSIBLE_MARGIN_V = 0.8
+
+
+def _is_number(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _finite(x):
+    return _is_number(x) and math.isfinite(x)
+
+
+def expected_measurements(daq_cfg, pack):
+    """What a complete, believable packet holds for this wiring and pack.
+
+    Counts come from the wiring the DAQ is running, except the cells, which come
+    from the pack: they are what must be watched, and a channel count that
+    disagrees is already a config error. None if the config cannot say, in which
+    case config_blockers() is already refusing ARM.
+    """
+    try:
+        return {
+            'cells': int(pack.series_count),
+            'temp_sensors': int(daq_cfg.sensor_count),
+            'resistor_tcs': len(daq_cfg.resistor_tc_channels),
+            'max_volts': float(pack.max_voltage) * (1.0 + VOLTAGE_PLAUSIBLE_MARGIN),
+            'max_cell_volts': float(pack.cell_max_voltage) + CELL_PLAUSIBLE_MARGIN_V,
+        }
+    except Exception:
+        return None
+
+
+def measurement_problems(data, expected=None):
+    """Readings in one packet that cannot be trusted, as (reason, detail) pairs.
+
+    INVALID READING: not a number, NaN or infinite, or past what the hardware can
+    really read. NaN loses every comparison, so a NaN current, voltage or cell
+    used to pass every trip as safe. INCOMPLETE DATA: a different number of
+    readings from what the wiring delivers, so some cells or banks are not being
+    checked at all; a packet with one cell, one sensor and one thermocouple used
+    to pass. Empty arrays are left to NO CELL DATA and its siblings, which name
+    them. `expected` is expected_measurements(); without it only the checks that
+    need no configuration run.
+    """
+    problems = []
+
+    def invalid(detail):
+        problems.append(("INVALID READING", detail))
+
+    amps = data.get('amps', 0.0)
+    volts = data.get('voltage', 0.0)
+    max_temp = data.get('max_temp', 0.0)
+    cells = data.get('cell_voltages', [])
+
+    for name, value in (("current", amps), ("module voltage", volts),
+                        ("max cell temperature", max_temp)):
+        if not _finite(value):
+            invalid(f"{name} reads {value!r}")
+    bad = [i + 1 for i, v in enumerate(cells) if not _finite(v)]
+    if bad:
+        invalid("cell(s) " + ", ".join(map(str, bad)) + " are not a number")
+    bad = [i + 1 for i, t in enumerate(data.get('resistor_temps', []))
+           if t is not None and not _finite(t)]
+    if bad:
+        invalid("bank(s) " + ", ".join(map(str, bad)) + " temperature is not a number")
+
+    # Ages may be inf -- never read -- but a NaN age passes every staleness test.
+    ages = ([data.get('daq_age_s', 0.0), data.get('temp_age_s', 0.0)]
+            + [a for bus in data.get('temp_sensor_ages_s', []) for a in bus]
+            + list(data.get('resistor_temp_ages_s', [])))
+    if any(not _is_number(a) or math.isnan(a) for a in ages):
+        invalid("a reading's age is not a number")
+
+    if _finite(amps) and amps < CURRENT_MIN_PLAUSIBLE_A:
+        invalid(f"current {amps:.1f} A is below {CURRENT_MIN_PLAUSIBLE_A:.0f} A; "
+                f"check the transducer's direction and wiring")
+    if _finite(max_temp) and max_temp < CELL_TEMP_MIN_PLAUSIBLE_C:
+        invalid(f"max cell temperature {max_temp:.1f} C is below what the sensors can read")
+
+    if expected:
+        if _finite(volts) and volts > expected['max_volts']:
+            invalid(f"module voltage {volts:.1f} V is above {expected['max_volts']:.1f} V, "
+                    f"more than a full module can read")
+        high = [i + 1 for i, v in enumerate(cells)
+                if _finite(v) and v > expected['max_cell_volts']]
+        if high:
+            invalid("cell(s) " + ", ".join(map(str, high))
+                    + f" above {expected['max_cell_volts']:.2f} V, more than a full cell")
+
+        n_sensors = sum(len(bus) for bus in data.get('temp_sensor_ages_s', []))
+        for name, have, want in (
+                ("cell voltages", len(cells), expected['cells']),
+                ("temperature sensors", n_sensors, expected['temp_sensors']),
+                ("resistor thermocouples", len(data.get('resistor_temp_ages_s', [])),
+                 expected['resistor_tcs'])):
+            if have and have != want:
+                problems.append(("INCOMPLETE DATA", f"{have} {name} reported, {want} wired"))
+    return problems
+
+
+def check_measurements(data, expected=None):
+    """measurement_problems() as (is_fault, reason): the first problem's reason."""
+    problems = measurement_problems(data, expected)
+    if problems:
+        return True, problems[0][0]
+    return False, None
+
+
 def arm_refusals(hardware_status, config_problems):
     """Why ARM would be refused right now, one line each. Empty means it would arm.
 
@@ -440,7 +562,8 @@ def report_config_problems(problems):
         print("[LOGIC] The rig will not arm until the configuration errors above are fixed.")
 
 
-def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=None):
+def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=None,
+                    expected=None):
     """All safety checks against one telemetry packet. Returns (is_fault, reason).
 
     Measured dangers are reported ahead of data-integrity faults: if the pack is
@@ -472,6 +595,10 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     `bank_steps` is the ladder setting in circuit, once it has settled (see
     BANK_SETTLE_S), for the per-bank overpower check. None skips that check and
     keeps the whole-ladder one.
+
+    `expected` is expected_measurements() for the running wiring and pack, for
+    the count and range checks in measurement_problems(). Like the other
+    integrity checks they apply once armed.
     """
     fault, reason = check_thermal_and_current(
         data.get('max_temp', 0.0), data.get('amps', 0.0),
@@ -503,6 +630,12 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     # voltage and the cells, and the cause is the useful thing to report.
     if config_problems:
         return True, "CONFIG FAULT"
+
+    # Before any check reads a value: NaN would pass all of them, and a missing
+    # cell can make the module read low and look like UNDERVOLTAGE.
+    fault, reason = check_measurements(data, expected)
+    if fault:
+        return True, reason
 
     if data.get('voltage', 0.0) <= limits['min_volts']:
         return True, "UNDERVOLTAGE"
@@ -541,7 +674,13 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
 
 #Double Checked
 def coulomb_step(amps, dt, remaining_ah, total_capacity_ah):
-    """Advances coulomb counting by dt seconds. Returns (new_remaining_ah, true_soc_pct)."""
+    """Advances coulomb counting by dt seconds. Returns (new_remaining_ah, true_soc_pct).
+
+    A sample that is not a finite number is skipped: one NaN would otherwise make
+    the remaining charge NaN for good, and min() then pins the SOC at 100%.
+    """
+    if not (_finite(amps) and _finite(dt)):
+        amps, dt = 0.0, 0.0
     ah_consumed = (amps * dt) / 3600.0
     new_remaining_ah = remaining_ah - ah_consumed
     true_soc = max(0.0, min(100.0, (new_remaining_ah / total_capacity_ah) * 100.0))
@@ -1016,6 +1155,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     running_daq = config.daq
     config_problems = config_blockers(running_daq, pack, limits)
     report_config_problems(config_problems)
+    # What a complete packet holds for that wiring and this pack.
+    expected = expected_measurements(running_daq, pack)
 
     last_heartbeat = time.time()
     last_physics_time = time.time()
@@ -1150,6 +1291,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                 # restart. Straight after the swap, so nothing below
                                 # can leave it judging the old pack.
                                 config_problems = config_blockers(running_daq, pack, limits)
+                                expected = expected_measurements(running_daq, pack)
 
                                 # Capacity change invalidates the running coulomb
                                 # count, so rebaseline rather than carry a stale Ah.
@@ -1251,7 +1393,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
             is_fault, trigger_reason = evaluate_safety(
                 data, limits, armed=fsm_state in ("ARMED", "RUNNING"),
-                config_problems=config_problems, bank_steps=settled_steps)
+                config_problems=config_problems, bank_steps=settled_steps,
+                expected=expected)
 
             if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
                 fsm_state = "FAULT"
@@ -1269,6 +1412,9 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 elif trigger_reason == "CONFIG FAULT":
                     for problem in config_problems:
                         print(f"[LOGIC]   - {problem}")
+                elif trigger_reason in ("INVALID READING", "INCOMPLETE DATA"):
+                    for _, detail in measurement_problems(data, expected):
+                        print(f"[LOGIC]   - {detail}")
                 elif trigger_reason == "BANK OVERPOWER":
                     volts, amps = data.get('voltage', 0.0), data.get('amps', 0.0)
                     factor = bank_power_factor(limits)

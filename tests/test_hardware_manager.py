@@ -129,6 +129,14 @@ class TestParseTemperatureLine:
         assert 2 not in readings
         assert len(readings) == 5
 
+    def test_values_a_ds18b20_cannot_read_are_not_readings(self):
+        # -127 is the library's disconnected value: as a fresh reading it would
+        # make that cell look cold. The sketch sends ERR for it today.
+        _, readings = parse_temperature_line("1,-127.0,-55.1,125.1,-55.0,125.0,85.0,30,30",
+                                             8, 6)
+        assert sorted(readings) == [3, 4, 5, 6, 7]
+        assert readings[5] == 85.0          # the power-on value reads hot: kept
+
 
 # ================= PER-SENSOR AGES =================
 

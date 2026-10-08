@@ -31,6 +31,11 @@ RESISTOR_TC_PERIOD_S = 0.25
 TC_MIN_C = -40.0
 TC_MAX_C = 600.0
 
+# What a DS18B20 can measure. A cell reading outside it is a sensor fault, and
+# is skipped like an ERR so that sensor's age grows.
+DS18B20_MIN_C = -55.0
+DS18B20_MAX_C = 125.0
+
 
 def derive_cell_voltages(cumulative_voltages):
     """Difference cumulative tap readings into per-cell voltages.
@@ -78,8 +83,13 @@ def parse_temperature_line(line, sensors_per_bus, bus_count):
             continue
         # float() accepts "nan" and "inf". Neither is a temperature, and a NaN
         # loses every comparison, so it would hide from max() and the overtemp
-        # trip while still counting as a fresh reading for that sensor.
-        if math.isfinite(value):
+        # trip while still counting as a fresh reading for that sensor. Nor is
+        # anything outside the DS18B20's range: -127 is the library's
+        # "disconnected" value, and as a fresh reading it would make that cell
+        # look cold. The sketch already sends ERR for anything at or below
+        # -100 C; this holds if it ever stops. 85 C, the power-on value, is
+        # within range and reads hot, so it fails closed on its own.
+        if math.isfinite(value) and DS18B20_MIN_C <= value <= DS18B20_MAX_C:
             readings[i] = value
 
     return bus_idx, readings

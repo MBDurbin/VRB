@@ -34,6 +34,9 @@ from control_logic import (
     CSV_FILENAME,
     NEUTRAL_PACKET,
     coulomb_step,
+    expected_measurements,
+    measurement_problems,
+    check_measurements,
     compute_lap_physics,
     compute_required_power,
     compute_road_load_forces,
@@ -1455,3 +1458,121 @@ class TestResistorWrites:
         assert kill_load(_Port(raises=serial.SerialException())) is False
 
 
+# ================= MEASUREMENT INTEGRITY =================
+
+NAN = float('nan')
+
+
+def _expected():
+    cfg = RigConfig.defaults()          # RS50 12S4P, 6x8 sensors, 4 thermocouples
+    return expected_measurements(cfg.daq, cfg.pack)
+
+
+class TestMeasurementIntegrity:
+    """Readings must be numbers, believable, and all there before any trip
+    trusts them. NaN loses every comparison, so it used to pass every trip."""
+
+    def _packet(self, **kw):
+        d = {'max_temp': 30.0, 'amps': 50.0, 'voltage': 45.0,
+             'cell_voltages': [3.75] * 12, 'temp_age_s': 0.1, 'daq_age_s': 0.05,
+             'temp_sensor_ages_s': _fresh_sensor_ages(),
+             'resistor_temps': [40.0] * 4, 'resistor_temp_ages_s': [0.1] * 4,
+             'hardware_status': {'temp_arduino': True, 'ni_daq': True}}
+        d.update(kw)
+        return d
+
+    def test_healthy_packet_passes(self):
+        assert evaluate_safety(self._packet(), _limits(), expected=_expected()) == (False, None)
+
+    def test_nan_current_voltage_and_cells_fault(self):
+        # The review's first reproduction: this used to come back safe.
+        data = self._packet(amps=NAN, voltage=NAN, cell_voltages=[NAN] * 12)
+        assert evaluate_safety(data, _limits(), expected=_expected()) \
+            == (True, "INVALID READING")
+        # Needs no configuration to catch.
+        assert evaluate_safety(data, _limits()) == (True, "INVALID READING")
+
+    def test_one_of_everything_faults(self):
+        # The review's second: one cell, one sensor, one thermocouple.
+        data = self._packet(cell_voltages=[3.75], temp_sensor_ages_s=[[0.1]],
+                            resistor_temps=[40.0], resistor_temp_ages_s=[0.1])
+        assert evaluate_safety(data, _limits(), expected=_expected()) \
+            == (True, "INCOMPLETE DATA")
+        details = [d for _, d in measurement_problems(data, _expected())]
+        assert details == ["1 cell voltages reported, 12 wired",
+                           "1 temperature sensors reported, 48 wired",
+                           "1 resistor thermocouples reported, 4 wired"]
+
+    def test_each_non_finite_value_is_caught(self):
+        for kw in ({'amps': float('inf')}, {'voltage': None}, {'max_temp': NAN},
+                   {'cell_voltages': [3.75] * 11 + [NAN]},
+                   {'resistor_temps': [40.0, NAN, 40.0, 40.0]},
+                   {'resistor_temp_ages_s': [0.1, NAN, 0.1, 0.1]},
+                   {'temp_age_s': NAN}):
+            assert check_measurements(self._packet(**kw)) == (True, "INVALID READING"), kw
+
+    def test_never_read_is_not_invalid(self):
+        # inf ages and None bank temperatures mean "no reading yet"; their own
+        # checks fault on them by name.
+        data = self._packet(resistor_temps=[None, 40.0, 40.0, 40.0],
+                            resistor_temp_ages_s=[float('inf'), 0.1, 0.1, 0.1])
+        assert check_measurements(data, _expected()) == (False, None)
+        assert evaluate_safety(data, _limits(), expected=_expected()) \
+            == (True, "RESISTOR TC FAULT")
+
+    def test_readings_past_what_the_hardware_can_read(self):
+        # Each errs in the direction that hides a danger.
+        for kw in ({'amps': -50.0},                                  # transducer reversed
+                   {'voltage': 60.0},                                # above a full module
+                   {'cell_voltages': [3.75] * 11 + [5.2]},           # above a full cell
+                   {'max_temp': -127.0}):                            # sensor disconnected
+            assert check_measurements(self._packet(**kw), _expected()) \
+                == (True, "INVALID READING"), kw
+
+    def test_calibration_sized_errors_are_not_invalid(self):
+        for kw in ({'amps': -5.0}, {'voltage': 54.0},
+                   {'cell_voltages': [3.75] * 11 + [4.9]}):
+            assert check_measurements(self._packet(**kw), _expected()) == (False, None), kw
+
+    def test_short_counts_fault(self):
+        for kw in ({'cell_voltages': [3.75] * 11},
+                   {'temp_sensor_ages_s': _fresh_sensor_ages(per_bus=7)},
+                   {'resistor_temp_ages_s': [0.1] * 3}):
+            assert check_measurements(self._packet(**kw), _expected()) \
+                == (True, "INCOMPLETE DATA"), kw
+
+    def test_empty_arrays_keep_their_own_names(self):
+        data = self._packet(cell_voltages=[])
+        assert evaluate_safety(data, _limits(), expected=_expected()) == (True, "NO CELL DATA")
+
+    def test_applies_once_armed(self):
+        data = self._packet(amps=NAN, voltage=NAN)
+        assert evaluate_safety(data, _limits(), armed=False, expected=_expected()) \
+            == (False, None)
+
+    def test_ordering(self):
+        # A real over-current is reported first; a missing DAQ explains NaN-free
+        # zero readings ahead of this.
+        assert evaluate_safety(self._packet(amps=500.0, cell_voltages=[NAN] * 12),
+                               _limits(), expected=_expected()) == (True, "OVERCURRENT")
+        assert evaluate_safety(self._packet(voltage=NAN,
+                                            hardware_status={'temp_arduino': True}),
+                               _limits(), expected=_expected()) == (True, "NI-DAQ OFFLINE")
+        # A missing tap makes the module read low; the cause is named, not
+        # UNDERVOLTAGE.
+        assert evaluate_safety(self._packet(voltage=30.0, cell_voltages=[3.75] * 8),
+                               _limits(), expected=_expected()) == (True, "INCOMPLETE DATA")
+
+    def test_bad_config_gives_no_expectations(self):
+        cfg = RigConfig.defaults()
+        cfg.pack.series_count = "twelve"
+        assert expected_measurements(cfg.daq, cfg.pack) is None
+
+
+class TestCoulombCountSurvivesBadSamples:
+    def test_nan_current_is_skipped_not_absorbed(self):
+        remaining, soc = coulomb_step(NAN, 1.0, 10.0, 20.0)
+        assert remaining == 10.0 and soc == 50.0
+        # Before, remaining went NaN for good and SOC read 100%.
+        remaining, soc = coulomb_step(36.0, 100.0, remaining, 20.0)
+        assert math.isclose(remaining, 9.0) and math.isclose(soc, 45.0)

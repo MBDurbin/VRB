@@ -4,24 +4,34 @@ from multiprocessing import Queue
 
 import theme
 from queue_util import put_latest
+from rig_config import RigConfig
 
 
 class SILSimulatorWindow(QtWidgets.QWidget):
-    def __init__(self, telemetry_queue: Queue):
+    def __init__(self, telemetry_queue: Queue, config: RigConfig = None):
         super().__init__()
         self.telemetry_queue = telemetry_queue
 
         self.setWindowTitle("SIL Plant Model")
         self.resize(430, 380)
 
-        # Physics Constants for P45B 12S4P (Molicel INR-21700-P45B v1.2)
-        #   4.2 V/cell charge * 12S      = 50.4 V full
-        #   2.5 V/cell cutoff * 12S      = 30.0 V floor
-        #   15 mohm DC/cell / 4P * 12S   = 45 mohm pack IR
-        self.series_count = 12
-        self.pack_max_v = 50.4
-        self.pack_min_v = 30.0
-        self.pack_ir = 0.045
+        # The pack and wiring the rig is configured for, so desk tests of the
+        # current, sag and bank-power trips run against the installed cells. These
+        # were hardcoded for the Molicel P45B (45 mOhm pack) and stayed that way
+        # after the move to the RS50 (12 mOhm), so every sag figure was 3-4x the
+        # real one. Read once at startup; restart to pick up a new pack.
+        config = config if config is not None else RigConfig.load()
+        pack, daq = config.pack, config.daq
+        self.series_count = pack.series_count
+        self.pack_min_v = pack.min_voltage
+        self.pack_ir = pack.resistance_ohm
+        self.cell_min_v = pack.cell_min_voltage
+        self.cell_max_v = pack.cell_max_voltage
+        # The same layout the DAQ would publish, so the logic's count checks see
+        # a complete packet.
+        self.temp_buses = daq.temp_bus_count
+        self.sensors_per_bus = daq.sensors_per_bus
+        self.n_banks = len(daq.resistor_tc_channels)
 
         self.init_ui()
 
@@ -87,12 +97,15 @@ class SILSimulatorWindow(QtWidgets.QWidget):
         layout.addWidget(self.slider_res_temp)
 
         # Pack OCV Slider -- lets the operator walk the pack down to exercise the
-        # UNDERVOLTAGE trip. Without this the rig floors at 39.15 V (max sag at
-        # 250 A) and the trip can never be reached on a desk test.
-        self.lbl_ocv = self._slider_label("Pack OCV        4.20 V/cell  ·  50.4 V")
+        # UNDERVOLTAGE trip. Sag alone cannot reach it from a full pack: at the
+        # slider's 250 A a 12 mOhm module drops only 3 V. Cutoff to full charge.
+        top = int(round(self.cell_max_v * 100))
+        self.lbl_ocv = self._slider_label(
+            f"Pack OCV        {self.cell_max_v:.2f} V/cell  ·  "
+            f"{self.cell_max_v * self.series_count:.1f} V")
         self.slider_ocv = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.slider_ocv.setRange(250, 420)  # 2.50 to 4.20 V/cell (scaled by 100)
-        self.slider_ocv.setValue(420)
+        self.slider_ocv.setRange(int(round(self.cell_min_v * 100)), top)  # V/cell x 100
+        self.slider_ocv.setValue(top)
         self.slider_ocv.valueChanged.connect(
             lambda v: self.lbl_ocv.setText(
                 f"Pack OCV        {v / 100.0:.2f} V/cell  ·  "
@@ -116,11 +129,14 @@ class SILSimulatorWindow(QtWidgets.QWidget):
         # Calculate realistic voltage sag off the operator-set open-circuit voltage
         sim_ocv = (self.slider_ocv.value() / 100.0) * self.series_count
         sim_voltage = sim_ocv - (sim_amps * self.pack_ir)
-        sim_voltage = max(self.pack_min_v, sim_voltage)  # Hard floor at 2.5 V/cell
+        sim_voltage = max(self.pack_min_v, sim_voltage)  # Hard floor at the cell cutoff
 
         # Generate stable fake cell voltages
         fake_cells = [(sim_voltage / self.series_count)] * self.series_count
-        fake_temps = [[sim_temp] * 12 for _ in range(4)]
+        fake_temps = [[sim_temp] * self.sensors_per_bus for _ in range(self.temp_buses)]
+        # Bank 1 from its slider; any other thermocoupled banks at room temperature.
+        bank_temps = ([float(self.slider_res_temp.value())] + [30.0] * (self.n_banks - 1)
+                      if self.n_banks else [])
 
         hw_fault = self.chk_fault.isChecked()
 
@@ -135,8 +151,8 @@ class SILSimulatorWindow(QtWidgets.QWidget):
             # temp_arduino instead, which is what exercises the stale/lost checks.
             'temp_age_s': 0.0,
             'temp_sensor_ages_s': [[0.0] * len(bus) for bus in fake_temps],
-            'resistor_temps': [float(self.slider_res_temp.value()), 30.0, 30.0, 30.0],
-            'resistor_temp_ages_s': [0.0] * 4,
+            'resistor_temps': bank_temps,
+            'resistor_temp_ages_s': [0.0] * len(bank_temps),
             'hardware_status': {
                 'ni_daq': not hw_fault,
                 'temp_arduino': not hw_fault,

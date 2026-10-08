@@ -443,7 +443,7 @@ class ConfigDialog(QtWidgets.QDialog):
     def restore_defaults(self):
         confirm = QtWidgets.QMessageBox.question(
             self, "Restore defaults?",
-            "Reset the vehicle and pack to the shipped Molicel P45B 12S4P defaults?\n\n"
+            "Reset the vehicle and pack to the shipped Reliance RS50 12S4P defaults?\n\n"
             "This discards your car's parameters.",
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.No,
@@ -803,7 +803,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.resistor_map_window = None
 
         # Vehicle, pack and safety limits all come from rig_config.json, falling
-        # back to the P45B 12S4P defaults. Editable from the Configure dialog so
+        # back to the RS50 12S4P defaults. Editable from the Configure dialog so
         # a future team retargets the rig without touching source.
         self.config = RigConfig.load()
 

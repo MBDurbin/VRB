@@ -10,7 +10,7 @@ Design intent for inheriting teams:
   * Pack limits are DERIVED from per-cell datasheet values times the series and
     parallel counts. Enter the numbers off your cell's datasheet and the pack
     current, voltage and capacity limits follow automatically -- you should not
-    be hand-computing 180 A anywhere.
+    be hand-computing 280 A anywhere.
   * Safety limits may be overridden to be MORE conservative than the derived
     values, but the GUI warns when an override exceeds what the cells are rated
     for. Deriving is the default; overriding is a deliberate act.
@@ -221,8 +221,11 @@ VEHICLE_FIELD_LABELS = {
 class PackConfig:
     """Per-cell datasheet values plus pack topology. Pack limits derive from these.
 
-    Defaults describe the Reliance RS50 21700 5000mAh 70A in 12S4P, taken from Product
-    Data Sheet v1.2. Replace with your own cell's numbers.
+    Defaults describe the Reliance RS50 (21700, 5000 mAh, 70 A) in 12S4P, the
+    cell installed since it replaced the Molicel P45B. The capacity, voltage,
+    current and temperature figures are the supplier's listing (see
+    datasheets/README.md); the 2.5 V cutoff and 4.0 mOhm impedance are not on
+    it and still want a datasheet. Replace with your own cell's numbers.
 
     THE RULE FOR THIS CLASS: every field is a number you can read directly off a
     cell datasheet or count off the physical pack. Nothing here is calculated by
@@ -242,7 +245,7 @@ class PackConfig:
     series_count: int = 12
 
     # Cells in PARALLEL within each series group. Multiplies current capability
-    # and capacity but NOT voltage: 4P of a 45 A cell gives a 180 A module.
+    # and capacity but NOT voltage: 4P of a 70 A cell gives a 280 A module.
     parallel_count: int = 4
 
     # Modules wired in series to form the car's complete battery.
@@ -265,8 +268,8 @@ class PackConfig:
     cell_capacity_ah: float = 5.0           # typical; see usable_capacity_ah note
 
     # Guaranteed-minimum capacity of one cell -- the worst-case figure the
-    # manufacturer commits to. Lower than typical (4.3 vs 4.5 here, a 4.65%
-    # difference across the pack). Selecting this is the conservative choice
+    # manufacturer commits to. Lower than typical (4.95 vs 5.0 Ah here, 1%
+    # across the pack). Selecting this is the conservative choice
     # because overstating remaining charge is the dangerous direction.
     cell_capacity_min_ah: float = 4.95       # minimum / worst case
 
@@ -293,16 +296,19 @@ class PackConfig:
     cell_min_voltage: float = 2.5           # absolute discharge cutoff
 
     # Highest cell temperature permitted while discharging. Sets the over-temp
-    # trip. Note this is the OPERATING range from the datasheet, which is often
-    # lower than the cut-off temperature quoted alongside a current rating -- the
-    # P45B lists 60 C operating but an 80 C cut-off for its 45 A test, and 60 is
-    # the correct one to use here.
-    cell_max_temp_c: float = 80.0           # discharge operating ceiling
+    # trip. Use the datasheet's discharge OPERATING range where it gives one: it
+    # can be lower than the cut-off quoted beside a current rating. The old P45B
+    # listed 60 C operating but an 80 C cut-off for its 45 A test, and 60 was the
+    # right figure. The RS50 listing gives only its 70 A rating "with 80 C
+    # temperature cut-off", so 80 it is -- lower it if a datasheet gives a
+    # narrower discharge range.
+    cell_max_temp_c: float = 80.0           # discharge ceiling
 
     # DC internal resistance of one cell, in milliohms, measured at 50% state of
     # charge. Drives the sag calculations: series adds and parallel divides, so
-    # 15 mOhm in 12S4P gives a 45 mOhm module. This is why the undervoltage trip
-    # sits well above the absolute cutoff -- at 180 A this module sags over 8 V.
+    # 4 mOhm in 12S4P gives a 12 mOhm module, sagging 3.4 V at the 280 A rating.
+    # Not on the RS50 listing: an estimate until a datasheet or a bench
+    # measurement replaces it.
     cell_dc_milliohm: float = 4.0         # DC impedance at 50% SOC
 
     # Use minimum rather than typical capacity for SOC. Conservative: a worst-case
@@ -311,7 +317,7 @@ class PackConfig:
     # Ships False (typical) to match how the rig has been run to date. Setting it
     # True makes the state-of-charge readout pessimistic, which is the safer way
     # to be wrong. Note that NEITHER setting accounts for capacity falling at
-    # high discharge rates, which at this rig's 10 C draw is a further optimism.
+    # high discharge rates, which at this rig's ~10 C peak is a further optimism.
     use_minimum_capacity: bool = False
 
     # --- Derived pack values ---
@@ -420,7 +426,8 @@ class PackConfig:
 
     def sag_volts(self, current_a: float) -> float:
         """Voltage drop across pack internal resistance at a given current."""
-        # Ohm's law. At the 180 A limit with 45 mOhm this is 8.1 V, which is why
+        # Ohm's law. At the RS50 module's 280 A rating with 12 mOhm this is
+        # 3.4 V (the old P45B's 45 mOhm sagged 8.1 V at its 180 A), which is why
         # the undervoltage trip cannot sit at the cells' absolute cutoff.
         return current_a * self.resistance_ohm
 

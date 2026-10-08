@@ -20,6 +20,10 @@ All 48 tests must pass before starting. Then plug in the SIL dongle and:
 python main_v2.py
 ```
 
+The SIL plant models the pack and sensor layout in `rig_config.json`, so the
+figures below assume the shipped Reliance RS50 12S4P (12 mΩ module). On another
+pack, recompute the sag and trip currents from its resistance.
+
 Confirm the console prints `--> SIL KEY UNLOCKED on COMx` and both the SIL
 plant-model window and the main telemetry GUI appear.
 
@@ -39,13 +43,13 @@ plant-model window and the main telemetry GUI appear.
 
 | # | Step | Expected |
 |---|------|----------|
-| B1 | Raise temp slider past **Max Temp** (default 60 °C) | State goes `FAULT` (red), console logs `OVERTEMP ALARM!` |
+| B1 | Raise temp slider past **Max Temp** (default 80 °C, the RS50's cut-off) | State goes `FAULT` (red), console logs `OVERTEMP ALARM!` |
 | B2 | While in FAULT, lower temp back to 25 °C | State **stays** `FAULT` — must not self-clear |
 | B3 | Press **RESET** | Returns to `IDLE` |
-| B4 | Set **Max Amp** to 120 A, then raise current slider past 125 A (Max Amp + E-Stop Buffer) | `FAULT`, console logs `OVERCURRENT ALARM!`. The derived RS50 limit is 280 A, past the slider, and with **Bank at rated power only** ticked the bank's total power trip (B16) fires first at any limit above ~190 A. Unticked (140%) that trip is past the slider |
+| B4 | Set **Max Amp** to 120 A, then raise current slider past 125 A (Max Amp + E-Stop Buffer) | `FAULT`, console logs `OVERCURRENT ALARM!`. The derived RS50 limit is 280 A, past the slider, and the bank's total power trip (B16) fires first at any limit above ~230 A (~160 A with **Bank at rated power only** ticked) |
 | B5 | RESET, then press **E-STOP** with no fault present | Immediately `FAULT` regardless of prior state |
 | B6 | RESET, then drag SIL **Pack OCV** down to 3.00 V/cell | `FAULT`, console logs `UNDERVOLTAGE ALARM!` |
-| B7 | RESET, set OCV to 3.20 V/cell, then raise current to ~150 A | `FAULT` on sag alone — pack reads 31.65 V under load despite 38.4 V at rest |
+| B7 | RESET, set OCV to 3.05 V/cell, then raise current to ~100 A | `FAULT` on sag alone — pack reads 35.4 V under load despite 36.6 V at rest (12 mΩ RS50 module) |
 | B8 | With all three faults possible at once (hot + high amps + low OCV) | Console reports `OVERTEMP` — priority is temp > current > bank power > voltage |
 | B9 | RESET, ARM, then tick **Simulate hardware interlock fault** | `FAULT` logging `NI-DAQ OFFLINE` — the toggle drops the NI-DAQ and the temperature link together, and the DAQ is reported first because its 0.0 V would otherwise read as undervoltage |
 | B10 | Untick the fault, RESET, stay in `IDLE`, tick it again | **No** fault — sensor checks apply only in ARMED/RUNNING, so the rig can still be brought up |
@@ -54,8 +58,8 @@ plant-model window and the main telemetry GUI appear.
 | B13 | From B12, press **ARM** | `FAULT` — arming on a 0.0 V reading must not be silently permitted |
 | B14 | ARM+RUN, then close the SIL window so the plant stops feeding | `FAULT` logging `DAQ DATA STALE` within ~1 s, and the GUI keeps updating rather than freezing |
 | B15 | Repeat B14 but press **E-STOP** while the plant is stopped | E-STOP is still processed — the logic loop no longer skips its body on an empty queue |
-| B16 | RESET, tick **Bank at rated power only**, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~192 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 8000 W)` once V × I passes 8 kW, in `IDLE` as well. Console logs `bank power 100% of rating` when the box is ticked. No Max Amp setting moves this trip. 2000 A is past the cells' rating, so `WILL NOT ARM: Over-current trip ...` shows beside the pills until Max Amp is set back |
-| B16a | Untick **Bank at rated power only**, RESET, drag current to the slider's 250 A | **No** fault: the trip is now 11.2 kW (140%), and the plant tops out near 9.8 kW. Console logs `bank power 140% of rating` |
+| B16 | RESET, tick **Bank at rated power only**, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~165 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 8000 W)` once V × I passes 8 kW, in `IDLE` as well. Console logs `bank power 100% of rating` when the box is ticked. No Max Amp setting moves this trip. 2000 A is past the cells' rating, so `WILL NOT ARM: Over-current trip ...` shows beside the pills until Max Amp is set back |
+| B16a | Untick **Bank at rated power only**, RESET, raise current past ~236 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 11200 W)` once V × I passes 11.2 kW (140%). Console logs `bank power 140% of rating` |
 | B17 | RESET, ARM, drag SIL **Bank 1 resistor** past 225 °C | `FAULT` logging `RESISTOR OVERTEMP` and `Bank 1 at ... C (trip 225 C)`. Fires in `IDLE` as well |
 | B18 | Open **Resistor Map** while dragging the Bank 1 slider | Bank 1's four top-row elements recolour toward red as they near 225 °C; banks 5–8 read `NO SENSOR` |
 | B19 | RESET, tick **Simulate hardware interlock fault** in `IDLE`, press **ARM** | ARM **refused**: state stays `IDLE` (no FAULT, nothing to reset), console logs `Cannot ARM: NI-DAQ OFFLINE`, and `WILL NOT ARM: NI-DAQ OFFLINE` shows in red beside the hardware pills. Untick, press ARM again: `ARMED` |
@@ -165,9 +169,10 @@ loop takes ahead of every queued command. Covered by `TestEstopSignal` and
 `V Warn` and `V Crit` were wired only to the dashed lines on the voltage plot and
 were never placed in `limits_dict`, so they never reached the logic process.
 `check_safety_trip` only ever saw temperature and current — nothing stopped a
-discharge below the P45B's 2.5 V/cell cutoff. `V Crit` now trips a genuine
-UNDERVOLTAGE fault (default 36.0 V = 3.0 V/cell, leaving room for the 8.1 V sag
-that 45 mohm pack IR produces at 180 A). `V Warn` remains display-only and its
+discharge below the cells' 2.5 V/cell cutoff. `V Crit` now trips a genuine
+UNDERVOLTAGE fault (default 36.0 V = 3.0 V/cell, leaving room for sag: 3.4 V
+for the RS50 module's 12 mΩ at its 280 A rating, and 8.1 V for the 45 mΩ Molicel
+P45B this was first written for). `V Warn` remains display-only and its
 label now says so.
 
 ### Residual limitation (by design, verify behavior in D3)

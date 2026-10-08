@@ -29,7 +29,7 @@
   },
   "limits": {
     "derive_from_pack": true,
-    "max_amps": 180.0,
+    "max_amps": 275.0,
     "amp_buffer": 5.0,
     "max_temp": 80.0,
     "min_volts": 36.0,

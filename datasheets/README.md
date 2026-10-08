@@ -2,13 +2,54 @@
 
 Source documents for the numbers the rig's safety limits are built from. Kept
 here so an inheriting team can verify every derived limit without hunting for
-the right revision — and revision matters, because these values were checked
-against **v1.2** specifically.
+the right revision.
 
-## INR-21700-P45B_v1.2.pdf
+## Reliance RS50 — the installed cell (no datasheet here yet)
 
-Molicel INR-21700-P45B, Product Data Sheet version 1.2. The cell used in the
-module under test (12S4P, 48 cells per module).
+Reliance RS50, 21700, 5000 mAh, 70 A, flat top. The cell in the module under
+test (12S4P, 48 cells per module) since it replaced the Molicel P45B below.
+
+**There is no RS50 datasheet in this folder.** The figures come from the
+supplier's product listing: liionwholesale.com, "Reliance RS50 70A 5000mAh Flat
+Top 21700". If a manufacturer datasheet turns up, add it here and check the two
+flagged rows against it.
+
+| Listing value | `PackConfig` field | Derived module figure (12S4P) |
+|---|---|---|
+| Nominal capacity 5000 mAh | `cell_capacity_ah = 5.0` | 20.0 Ah (× 4P) |
+| Minimum capacity 4950 mAh (0.2 C) | `cell_capacity_min_ah = 4.95` | 19.8 Ah (× 4P) |
+| Max continuous discharge 70 A, "with 80 °C temperature cut-off" | `cell_max_continuous_a = 70` | **280 A** (× 4P) |
+| Peak voltage 4.2 V | `cell_max_voltage = 4.2` | 50.4 V module, ~454 V battery |
+| Nominal voltage 3.6 V | `cell_nominal_voltage = 3.6` | 43.2 V module |
+| 80 °C cut-off (the only temperature given) | `cell_max_temp_c = 80.0` | 80 °C over-temp trip |
+| **Not listed** — discharge cutoff | `cell_min_voltage = 2.5` | 30.0 V absolute floor |
+| **Not listed** — DC impedance | `cell_dc_milliohm = 4.0` | 12 mΩ module (÷4P × 12S) |
+| Max charge 15 A, standard 8 A | — | unused: the rig never charges |
+
+**The two unlisted rows are working values, not sourced ones.** 2.5 V is the
+usual cutoff for this class of cell; 4 mΩ is an estimate. The cutoff feeds the
+undervoltage trips (30 V floor, 36 V module trip, 2.70 V per cell), so it is the
+one that matters most to confirm. The impedance only feeds sag estimates and the
+SIL plant; measuring a module's sag under a known load would settle it.
+
+**80 °C is the right trip here, unlike on the P45B.** The P45B quoted an 80 °C
+cut-off for its current *test* but a 60 °C discharge operating range, and the
+rig used 60. The RS50 listing gives no separate operating range, so the trip
+sits at the 80 °C attached to the 70 A rating. Lower it if a datasheet gives a
+narrower range.
+
+**The buffer comes out of the rating.** The over-current trip fires at
+`max_amps + amp_buffer`, so derivation sets `max_amps = 280 − 5 = 275 A`, putting
+the trip exactly on 280 A. With these cells the ladder's 0.25 Ω bottom step caps a
+full module at about 202 A anyway, so the bank's power ratings bind first; see
+"What bounds the load" in `PROJECT_CONTEXT.md`.
+
+## INR-21700-P45B_v1.2.pdf — the previous cell
+
+Molicel INR-21700-P45B, Product Data Sheet version 1.2. The cell the modules were
+first built with, replaced by the RS50 above. Kept because its section below
+records how each datasheet figure was read, and some tests pin the derivation
+math to its published values.
 
 Redistributed here as a manufacturer datasheet. Copyright remains E-One Moli
 Energy Corp.; this copy is included for reference by people working on this rig.
@@ -106,42 +147,34 @@ element that is on its own:
 
 | Bank state | Current | Dissipated in the 0.25 Ω step |
 |---|---|---|
-| 0.278 Ω (at the 180 A limit) | 180 A | ~9.0 kW |
-| 0.25 Ω (bank minimum) | 200 A | ~10 kW |
+| 0.25 Ω at a 44.7 V module | 179 A | 8.0 kW (its rating) |
+| 0.25 Ω at a full 50.4 V RS50 module | 202 A | ~10.2 kW (127%) |
 
-That is the peak duty in the whole system, and it lands on one step.
+That is the peak duty in the whole system, and it lands on one step. The step
+is bank 1: four 1 Ω TE2000 elements in parallel, so each carries a quarter of
+the power and sees the whole module voltage. At a full module that is 2.54 kW and
+50.4 V per element, against 2 kW and an RCWV of √(2000 × 1) = 44.7 V. RCWV is
+just the voltage at rated power, so it is the same overload, not a second one.
+The bank's composition is now recorded in `docs/hardware_topology.md`.
 
-**Two things to verify against the physical build**, which cannot be settled
-from the datasheet alone because it covers a series rather than the specific
-parts installed:
+### How the software uses it
 
-1. **Dissipation.** ~9 kW through the 0.25 Ω step exceeds the 2500 W free-air
-   ceiling of even the largest part in this series by roughly 3.6×. That is not
-   necessarily wrong — forced air raises it, the peak is transient rather than
-   continuous, and the step may be several elements sharing the load — but the
-   margin should be confirmed rather than assumed.
-2. **RCWV.** At 0.25 Ω, √(P × R) gives 25.0 V even for a 2500 W part, against
-   the ~50 V the module puts across the bank at minimum resistance. If that step
-   is a single element, it is above its rated continuous working voltage.
+The bank now has protection of its own, separate from the cell trips:
 
-Both hinge on how many physical resistors make up each ladder step and how they
-are wired, which is not recorded anywhere in this repo. **Worth writing down.**
-
-### Not yet used by the software
-
-Nothing in the control logic models resistor temperature or power. Every trip
-protects the *cells* — over-temp, over-current, undervoltage. The bank itself
-has no thermal protection in software; it relies on the airflow analysis being
-right and on the cell-side current limit indirectly bounding dissipation.
-
-`rig_config.py` carries a note that resistor temperature sensors are planned.
-When they are added, **155 °C is the number from this datasheet** — the
-operating ceiling — and it will need its own limit field and trip, separate from
-`max_temp`, which is a cell figure and sits at 60 °C.
+- **Power.** Every setting is checked against the 8 kW ladder total and each
+  bank's own rating, and so is the measured power; the software allows 140% of
+  them by default, 100% with *Bank at rated power only* ticked. See "The bank's
+  power ratings" in `docs/hardware_topology.md`.
+- **Temperature.** Thermocouples on banks 1–4 trip at 225 °C for the TE banks.
+  **155 °C in this datasheet is an ambient limit**, not the element's: the
+  element is conventionally limited to 275 °C, where the derating curve on page 3
+  reaches zero load, and the 225 °C trip leaves 50 K under that. Bank 4's 150 °C
+  trip is a placeholder for a part with no datasheet here.
 
 ## Adding another datasheet
 
-If the cell changes, add the new PDF here with its revision in the filename, add
-a section above mapping its values to `PackConfig` fields, and update the
-defaults in `rig_config.py`. The pack limits will follow automatically — that is
+If the cell changes, add the new PDF here with its revision in the filename (or,
+as with the RS50, record where the figures came from if there is no PDF), add a
+section above mapping its values to `PackConfig` fields, and update the defaults
+in `rig_config.py` and the values in `rig_config.json`. The pack limits will follow automatically — that is
 the whole point of deriving them rather than typing them in.

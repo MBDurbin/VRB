@@ -14,27 +14,32 @@ car's battery.
 ## Battery
 
 The car's battery is **9 modules in series**. Each module is **12S4P** — 12 cells
-in series, 4 in parallel — of Molicel INR-21700-P45B, obtained through a Tesla
-scholarship.
+in series, 4 in parallel — of **Reliance RS50** (21700, 5000 mAh, 70 A). The
+modules were first built with Molicel INR-21700-P45B, obtained through a Tesla
+scholarship; the RS50 replaced it.
 
 **The bench loads one module.** See the Battery topology section of
 `PROJECT_CONTEXT.md` for why that distinction governs the physics, and
-`datasheets/` for the cell datasheet the limits derive from.
+`datasheets/README.md` for where each cell figure comes from.
 
 | Per module | Value |
 |---|---|
-| Continuous discharge current | 180 A |
+| Continuous discharge current | 280 A (70 A × 4P) |
+| Capacity | 20.0 Ah (19.8 Ah minimum) |
 | Charge voltage | 50.4 V |
 | Nominal voltage | 43.2 V |
-| Discharge cutoff | 30.0 V |
-| Internal resistance | 0.045 Ω |
+| Discharge cutoff | 30.0 V (2.5 V/cell; not on the RS50 listing — confirm) |
+| Internal resistance | 0.012 Ω (4 mΩ/cell; an estimate — confirm) |
+| Discharge temperature limit | 80 °C |
 
 ---
 
 ## Resistor bank
 
-Eight banks give the ladder its binary resistance. **Maximum energy dissipation
-is 8 kW.**
+Eight banks give the ladder its binary resistance. **Rated dissipation is 8 kW**
+(bank 1's four 2 kW elements), and every bank has its own rating below. The
+software holds the ladder and each bank to 140% of these by default, or 100%
+with *Bank at rated power only* ticked — see "The bank's power ratings" below.
 
 | Bank | Resistance | Built from | Part | Capacity |
 |---|---|---|---|---|
@@ -58,19 +63,22 @@ The TE parts are covered by
 
 Minimum resistance means maximum current, and at minimum resistance only bank 1
 is in circuit — so it absorbs the entire load. Its four parallel elements share
-the current:
+the current, and each sees the whole module voltage:
 
-| Bank current | Per resistor | Per resistor power | vs 2000 W rating | Bank voltage vs 44.7 V RCWV |
-|---|---|---|---|---|
-| 160 A | 40.0 A | 1600 W | −20% | 40.0 V (−10.6%) |
-| **180 A** (trip) | 45.0 A | **2025 W** | **+1.2%** | **45.0 V (+0.6%)** |
-| 200 A (0.25 Ω floor) | 50.0 A | 2500 W | +25% | 50.0 V (+11.8%) |
+| Module voltage | Bank current | Per resistor | Per resistor power | vs 2000 W rating | vs 44.7 V RCWV |
+|---|---|---|---|---|---|
+| 40.0 V | 160 A | 40.0 A | 1600 W | −20% | −10.6% |
+| 44.7 V | 179 A | 44.7 A | 2000 W | 0% | 0% |
+| **50.4 V** (full RS50 module) | **202 A** | 50.4 A | **2540 W** | **+27%** | **+12.7%** |
 
-At the over-current trip the design sits roughly **1% over** the elements' free-air
-rating and their rated continuous working voltage (RCWV = √(P × R) = 44.72 V for
-a 2 kW 1 Ω part). Forced air raises the usable power well above the free-air
-figure, so this is tight rather than wrong — but it is tight, and it is why the
-fan is not optional.
+**The ladder, not the cells, caps the current.** With the RS50's 280 A rating, the
+0.25 Ω bottom step limits a full module to about 202 A, so the over-current trip
+is a backstop for a fault (a shorted ladder, say) rather than a limit the rig
+reaches in use. What bounds the load is the bank: at a full module bank 1 runs at
+127% of its elements' rating, which is why the default bank setting is 140% (see
+"The bank's power ratings" below), why it leans on the thermocouple trips, and
+why the fan is not optional. RCWV = √(P × R) is the voltage at rated power, so
+it is exceeded by the same overload rather than being a separate limit.
 
 ---
 
@@ -197,8 +205,9 @@ order (`MIDDLE_ROW_BANKS` and `FLAT_BAR_BANKS` in `gui_layout.py`).
 
 **3. The bank's power ratings — now enforced in software, per bank.** The
 current limit derives from the cells alone. With the Reliance RS50 cells (70 A
-each) it works out to 275 A, about 14 kW at 50 V, so the cell limit can no
-longer protect the bank. Two ratings apply, both code constants in
+each) it works out to a 275 A operating limit and a 280 A trip, about 14 kW at
+50 V, so the cell limit can no longer protect the bank. Two ratings apply, both
+code constants in
 `control_logic.py` rather than `rig_config` fields:
 
 - **The ladder total**, `VRB_MAX_POWER_W = 8000`.

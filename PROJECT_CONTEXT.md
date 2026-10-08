@@ -4,8 +4,8 @@ Self-contained summary of the system, its validated constants, and its open
 questions. Written to be dropped into a Claude Project (or read cold by anyone
 new to the repo).
 
-Last updated: 2026-07-25. Reflects `master` through the cell-level and
-sensor-integrity safety work.
+Last updated: 2026-10-08. Reflects the move to Reliance RS50 cells and the
+October 2026 safety-review fixes.
 
 ---
 
@@ -96,8 +96,9 @@ the configuration has ARM blockers (see Retargeting below).
 
 ## Hardware
 
-- **Module under test**: 12S4P Molicel INR-21700-P45B, 48 cells, ~50 V. This is
-  what the bench actually loads.
+- **Module under test**: 12S4P Reliance RS50 (21700, 5000 mAh, 70 A), 48 cells,
+  ~50 V, 280 A. This is what the bench actually loads. It replaced the Molicel
+  INR-21700-P45B the modules were first built with; see Cell constants below.
 - **Car's battery** (reference only): 9 modules in series, 432 cells, ~450 V.
 - **Resistor bank**: binary ladder of 8 relay-switched steps —
   0.25, 0.5, 1, 2, 4, 8, 16, 32 Ω. 0.25 Ω resolution, 63.75 Ω total, 255 steps
@@ -160,7 +161,7 @@ Nothing below requires editing Python.
 The dialog has two tabs. **Vehicle** describes the car — mass, aero, tyres,
 drivetrain. **Battery Pack** takes the numbers straight off your cell's
 datasheet plus your series/parallel counts. Pack limits are *derived* from those
-values, so entering `45 A` continuous and `4P` produces a 180 A pack rating
+values, so entering `70 A` continuous and `4P` produces a 280 A pack rating
 automatically; you should never be hand-computing a pack limit.
 
 A live panel shows the derived pack figures and the resulting trip points as you
@@ -170,10 +171,11 @@ restarts and travel with the repo.
 
 One safety rule is enforced in the derivation: **the E-STOP fires at
 `max_amps + amp_buffer`, so the buffer is taken out of the cell rating, not
-added on top of it.** With a 180 A pack and a 5 A buffer the operating limit
-derives to 175 A and the trip lands exactly on 180 A. Deriving the limit as the
-raw rating would put the real trip at 185 A — above the cells — which is exactly
-the bug that shipped originally as 182 A / 187 A.
+added on top of it.** With the RS50's 280 A pack and a 5 A buffer the operating
+limit derives to 275 A and the trip lands exactly on 280 A. Deriving the limit
+as the raw rating would put the real trip at 285 A — above the cells — which is
+exactly the bug that shipped originally, on the P45B's 180 A pack, as
+182 A / 187 A.
 
 Hand-editing a threshold in the sidebar that derivation computes (V crit, cell
 min, max current, max temp, derate start) sets `derive_from_pack = False`, so
@@ -308,29 +310,64 @@ acceleration. At 10 m/s and a = +8 m/s² that moves the bank from 6.73 Ω to
 6.10 Ω — roughly two 0.25 Ω steps, so it is resolvable by the hardware rather
 than lost in quantisation.
 
-## Datasheet-validated constants
+## Cell constants — Reliance RS50
 
-All verified against the **Molicel INR-21700-P45B Product Data Sheet v1.2** for
-the 12S4P configuration.
+The module has been **Reliance RS50** since it replaced the Molicel
+INR-21700-P45B. The figures come from the supplier's listing (liionwholesale.com,
+"Reliance RS50 70A 5000mAh Flat Top 21700"); there is no RS50 datasheet in the
+repo yet. Two figures the rig needs are **not on that listing** and are flagged
+below. The P45B's datasheet stays in `datasheets/` for reference: some tests pin
+the derivation math to its published figures.
 
-| Quantity | Value | Derivation |
-|---|---|---|
-| Pack capacity | 18.0 Ah | 4500 mAh typical × 4P |
-| Pack full charge | 50.4 V | 4.2 V/cell × 12S |
-| Pack cutoff (absolute) | 30.0 V | 2.5 V/cell × 12S |
-| Pack nominal | 43.2 V | 3.6 V/cell × 12S |
-| Pack DC internal resistance | 45 mΩ | 15 mΩ/cell @50%SOC ÷ 4P × 12S |
-| Max continuous current | 180 A | 45 A/cell × 4P |
-| Discharge temperature ceiling | 60 °C | datasheet discharge range −40 to 60 °C |
-| Undervoltage trip default | 36.0 V | 3.0 V/cell — above the 30.0 V floor, leaving room for IR sag |
-| Pack energy | 777.6 Wh | 16.2 Wh × 48 |
+| Quantity | Cell | 12S4P module | Source |
+|---|---|---|---|
+| Capacity | 5000 mAh typical, 4950 mAh min (0.2 C) | 20.0 Ah (19.8 Ah min) | listing |
+| Full charge | 4.2 V | 50.4 V | listing ("peak voltage") |
+| Nominal | 3.6 V | 43.2 V | listing |
+| Max continuous discharge | 70 A "with 80 °C temperature cut-off" | **280 A** | listing |
+| Discharge temperature limit | 80 °C | 80 °C over-temp trip | listing (its only temperature figure) |
+| Discharge cutoff | 2.5 V | 30.0 V absolute floor | **not on the listing** — usual for the class; confirm |
+| DC internal resistance | 4 mΩ | 12 mΩ | **not on the listing** — an estimate; confirm or measure |
+| Energy | 18 Wh | 864 Wh | 5.0 Ah × 3.6 V |
+| Charge current | 15 A max, 8 A standard | — | listing; the rig never charges |
 
-**Why the undervoltage trip sits at 36.0 V and not 30.0 V:** 45 mΩ of pack IR
-sags 8.1 V at 180 A. A pack resting at a healthy-looking 3.2 V/cell (38.4 V)
-reads **2.499 V/cell under load** — through the cell cutoff. The trip threshold
-has to leave room for sag or it only fires after damage.
+Pack derivation (`derive_from_pack: true`) turns these into the trips: 275 A
+operating current and a 280 A over-current trip, 80 °C max temp, 36.0 V module
+undervoltage (3.0 V/cell), 2.70 V per cell, and a 38.0 V warning line.
 
-At 180 A the pack is at a **10 C** discharge rate.
+**80 °C is the right trip for this cell.** The P45B needed care here: its 45 A
+rating carried an 80 °C *test* cut-off while its discharge operating range
+stopped at 60 °C, so the rig used 60. The RS50 listing gives only the 80 °C
+cut-off with its 70 A rating and no separate operating range, so the rig trips at
+80. Lower `cell_max_temp_c` if an RS50 datasheet gives a narrower discharge range.
+
+**Why the undervoltage trip sits at 36.0 V and not 30.0 V:** headroom for sag.
+The RS50 module's 12 mΩ sags 3.4 V at its 280 A rating, about 2.4 V at the
+~200 A the ladder can actually draw. The 3.0 V/cell figure came from the P45B,
+whose 45 mΩ sagged 8.1 V at 180 A; it still leaves the RS50 well clear of its
+cutoff.
+
+`rig_config.json` used to say `max_amps: 180`, the P45B's figure. With
+`derive_from_pack: true` it was replaced by the RS50's 275 A on every load, behind
+a "hand-edited limits were replaced" dialog, so 275 A was already in force. The
+file now says 275.
+
+### What bounds the load: battery current and bank power
+
+Two independent limits, each enforced on what is commanded and again as a trip:
+
+| Limit | On the command | As a trip | Can configuration raise it? |
+|---|---|---|---|
+| **Battery current** — 280 A for the RS50 module (70 A × 4P) | Resistance never below V ÷ 275 A, rounded up a step | Over-current at 275 + 5 = 280 A, in any state | No: a trip above the pack rating blocks ARM |
+| **Bank power** — 8 kW ladder total and each bank's own rating (`BANK_RATED_POWER_W`) | Every setting checked against both at worst-case tolerance; one that fails moves to the nearest that passes | Ladder V × I in any state; each bank's share once a setting has settled | Only between 100% and 140% (the sidebar switch) |
+
+**With the RS50 the bank binds first.** The 0.25 Ω bottom step limits a full
+50.4 V module to about 202 A, under the cells' 280 A, so the over-current trip is
+a backstop for a fault such as a shorted ladder rather than a limit the rig
+reaches in use. At full charge the heaviest load is 0.25 Ω and ~10.2 kW with the
+default 140% bank setting; held to rated power, it is 0.75 Ω and ~3.4 kW above
+43.6 V. `tests/test_shipped_limits.py` runs every setting the shipped config can
+command, across the charge range and at both bank settings, against both limits.
 
 ## Battery topology — read this before touching the physics
 
@@ -342,8 +379,8 @@ mistake in this codebase has come from conflating the two.
 - The DAQ reads taps on **one** module, and the resistor bank is wired across
   **that one module only**. So `voltage` in the telemetry packet is ~50 V, and
   the bank never sees 450 V.
-- Series modules all carry the same current, so **180 A is simultaneously the
-  per-module limit and the whole-battery limit**. Current limits do not scale
+- Series modules all carry the same current, so **the RS50 module's 280 A is
+  simultaneously the per-module limit and the whole-battery limit**. Current limits do not scale
   with module count.
 
 The lap physics computes power for the **whole car**, drawn from the 450 V
@@ -492,7 +529,7 @@ and shutdown hygiene. Requires the SIL dongle; no battery or DAQ needed.
 | GUI buttons used blocking `.put()` on a bounded queue | A full queue froze the UI including E-STOP |
 | Derate divided by `(max_safe_temp - derate_start_temp)` unguarded | `ZeroDivisionError` crashed the safety-critical process on misconfigured thresholds |
 | **No undervoltage protection existed** | `V Warn`/`V Crit` only moved dashed lines on the plot; they were never sent to the logic process. Nothing prevented discharge past the 2.5 V/cell cutoff |
-| Current limit 182 A, temp limit 65 °C | Both exceeded datasheet ratings (180 A / 60 °C). E-STOP only fired at 187 A = 46.75 A/cell, 3.89 % over rated |
+| Current limit 182 A, temp limit 65 °C (P45B pack) | Both exceeded datasheet ratings (180 A / 60 °C). E-STOP only fired at 187 A = 46.75 A/cell, 3.89 % over rated |
 
 ## Open questions and known gaps
 
@@ -506,12 +543,11 @@ reset in the GUI, that is a deliberate affordance someone should add; silently
 doing it on every `RUN` was not.
 
 **1. SOC reads optimistically high.** `coulomb_step` integrates against a fixed
-18.0 Ah nameplate figure. Two problems: it uses *typical* capacity (4500 mAh)
-rather than *minimum* (4300 mAh, → 17.2 Ah), overstating by up to 4.65 %; and it
-ignores rate dependence, though 180 A is a 10 C discharge where real deliverable
-capacity is meaningfully lower. Quantifying the second needs the datasheet's
-Discharge Rate Characteristics curve, which is a plotted graph — the values have
-to be read off by eye.
+20.0 Ah nameplate figure. Two problems: it uses *typical* capacity (5000 mAh)
+rather than *minimum* (4950 mAh, → 19.8 Ah), overstating by up to 1 %; and it
+ignores rate dependence, though the ~200 A the ladder can draw is a 10 C
+discharge where real deliverable capacity is meaningfully lower. Quantifying the
+second needs a discharge-rate curve, and the RS50 listing has none.
 
 **2. The regen branch of the power model is currently inert.**
 `compute_target_resistance()` maps any `req_power <= 0` to `MAX_RESISTANCE`, so

@@ -1119,7 +1119,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                   "controller; its watchdog sheds the load 2 s after the last one did.")
 
     # All limits, the pack spec and the vehicle model come from rig_config.json
-    # (falling back to the P45B 12S4P defaults). Nothing here is hardcoded, so a
+    # (falling back to the RS50 12S4P defaults). Nothing here is hardcoded, so a
     # future team retargets the rig from the GUI rather than from source.
     config = RigConfig.load()
     pack = config.pack

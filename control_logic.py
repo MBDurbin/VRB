@@ -12,6 +12,7 @@ from queue import Empty
 # place. Re-exported here because callers and tests import it from this module.
 from rig_config import RigConfig, VehicleParams, PackConfig, SafetyLimits  # noqa: F401
 from rig_config import arm_blockers
+from queue_util import put_latest
 
 # ================= CONFIGURATION =================
 RESISTOR_BAUD_RATE = 9600
@@ -1324,9 +1325,9 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         data['hardware_status']['res_arduino'] = (res_ser is not None)
         data['arm_refusals'] = arm_refusals(data['hardware_status'], config_problems)
 
-        if telemetry_queue.full():
-            telemetry_queue.get()
-        telemetry_queue.put(data)
+        # Never blocks: a blocking get or put here would stall every trip, the
+        # E-STOP and the heartbeat behind the GUI's queue. See put_latest().
+        put_latest(telemetry_queue, data)
 
     # Take the handle out of the slot before closing it, so a discovery sweep
     # that finishes during shutdown cannot hand back a port we are tearing down.

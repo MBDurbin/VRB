@@ -30,6 +30,7 @@ temperatures are edited in the file itself.
 | `gui_layout.py`, `theme.py` | The PyQt6 interface. |
 | `sil_simulator.py` | Desk-test plant model that stands in for the DAQ. |
 | `rig_config.py`, `rig_config.json` | All configuration, and the file it is saved to. |
+| `queue_util.py` | `put_latest()`: publishes DAQ packets and telemetry onto the bounded queues without ever blocking. |
 | `profiles/` | Lap speed profiles (CSV). The GUI's **Load CSV** dialog opens here. |
 | `logs/` | Recordings from the GUI's **Record** button. Not tracked by git. |
 | `tools/` | Bench and desk tools, run by hand: see below. |

@@ -1,9 +1,9 @@
 import time
-from queue import Empty
 from PyQt6 import QtWidgets, QtCore
 from multiprocessing import Queue
 
 import theme
+from queue_util import put_latest
 
 
 class SILSimulatorWindow(QtWidgets.QWidget):
@@ -144,12 +144,6 @@ class SILSimulatorWindow(QtWidgets.QWidget):
             }
         }
 
-        # Overwrite queue to keep it fresh. The queue can empty between the
-        # full() check and the get(), so Empty is expected here -- but catch it
-        # by name rather than bare, which would also swallow KeyboardInterrupt.
-        if self.telemetry_queue.full():
-            try:
-                self.telemetry_queue.get_nowait()
-            except Empty:
-                pass
-        self.telemetry_queue.put(fake_data)
+        # Newest packet wins, and never blocks the Qt thread: the put() that was
+        # here could wait on a queue the logic process had not yet drained.
+        put_latest(self.telemetry_queue, fake_data)

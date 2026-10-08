@@ -309,3 +309,22 @@ def test_estop_gets_through_a_jammed_command_queue(rig, capsys):
     assert b"KILL\n" in rig.resistor.written()[before:]
     assert not rig.estop.is_set()           # taken, so one press acts once
     assert capsys.readouterr().out.count("EMERGENCY STOP triggered via GUI.") == 1
+
+
+class DrainedBeforeGet(queue.Queue):
+    """Reports full, as it was a moment ago, though the GUI has since emptied
+    it: the race between full() and a blocking get()."""
+    def full(self):
+        return True
+
+
+def test_loop_keeps_running_when_the_gui_drains_telemetry_mid_publish(rig):
+    # The old `if full(): get()` waited forever on this queue, freezing every
+    # trip, the E-STOP and the heartbeat. Nothing past the first packet ran.
+    rig.tel_q = DrainedBeforeGet(maxsize=50)
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put("ARM")
+    rig.wait_for("ARMED")
+    rig.estop.set()
+    rig.wait_for("FAULT")

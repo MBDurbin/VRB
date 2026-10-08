@@ -8,6 +8,7 @@ import threading
 from multiprocessing import Queue, Event
 
 from rig_config import RigConfig
+from queue_util import put_latest
 
 # ================= CONFIGURATION =================
 # Channel mapping, scaling and sensor layout all come from rig_config.json --
@@ -415,9 +416,10 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 }
             }
 
-            if telemetry_queue.full():
-                telemetry_queue.get()
-            telemetry_queue.put(data_packet)
+            # Never blocks; see put_latest(). A blocking get here could wait
+            # forever once the logic process drained the queue, and the DAQ
+            # would stop publishing altogether.
+            put_latest(telemetry_queue, data_packet)
 
             elapsed = time.time() - loop_start
             if elapsed < daq_cfg.sample_period_s:

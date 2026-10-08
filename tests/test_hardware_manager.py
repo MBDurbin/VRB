@@ -213,12 +213,12 @@ class TestNoNiDaq:
     from a real one.
     """
 
-    def _collect(self, monkeypatch, task_factory, seconds=1.2):
+    def _collect(self, monkeypatch, task_factory, seconds=1.2, packets=None):
         monkeypatch.setattr(hardware_manager.serial.tools.list_ports, "comports", lambda: [])
         monkeypatch.setattr(hardware_manager.nidaqmx, "Task", task_factory)
 
         config = RigConfig.defaults()
-        packets = queue.Queue(maxsize=1000)
+        packets = packets if packets is not None else queue.Queue(maxsize=1000)
         stop = threading.Event()
         worker = threading.Thread(target=hardware_manager.run_daq_process,
                                   args=(packets, stop, config), daemon=True)
@@ -277,3 +277,19 @@ class TestNoNiDaq:
             assert p['amps'] == 0.0 and p['voltage'] == 0.0 and p['cell_voltages'] == []
         assert tasks[0].closed
 
+
+class DrainedBeforeGet(queue.Queue):
+    """Reports full, as it was a moment ago, though its consumer has since
+    emptied it: the race between full() and a blocking get()."""
+    def full(self):
+        return True
+
+
+def test_daq_keeps_publishing_when_its_queue_is_drained_mid_publish(monkeypatch):
+    # The old `if full(): get()` waited forever here and the DAQ went silent.
+    def no_daq():
+        raise RuntimeError("DaqNotFoundError")
+
+    _, packets = TestNoNiDaq()._collect(monkeypatch, no_daq, seconds=0.6,
+                                        packets=DrainedBeforeGet(maxsize=1000))
+    assert len(packets) >= 3

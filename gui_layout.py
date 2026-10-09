@@ -12,7 +12,7 @@ from rig_config import (
     VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, DAQ_FIELD_LABELS, field_label,
 )
 from control_logic import (DEFAULT_LAP_CSV, PROFILES_DIR, PROJECT_DIR, VRB_MAX_POWER_W,
-                           BANK_OVERLOAD_FACTOR)
+                           BANK_OVERLOAD_FACTOR, transition_command)
 import theme
 from PyQt6 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
@@ -906,11 +906,12 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         self.btn_arm = QtWidgets.QPushButton("Arm")
         self.btn_arm.setProperty("variant", "warning")
-        self.btn_arm.clicked.connect(lambda: self.send_command("ARM"))
+        self.btn_arm.clicked.connect(lambda: self.send_command(transition_command("ARM")))
 
         self.btn_run = QtWidgets.QPushButton("Run")
         self.btn_run.setProperty("variant", "success")
-        self.btn_run.clicked.connect(lambda: self.send_command(("RUN", self.spin_laps.value())))
+        self.btn_run.clicked.connect(lambda: self.send_command(
+            transition_command("RUN", self.spin_laps.value())))
 
         self.btn_stop = QtWidgets.QPushButton("E-STOP")
         self.btn_stop.setProperty("variant", "danger")
@@ -920,7 +921,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
         self.btn_reset = QtWidgets.QPushButton("Reset")
         self.btn_reset.setToolTip("Clear a latched fault and return to idle")
-        self.btn_reset.clicked.connect(lambda: self.send_command("RESET"))
+        self.btn_reset.clicked.connect(lambda: self.send_command(transition_command("RESET")))
 
         self.btn_heatmap = QtWidgets.QPushButton("Thermal Map")
         self.btn_heatmap.clicked.connect(self.toggle_heatmap)

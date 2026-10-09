@@ -173,10 +173,10 @@ def run_scenario(sc):
         time.sleep(2.0)                     # DISCONNECTED -> IDLE
         cmd_q.put(("LOAD_CSV", csv_path))
         time.sleep(0.5)
-        cmd_q.put("ARM")
+        cmd_q.put(cl.transition_command("ARM"))
         time.sleep(1.0)
         t_run = time.monotonic()
-        cmd_q.put(("RUN", sc.laps))
+        cmd_q.put(cl.transition_command("RUN", sc.laps))
 
         if sc.hang_after_s is not None:
             time.sleep(sc.hang_after_s)

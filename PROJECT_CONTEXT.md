@@ -94,6 +94,13 @@ Guards live in `is_valid_transition()`. `ARM` only from `IDLE`, `RUN` only from
 staying in `IDLE`, while `arm_refusals()` is non-empty: the NI-DAQ is offline or
 the configuration has ARM blockers (see Retargeting below).
 
+`ARM`, `RUN` and `RESET` carry the time they were pressed
+(`transition_command()`), and the loop ignores one pressed before the most
+recent stop or fault (`stale_transition()`). Without that, a `RESET`, `ARM` and
+`RUN` already waiting in the queue were processed straight after an E-STOP, in
+the same pass, and the rig was `RUNNING` again with the next resistance command
+reconnecting the load. A fault is cleared only by a `RESET` pressed after it.
+
 ## Hardware
 
 - **Module under test**: 12S4P Reliance RS50 (21700, 5000 mAh, 70 A), 48 cells,
@@ -496,7 +503,8 @@ Three independent layers. They must all be verified separately.
    old command out; a `multiprocessing.Queue` can refuse that for a moment after
    its own puts, so a STOP pressed into a full queue could be dropped while
    heartbeats carried on and the Arduino watchdog never fired. An Event has no
-   capacity to run out of.
+   capacity to run out of. Any `ARM`, `RUN` or `RESET` pressed before the stop
+   is void (see the state machine above).
 3. **Arduino serial watchdog** — 2 s of host silence opens the main contactor
    and sheds all load, independent of the host entirely.
 

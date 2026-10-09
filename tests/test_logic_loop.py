@@ -153,7 +153,7 @@ def test_arm_is_refused_without_the_ni_daq(rig, capsys):
     rig.start()
     rig.wait_for("IDLE")
 
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     time.sleep(0.5)
 
     # Refused, not armed into a fault: no RESET needed once the DAQ is back.
@@ -163,16 +163,16 @@ def test_arm_is_refused_without_the_ni_daq(rig, capsys):
 
     rig.ni_daq = True
     time.sleep(0.2)
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
 
 
 def test_ni_daq_lost_mid_run_faults_and_kills_the_load(rig, capsys):
     rig.start()
     rig.wait_for("IDLE")
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
-    rig.cmd_q.put(("RUN", 1))
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
     rig.wait_for("RUNNING")
 
     deadline = time.monotonic() + 3.0
@@ -206,7 +206,7 @@ def test_arm_is_refused_while_the_config_leaves_a_cell_unwatched(rig, capsys):
     rig.start()
     rig.wait_for("IDLE")
 
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     time.sleep(0.5)
 
     assert rig.state == "IDLE"
@@ -226,7 +226,7 @@ def test_fixing_the_wiring_in_the_gui_waits_for_a_restart(rig, capsys):
 
     rig.cmd_q.put(("SET_CONFIG", RigConfig.defaults().to_dict()))
     time.sleep(0.3)
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     time.sleep(0.5)
 
     assert rig.state == "IDLE"
@@ -238,7 +238,7 @@ def test_fixing_the_wiring_in_the_gui_waits_for_a_restart(rig, capsys):
 def test_config_change_while_armed_faults_and_kills_the_load(rig, capsys):
     rig.start()
     rig.wait_for("IDLE")
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
 
     # Reconfigured for a 14S module while armed; the DAQ still reads 12 taps.
@@ -261,9 +261,9 @@ def test_bank_over_its_own_rating_trips_once_the_setting_settles(rig, monkeypatc
     rig.amps = 5800.0 / 46.0
     rig.start()
     rig.wait_for("IDLE")
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
-    rig.cmd_q.put(("RUN", 1))
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
     rig.wait_for("RUNNING")
 
     deadline = time.monotonic() + 3.0
@@ -286,9 +286,9 @@ def test_sidebar_switch_to_rated_power_reaches_the_trip(rig, monkeypatch, capsys
     rig.amps = 4200.0 / 46.0
     rig.start()
     rig.wait_for("IDLE")
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
-    rig.cmd_q.put(("RUN", 1))
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
     rig.wait_for("RUNNING")
     time.sleep(cl.BANK_SETTLE_S + 0.5)
     assert rig.state == "RUNNING"
@@ -303,9 +303,9 @@ def test_sidebar_switch_to_rated_power_reaches_the_trip(rig, monkeypatch, capsys
 def test_estop_gets_through_a_jammed_command_queue(rig, capsys):
     rig.start()
     rig.wait_for("IDLE")
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
-    rig.cmd_q.put(("RUN", 1))
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
     rig.wait_for("RUNNING")
 
     # Fill the command queue the way spinbox spam would, then press E-STOP.
@@ -336,7 +336,7 @@ def test_loop_keeps_running_when_the_gui_drains_telemetry_mid_publish(rig):
     rig.tel_q = DrainedBeforeGet(maxsize=50)
     rig.start()
     rig.wait_for("IDLE")
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
     rig.estop.set()
     rig.wait_for("FAULT")
@@ -347,9 +347,9 @@ def test_loop_keeps_running_when_the_gui_drains_telemetry_mid_publish(rig):
 def run_to_running(rig):
     rig.start()
     rig.wait_for("IDLE")
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
-    rig.cmd_q.put(("RUN", 1))
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
     rig.wait_for("RUNNING")
 
 
@@ -411,9 +411,9 @@ def test_unexpected_error_still_kills_the_load_and_tells_the_gui(rig, monkeypatc
 
     rig.start()
     rig.wait_for("IDLE")
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     rig.wait_for("ARMED")
-    rig.cmd_q.put(("RUN", 1))
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
 
     deadline = time.monotonic() + 3.0
     while rig.crash is None:
@@ -460,7 +460,7 @@ def test_sidebar_trip_past_the_cell_rating_refuses_arm(rig, capsys):
     rig.wait_for("IDLE")
     rig.cmd_q.put(sidebar_limits(max_amps=2000.0))
     time.sleep(0.3)
-    rig.cmd_q.put("ARM")
+    rig.cmd_q.put(cl.transition_command("ARM"))
     time.sleep(0.5)
 
     assert rig.state == "IDLE" and "ARMED" not in rig.seen
@@ -529,3 +529,86 @@ def test_config_accepted_in_idle_shows_no_mismatch(rig):
     while settings_mismatch(cooler, rig.last):
         assert time.monotonic() < deadline, settings_mismatch(cooler, rig.last)
         time.sleep(0.02)
+
+
+class GatedQueue(queue.Queue):
+    """A DAQ queue the test can hold the logic loop at.
+
+    With the gate shut, the loop parks in its DAQ get() at the top of the next
+    pass, so commands and an E-STOP can be lined up for it to find together.
+    """
+    def __init__(self, maxsize):
+        super().__init__(maxsize)
+        self.gate = threading.Event()
+        self.gate.set()
+        self.parked = threading.Event()
+
+    def get(self, block=True, timeout=None):
+        if not self.gate.is_set():
+            self.parked.set()
+            self.gate.wait()
+        return super().get(block, timeout)
+
+
+def hold_loop(rig):
+    rig.daq_q.parked.clear()
+    rig.daq_q.gate.clear()
+    assert rig.daq_q.parked.wait(2.0), "the loop never came round to its DAQ read"
+
+
+def test_queued_reset_arm_run_cannot_undo_an_estop(rig, capsys):
+    # The reported failure: RESET, ARM and RUN already waiting in the queue
+    # were processed straight after the E-STOP, in the same pass, and the rig
+    # was RUNNING again with the next resistance command reconnecting the load.
+    rig.daq_q = GatedQueue(maxsize=5)
+    run_to_running(rig)
+    hold_loop(rig)
+
+    for cmd in (cl.transition_command("RESET"), cl.transition_command("ARM"),
+                cl.transition_command("RUN", 1)):
+        rig.cmd_q.put(cmd)
+    rig.estop.set()
+    before = len(rig.resistor.written())
+    fault_index = len(rig.seen)
+    rig.daq_q.gate.set()
+
+    rig.wait_for("FAULT")
+    time.sleep(1.0)
+    assert set(rig.seen[fault_index:]) == {"FAULT"}
+    after = rig.resistor.written()[before:]
+    assert b"KILL\n" in after
+    assert not any(is_resistance_command(w) for w in after[after.index(b"KILL\n"):])
+    out = capsys.readouterr().out
+    for name in ("RESET", "ARM", "RUN"):
+        assert f"Ignoring {name}: issued before the last stop or fault." in out
+
+
+def test_reset_pressed_after_the_estop_clears_it(rig):
+    run_to_running(rig)
+    rig.estop.set()
+    rig.wait_for("FAULT")
+    rig.cmd_q.put(cl.transition_command("RESET"))
+    rig.wait_for("IDLE")
+
+
+def test_reset_pressed_before_a_fault_does_not_clear_it(rig):
+    # Not only E-STOP: a trip is a stop the operator has not yet seen.
+    rig.daq_q = GatedQueue(maxsize=5)
+    run_to_running(rig)
+    hold_loop(rig)
+    early_reset = cl.transition_command("RESET")
+    rig.resistor.fail = True            # the next write fails: link lost, FAULT
+    rig.daq_q.gate.set()
+    rig.wait_for("FAULT")
+    rig.cmd_q.put(early_reset)
+    time.sleep(0.5)
+    assert rig.state == "FAULT"
+
+
+def test_unstamped_transition_is_refused(rig, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put("ARM")
+    time.sleep(0.5)
+    assert rig.state == "IDLE"
+    assert "Ignoring ARM: no issue time." in capsys.readouterr().out

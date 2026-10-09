@@ -1072,6 +1072,54 @@ def is_valid_transition(current_state, command):
     return False
 
 
+TRANSITION_COMMANDS = ("ARM", "RUN", "RESET")
+
+
+def transition_command(name, *args):
+    """ARM, RUN or RESET as the GUI queues it: (name, *args, issued_at).
+
+    issued_at is time.monotonic() when the operator pressed the button. The logic
+    process acts on the command only if it was issued after the most recent stop
+    or fault (stale_transition() below), so a press already waiting in the queue
+    cannot undo an E-STOP. time.monotonic() is the system-wide clock on Windows
+    and Linux, so the GUI's stamp and the logic process's are comparable.
+    """
+    if name not in TRANSITION_COMMANDS:
+        raise ValueError(f"not a state transition: {name!r}")
+    return (name, *args, time.monotonic())
+
+
+def parse_transition(cmd):
+    """(name, args, issued_at) for a transition command, else None.
+
+    issued_at is None when the command carries no usable stamp: a bare "ARM"
+    string, or an old ("RUN", laps). The loop refuses those outright.
+    """
+    name = cmd[0] if isinstance(cmd, tuple) and cmd else cmd
+    if not isinstance(name, str) or name not in TRANSITION_COMMANDS:
+        return None
+    arg_count = 1 if name == "RUN" else 0
+    if not isinstance(cmd, tuple) or len(cmd) != arg_count + 2 or not _finite(cmd[-1]):
+        return name, (), None
+    return name, tuple(cmd[1:-1]), float(cmd[-1])
+
+
+def stale_transition(issued_at, fault_at):
+    """Whether a transition must be ignored: unstamped, or issued before the last stop.
+
+    E-STOP latches FAULT and then the logic loop works through the command queue.
+    A RESET, ARM and RUN queued before the stop were then accepted in order, and
+    the rig was RUNNING again, reconnecting the load, in the same loop pass as the
+    E-STOP. Comparing stamps rather than queue position means a press is judged
+    by when it was made, however late the queue delivers it. A press made in the
+    instant between the E-STOP and the loop seeing it counts as before: the
+    operator presses it again.
+    """
+    if issued_at is None:
+        return True
+    return fault_at is not None and issued_at <= fault_at
+
+
 def kill_load(res_ser):
     """Send KILL to the resistor controller. False only if the link failed.
 
@@ -1087,6 +1135,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                       stop_event: Event, discovery_lock=None, estop_event=None):
     fsm_state = "DISCONNECTED"
     target_res = 0.0
+    # time.monotonic() at the most recent stop or fault; see stale_transition().
+    fault_at = None
 
     # --- Resistor controller discovery, off the safety loop ---
     #
@@ -1129,6 +1179,17 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
     res_ser = None
 
+    def latch_fault():
+        """Enter FAULT, and void every ARM, RUN and RESET issued before now.
+
+        Called for every stop and fault, including a stop while already in
+        FAULT: the operator's latest press is a stop, so a RESET made before it
+        must not clear it.
+        """
+        nonlocal fsm_state, fault_at
+        fsm_state = "FAULT"
+        fault_at = time.monotonic()
+
     def drop_resistor_link(what):
         """The controller stopped taking writes, or its port closed under us.
 
@@ -1138,7 +1199,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         go over a dead link; the Arduino's watchdog sheds the load 2 s after
         the last message that reached it.
         """
-        nonlocal res_ser, fsm_state
+        nonlocal res_ser
         lost, res_ser = res_ser, None
         with slot_lock:
             resistor_slot['ser'] = None
@@ -1149,7 +1210,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 pass
         print(f"\n[LOGIC] Resistor controller link lost ({what}).")
         if fsm_state in ("ARMED", "RUNNING"):
-            fsm_state = "FAULT"
+            latch_fault()
             print("[LOGIC] RESISTOR LINK LOST ALARM! Commands are not reaching the "
                   "controller; its watchdog sheds the load 2 s after the last one did.")
 
@@ -1285,7 +1346,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             # check and the clear is the same stop.
             if estop_event is not None and estop_event.is_set():
                 estop_event.clear()
-                fsm_state = "FAULT"
+                latch_fault()
                 print("[LOGIC] EMERGENCY STOP triggered via GUI.")
                 if not kill_load(res_ser):
                     drop_resistor_link("KILL")
@@ -1294,6 +1355,17 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             while not gui_cmd_queue.empty():
                 try:
                     cmd = gui_cmd_queue.get_nowait()
+
+                    transition = parse_transition(cmd)
+                    if transition is not None:
+                        name, args, issued_at = transition
+                        if stale_transition(issued_at, fault_at):
+                            print(f"[LOGIC] Ignoring {name}: "
+                                  + ("issued before the last stop or fault. Press it again."
+                                     if issued_at is not None else "no issue time."))
+                            continue
+                    else:
+                        name, args = None, ()
 
                     if isinstance(cmd, tuple) and cmd[0] == "SET_LIMITS":
                         # Merge rather than replace, so a partial payload cannot drop
@@ -1369,7 +1441,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                         except Exception as e:
                             print(f"\n[LOGIC ERROR] Failed to load new CSV: {e}")
 
-                    elif cmd == "ARM" and is_valid_transition(fsm_state, "ARM"):
+                    elif name == "ARM" and is_valid_transition(fsm_state, "ARM"):
                         # Refused outright rather than armed into an immediate
                         # fault: nothing is wrong with the rig itself, it just
                         # cannot watch all of it, so stay in IDLE.
@@ -1380,9 +1452,9 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             fsm_state = "ARMED"
                             print("[LOGIC] System ARMED.")
 
-                    elif isinstance(cmd, tuple) and cmd[0] == "RUN" and is_valid_transition(fsm_state, "RUN"):
+                    elif name == "RUN" and is_valid_transition(fsm_state, "RUN"):
                         if total_rows > 0:
-                            total_laps = cmd[1]
+                            total_laps = args[0]
                             fsm_state = "RUNNING"
                             current_row_idx = 0
                             current_lap = 1
@@ -1409,12 +1481,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     elif cmd == "STOP" and is_valid_transition(fsm_state, "STOP"):
                         # Still accepted from the queue, for callers with no E-STOP
                         # event (the bench tools); the GUI uses the event.
-                        fsm_state = "FAULT"
+                        latch_fault()
                         print("[LOGIC] EMERGENCY STOP triggered via GUI.")
                         if not kill_load(res_ser):
                             drop_resistor_link("KILL")
 
-                    elif cmd == "RESET" and is_valid_transition(fsm_state, "RESET"):
+                    elif name == "RESET" and is_valid_transition(fsm_state, "RESET"):
                         fsm_state = "IDLE"
                         target_res = 0.0
                 except Empty:
@@ -1437,7 +1509,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 expected=expected)
 
             if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
-                fsm_state = "FAULT"
+                latch_fault()
                 print(f"\n[LOGIC] {trigger_reason} ALARM! Killing Load.")
                 if trigger_reason == "TEMP SENSOR FAULT":
                     dead = stale_temp_sensors(data.get('temp_sensor_ages_s', []),

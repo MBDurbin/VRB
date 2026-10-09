@@ -11,6 +11,8 @@ import math
 import sys
 import os
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from control_logic import (
@@ -56,6 +58,9 @@ from control_logic import (
     VRB_MAX_POWER_W,
     RESISTOR_TOLERANCE,
     is_valid_transition,
+    parse_transition,
+    stale_transition,
+    transition_command,
     heartbeat_due,
     write_resistor,
     send_binary_command,
@@ -668,6 +673,35 @@ class TestFSMTransitions:
 
     def test_unknown_command_rejected(self):
         assert is_valid_transition("IDLE", "NOT_A_REAL_COMMAND") is False
+
+
+class TestTransitionStamps:
+    """ARM, RUN and RESET carry when they were pressed; see stale_transition()."""
+
+    def test_round_trip(self):
+        name, args, issued_at = parse_transition(transition_command("RUN", 3))
+        assert (name, args) == ("RUN", (3,)) and issued_at is not None
+        assert parse_transition(transition_command("RESET"))[:2] == ("RESET", ())
+
+    def test_other_commands_are_not_transitions(self):
+        for cmd in ("STOP", ("SET_LIMITS", {}), ("LOAD_CSV", "x.csv"), None, ()):
+            assert parse_transition(cmd) is None
+
+    def test_unstamped_or_malformed_has_no_issue_time(self):
+        for cmd in ("ARM", "RESET", ("RUN", 1), ("ARM", "soon"), ("ARM", float("nan")),
+                    ("RESET", 1.0, 2.0)):
+            assert parse_transition(cmd)[2] is None
+
+    def test_stale_before_the_last_fault_only(self):
+        assert stale_transition(10.0, None) is False      # never faulted
+        assert stale_transition(10.0, 9.0) is False       # pressed after
+        assert stale_transition(9.0, 10.0) is True        # pressed before
+        assert stale_transition(10.0, 10.0) is True       # a tie counts as before
+        assert stale_transition(None, None) is True       # no stamp at all
+
+    def test_only_transitions_can_be_stamped(self):
+        with pytest.raises(ValueError):
+            transition_command("STOP")
 
 
 # ================= RESISTOR HEARTBEAT =================

@@ -115,8 +115,27 @@ MOSFETs. The MOSFETs sit on a PCB with the control Arduino, keeping the wiring
 tidy.
 
 The command is a binary word representing **4 × the target resistance in ohms**
-(equivalently, the number of 0.25 Ω steps). A received `00000000` is converted to
-`00000001` — 0.25 Ω — so the bank is never commanded to zero resistance.
+(equivalently, the number of 0.25 Ω steps), **most significant bank first**: 32 Ω
+is `10000000`, 0.25 Ω is `00000001`. A `1` opens that bank's bypass relay and
+puts the bank in circuit. A received `00000000` is converted to `00000001` —
+0.25 Ω — so the bank is never commanded to zero resistance.
+
+| Character | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| Bank | 8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 |
+| Resistance | 32 Ω | 16 Ω | 8 Ω | 4 Ω | 2 Ω | 1 Ω | 0.5 Ω | 0.25 Ω |
+| Arduino pin | 12 | 11 | 10 | 9 | 8 | 7 | 6 | 5 |
+
+The main contactor is pin 4. In software this table is `COMMAND_BANKS` and
+`BANK_RELAY_PIN` in `control_logic.py`; `tests/test_firmware_bank_map.py`
+compiles the firmware and checks every one of the 255 settings against it.
+
+The host used to send the word reversed, least significant bank first, so 32 Ω
+arrived as `00000001` and switched in bank 1 alone: about 202 A / 10 kW at
+50.4 V instead of 1.6 A / 79 W. **Pin 5 is the only bank the firmware names.**
+That pins 6–12 carry banks 2–8 in order follows from the word being binary, and
+only a meter proves it: run `python tools/bench_relay_check.py`, `walk`, with
+the battery disconnected, before the first run and after any rewiring.
 
 Firmware: `arduino/resistor_bank_controller/`.
 

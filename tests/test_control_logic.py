@@ -1448,7 +1448,7 @@ class TestResistorWrites:
         import serial
         port = _Port()
         assert send_binary_command(port, 3) is True
-        assert port.writes == [b"11000000\n"]
+        assert port.writes == [b"00000011\n"]    # 0.75 ohm: banks 1 and 2, bank 1 last
         assert send_binary_command(_Port(raises=serial.SerialException()), 3) is False
 
     def test_kill_fails_only_on_a_failed_write(self):

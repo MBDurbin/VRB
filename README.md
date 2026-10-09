@@ -13,7 +13,7 @@ The design, the physics and the safety layers are explained in
 |---|---|
 | The rig | `python main_v2.py` |
 | Desk test without hardware | plug in the SIL dongle, then `python main_v2.py`; follow [tests/SIL_CHECKLIST.md](tests/SIL_CHECKLIST.md) |
-| Unit tests | `python -m pytest` |
+| Unit tests | `python -m pytest` (the firmware bank-map test also needs `g++` or `clang++`; it skips without one) |
 | Relay chatter check (no hardware) | `python tools/relay_timing_check.py` |
 
 Run everything from this folder. `rig_config.json` holds the car, pack, wiring and

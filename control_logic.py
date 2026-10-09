@@ -46,6 +46,27 @@ VRB_MAX_POWER_W = 8000.0
 BANK_RESISTANCE_OHM = tuple(RESISTOR_RESOLUTION * 2 ** k for k in range(8))
 BANK_RATED_POWER_W = (8000.0, 4000.0, 2000.0, 1000.0, 500.0, 300.0, 200.0, 400.0)
 
+# Which bank each character of a resistance command switches, and the Arduino
+# pin that switches each bank. The one place the wire format is defined:
+# encode_steps() builds every command from it, tools/bench_relay_check.py prints
+# it, and tests/test_firmware_bank_map.py runs the real firmware to prove it
+# matches resistor_bank_controller.ino for every one of the 255 settings.
+#
+# The word is written most significant bank first, so it reads as the binary
+# number of 0.25 ohm steps: 32 ohm is 10000000, 0.25 ohm is 00000001. The
+# firmware drives characters 0-6 onto otherRelayPins[] = {12, ..., 6} and the
+# last character onto BANK_1_RELAY, pin 5, which it labels as the 0.25 ohm relay
+# and opens first on every change. The host used to send the word reversed,
+# least significant first, so 32 ohm arrived as 00000001 and switched in bank 1
+# alone: about 202 A at 50.4 V instead of 1.6 A.
+#
+# Pin 5 is the only bank the firmware names. Pins 6-12 carrying banks 2-8 in
+# order follows from the word being binary; confirm it on the bench with
+# `python tools/bench_relay_check.py` and `walk`, battery disconnected, before a
+# run, and after any rewiring of the relay board.
+COMMAND_BANKS = (8, 7, 6, 5, 4, 3, 2, 1)
+BANK_RELAY_PIN = (5, 6, 7, 8, 9, 10, 11, 12)    # bank 1 first
+
 # How far past the ratings above, and past VRB_MAX_POWER_W, the bank may run
 # unless SafetyLimits.bank_rated_power_only holds it to 100%. Fixed here, so the
 # config can choose between the two figures but not raise either.
@@ -155,12 +176,26 @@ def write_resistor(ser, payload):
         return False
 
 
+def encode_steps(steps):
+    """The command word for a ladder setting: one character per bank, COMMAND_BANKS order.
+
+    '1' puts that bank in circuit. Zero steps becomes bank 1 alone (0.25 ohm), as
+    the firmware's own all-zero interlock would, so the bank is never commanded
+    to zero resistance.
+    """
+    if steps == 0:
+        steps = 1
+    return "".join("1" if (steps >> (bank - 1)) & 1 else "0" for bank in COMMAND_BANKS)
+
+
+def decode_word(word):
+    """The ladder setting, in steps, that a command word puts in circuit."""
+    return sum(2 ** (bank - 1) for bank, bit in zip(COMMAND_BANKS, word) if bit == "1")
+
+
 def send_binary_command(ser, steps):
     """Send a ladder setting. False if the write failed; see write_resistor()."""
-    bin_str = format(steps, '08b')[::-1]
-    if bin_str == "00000000":
-        bin_str = "00000001"
-    return write_resistor(ser, (bin_str + '\n').encode('utf-8'))
+    return write_resistor(ser, (encode_steps(steps) + '\n').encode('utf-8'))
 
 
 # ================= PURE SAFETY / PHYSICS LOGIC =================

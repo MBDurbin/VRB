@@ -43,6 +43,8 @@ import serial
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from control_logic import (
+    BANK_RELAY_PIN,
+    COMMAND_BANKS,
     MAX_RESISTANCE,
     RESISTOR_BAUD_RATE,
     RESISTOR_RESOLUTION,
@@ -51,10 +53,10 @@ from control_logic import (
     send_binary_command,
 )
 
-# Arduino pin driven by each character of the command, left to right. Mirrors
-# arduino/resistor_bank_controller: otherRelayPins[] = {12, 11, 10, 9, 8, 7, 6}
-# take characters 0-6, and the last character drives BANK_1_RELAY on pin 5.
-PIN_FOR_CHAR = [12, 11, 10, 9, 8, 7, 6, 5]
+# Arduino pin driven by each character of the command, left to right: 12 down to
+# 5. From the mapping in control_logic, which tests/test_firmware_bank_map.py
+# checks against arduino/resistor_bank_controller.
+PIN_FOR_CHAR = [BANK_RELAY_PIN[bank - 1] for bank in COMMAND_BANKS]
 
 HEARTBEAT_S = 0.5      # the firmware watchdog sheds load after 2 s of silence
 APPLY_TIMEOUT_S = 1.5  # how long to wait for "New State Received" after a command

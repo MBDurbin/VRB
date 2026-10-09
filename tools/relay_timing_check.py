@@ -129,8 +129,7 @@ def run_scenario(sc):
             writes.append((time.monotonic(), bytes(data)))
             line = data.decode(errors="replace").strip()
             if is_command(line):
-                # Least significant bit first: character k is bank k + 1.
-                plant['ohms'] = sum(0.25 * 2 ** k for k, c in enumerate(line) if c == "1")
+                plant['ohms'] = cl.decode_word(line) * cl.RESISTOR_RESOLUTION
             elif line == "KILL":
                 plant['ohms'] = None
 

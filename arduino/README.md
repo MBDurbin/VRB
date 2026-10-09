@@ -24,7 +24,12 @@ reply strings above must not be changed without changing the Python to match
 ### resistor_bank_controller
 
 Drives the binary ladder — 0.25, 0.5, 1, 2, 4, 8, 16, 32 Ω — from an 8-bit word
-sent over serial, plus a main contactor.
+sent over serial, plus a main contactor. The word is most significant bank
+first, so the last character is bank 1, 0.25 Ω, on pin 5; the full table is in
+`docs/hardware_topology.md`. `tests/test_firmware_bank_map.py` compiles this
+sketch for the PC (needs `g++` or `clang++`) and checks that every command the
+host can send puts exactly the intended banks in circuit. Run it after changing
+a pin here.
 
 **This sketch carries an independent safety layer.** A 2 second serial timeout
 calls `shedAllLoad()`, which opens every relay including the main

@@ -12,12 +12,18 @@ bool noSignalAnnounced = false;
 
 // ================= HARDWARE CONFIGURATION =================
 const int RELAY_MAIN_PIN = 4;       // Main relay d4
-const int BANK_1_RELAY   = 5;        // 0.25 ohm relay on Digital
-const int otherRelayPins[] = {12, 11, 10, 9, 8, 7, 6}; // Relays
+const int BANK_1_RELAY   = 5;        // Bank 1, 0.25 ohm: the LAST character
+const int otherRelayPins[] = {12, 11, 10, 9, 8, 7, 6}; // Banks 8 (32 ohm) down to 2 (0.5 ohm)
 const int numOtherRelays = sizeof(otherRelayPins) / sizeof(otherRelayPins[0]);
 
 // One character per ladder relay: otherRelayPins in order, then BANK_1_RELAY.
 // The host always sends exactly this many (send_binary_command in Python).
+//
+// The word is the number of 0.25 ohm steps in binary, most significant bank
+// first: 32 ohm is 10000000, 0.25 ohm is 00000001. The host's copy of this
+// mapping is COMMAND_BANKS and BANK_RELAY_PIN in control_logic.py, and
+// tests/test_firmware_bank_map.py compiles this sketch to check the two agree.
+// Change the pins here and the test fails until the Python is changed to match.
 const int COMMAND_LENGTH = numOtherRelays + 1;
 
 const int RELAY_OPEN  = LOW;  // LED OFF

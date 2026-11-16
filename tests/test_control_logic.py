@@ -62,6 +62,9 @@ from control_logic import (
     stale_transition,
     transition_command,
     heartbeat_due,
+    keepalive_message,
+    press_clock,
+    run_laps,
     write_resistor,
     send_binary_command,
     kill_load,
@@ -713,6 +716,19 @@ class TestTransitionStamps:
         with pytest.raises(ValueError):
             transition_command("STOP")
 
+    def test_two_presses_in_a_row_get_different_stamps(self):
+        # time.monotonic() steps every 15.6 ms on Windows before Python 3.13, so
+        # a RESET pressed straight after a fault tied with it and was dropped.
+        stamps = [press_clock() for _ in range(200)]
+        assert all(later > earlier for earlier, later in zip(stamps, stamps[1:]))
+        assert transition_command("RESET")[-1] > stamps[-1]
+
+    def test_run_takes_only_a_whole_lap_count(self):
+        assert run_laps((1,)) == 1 and run_laps((25,)) == 25 and run_laps((3.0,)) == 3
+        for bad in ((), (0,), (-2,), (1.5,), (None,), ("3",), (True,), (float("nan"),),
+                    (float("inf"),)):
+            assert run_laps(bad) is None
+
 
 # ================= RESISTOR HEARTBEAT =================
 
@@ -722,13 +738,22 @@ class TestHeartbeat:
         # lost command opened the main contactor under load mid-run.
         assert heartbeat_due("RUNNING", HEARTBEAT_INTERVAL_S + 0.01) is True
 
-    def test_idle_and_armed_still_heartbeat(self):
-        for state in ("IDLE", "ARMED"):
+    def test_every_state_keeps_the_link_checked(self):
+        for state in ("DISCONNECTED", "IDLE", "ARMED", "RUNNING", "FAULT"):
             assert heartbeat_due(state, HEARTBEAT_INTERVAL_S + 0.01) is True
 
-    def test_no_heartbeat_once_faulted(self):
-        # Letting the watchdog lapse keeps the bank shed even if KILL was lost.
-        assert heartbeat_due("FAULT", 10.0) is False
+    def test_only_a_running_rig_feeds_the_watchdog(self):
+        # "alive" feeds the Arduino's watchdog and KILL does not, so anywhere
+        # but RUNNING the bank is told to disconnect again twice a second. A
+        # single KILL lost at the end of a run used to leave the contactor
+        # closed, with "alive" in IDLE holding the watchdog off.
+        assert keepalive_message("RUNNING") == b"alive\n"
+        for state in ("DISCONNECTED", "IDLE", "ARMED", "FAULT"):
+            assert keepalive_message(state) == b"KILL\n"
+
+    def test_a_faulted_rig_never_feeds_the_watchdog(self):
+        # Letting the watchdog lapse keeps the bank shed even if every KILL is lost.
+        assert keepalive_message("FAULT") != b"alive\n"
 
     def test_not_sent_early(self):
         assert heartbeat_due("RUNNING", HEARTBEAT_INTERVAL_S - 0.01) is False

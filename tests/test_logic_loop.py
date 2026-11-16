@@ -49,6 +49,7 @@ class FakeResistor:
         self.is_open = True
         self.fail = False       # set to make every write raise, like a pulled cable
         self.writes = []
+        self.ohms = None        # the ladder setting in circuit; None with the contactor open
         self._lock = threading.Lock()
 
     def write(self, data):
@@ -56,6 +57,12 @@ class FakeResistor:
             raise serial.SerialException("WriteFile failed")
         with self._lock:
             self.writes.append(bytes(data))
+        # What the firmware would do with it: a command closes the contactor
+        # onto that setting, KILL opens it.
+        if is_resistance_command(data):
+            self.ohms = cl.decode_word(data.decode().strip()) * cl.RESISTOR_RESOLUTION
+        elif data.strip() == b"KILL":
+            self.ohms = None
 
     def written(self):
         with self._lock:
@@ -80,7 +87,12 @@ class Rig:
         monkeypatch.setattr(RigConfig, "load", staticmethod(lambda *a, **k: self.config))
 
         self.ni_daq = True
-        self.amps = 50.0
+        # The current the DAQ reports. None follows the bank: the packet's 46 V
+        # across whatever the controller was last sent, and nothing once it is
+        # killed. A number holds the reading there whatever the ladder is doing,
+        # which is how the tests put a fault in front of the trips.
+        self.amps = None
+        self.readings = {}      # fields to overwrite in every packet the DAQ sends
         self.daq_q = queue.Queue(maxsize=5)
         self.tel_q = queue.Queue(maxsize=50)
         self.cmd_q = queue.Queue(maxsize=10)
@@ -105,7 +117,13 @@ class Rig:
                     self.daq_q.get_nowait()
                 except queue.Empty:
                     pass
-            self.daq_q.put(daq_packet(self.ni_daq, self.amps))
+            amps = self.amps
+            if amps is None:
+                ohms = self.resistor.ohms
+                amps = 46.0 / ohms if ohms else 0.0
+            packet = daq_packet(self.ni_daq, amps)
+            packet.update(self.readings)
+            self.daq_q.put(packet)
             time.sleep(0.05)
 
     def _tap(self):
@@ -407,6 +425,146 @@ def test_heartbeat_failure_in_idle_disconnects_without_a_fault(rig):
     assert "FAULT" not in rig.seen
 
 
+def test_only_a_running_rig_is_sent_alive(rig):
+    # Anywhere but RUNNING the keep-alive is KILL, which does not feed the
+    # Arduino's watchdog. "alive" in IDLE used to hold the watchdog off, so one
+    # lost KILL at the end of a run left the contactor closed.
+    rig.start()
+    rig.wait_for("IDLE")
+    time.sleep(1.3)
+    idle = rig.resistor.written()
+    assert idle.count(b"KILL\n") >= 2 and b"alive\n" not in idle
+
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    time.sleep(0.7)
+    assert b"alive\n" not in rig.resistor.written()
+
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
+    rig.wait_for("RUNNING")
+    since = len(rig.resistor.written())
+    time.sleep(1.3)
+    running = rig.resistor.written()[since:]
+    assert running.count(b"alive\n") >= 2 and b"KILL\n" not in running
+
+    rig.estop.set()
+    rig.wait_for("FAULT")
+    since = len(rig.resistor.written())
+    time.sleep(1.3)
+    faulted = rig.resistor.written()[since:]
+    assert faulted.count(b"KILL\n") >= 2 and b"alive\n" not in faulted
+
+
+def test_the_kill_is_repeated_after_a_run_ends(rig, tmp_path):
+    profile = tmp_path / "short.csv"
+    profile.write_text(f"Time (s),{cl.RESISTANCE_COLUMN}\n0,63.75\n0.3,63.75\n")
+    rig.amps = 0.5
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("LOAD_CSV", str(profile)))
+    arm_and_run(rig)
+    rig.wait_for("IDLE", timeout=4.0)
+
+    since = len(rig.resistor.written())
+    time.sleep(1.3)
+    after = rig.resistor.written()[since:]
+    assert after.count(b"KILL\n") >= 2 and b"alive\n" not in after
+
+
+def test_a_trip_latches_with_no_controller_connected(rig, capsys):
+    # DISCONNECTED used to swallow every trip: nothing shown and nothing logged
+    # with every cell at 95 C, because the rig was still looking for a board.
+    rig.resistor.is_open = False            # discovery never finds it
+    rig.start()
+    rig.wait_for("DISCONNECTED")
+    rig.readings = {'max_temp': 95.0, 'temperatures': [[95.0] * 8 for _ in range(6)]}
+    rig.wait_for("FAULT", timeout=1.0)
+
+    time.sleep(0.2)
+    assert rig.last['fault_reason'] == "OVERTEMP"
+    (row,) = read_trip_log(rig)
+    # No controller, so there was no KILL to send: blank, not "yes".
+    assert (row['Reason'], row['State'], row['Kill_Sent']) == ("OVERTEMP", "DISCONNECTED", "")
+    assert "OVERTEMP ALARM!" in capsys.readouterr().out
+
+    # RESET clears it once the cells are cool again.
+    rig.readings = {}
+    time.sleep(0.2)
+    rig.cmd_q.put(cl.transition_command("RESET"))
+    rig.wait_for("DISCONNECTED", timeout=1.0)
+
+
+def test_a_missing_temperature_board_does_not_fault_a_disconnected_rig(rig):
+    # Only the trips that apply in every state can fire before the rig is up.
+    rig.resistor.is_open = False
+    rig.readings = {'voltage': 0.0, 'cell_voltages': [],
+                    'hardware_status': {'temp_arduino': False, 'ni_daq': False,
+                                        'res_arduino': False}}
+    rig.start()
+    rig.wait_for("DISCONNECTED")
+    time.sleep(0.6)
+    assert set(rig.seen) == {"DISCONNECTED"}
+
+
+def test_a_profile_is_not_swapped_under_a_run(rig, tmp_path, capsys):
+    other = tmp_path / "other.csv"
+    other.write_text(f"Time (s),{cl.RESISTANCE_COLUMN}\n0,63.75\n1,63.75\n")
+    run_to_running(rig)
+    assert rig.last['profile_name'] == cl.DEFAULT_LAP_CSV
+
+    rig.cmd_q.put(("LOAD_CSV", str(other)))
+    time.sleep(0.5)
+    assert "Ignoring profile change while RUNNING" in capsys.readouterr().out
+    assert rig.last['profile_name'] == cl.DEFAULT_LAP_CSV and rig.state == "RUNNING"
+
+    rig.estop.set()
+    rig.wait_for("FAULT")
+    rig.cmd_q.put(("LOAD_CSV", str(other)))
+    deadline = time.monotonic() + 1.0
+    while rig.last['profile_name'] != "other.csv":
+        assert time.monotonic() < deadline, rig.last['profile_name']
+        time.sleep(0.02)
+    assert rig.last['profile_rows'] == 2
+
+
+def test_a_profile_that_fails_to_load_leaves_the_old_one_in_force(rig, tmp_path, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("LOAD_CSV", str(tmp_path / "missing.csv")))
+    time.sleep(0.4)
+    assert "Failed to load new CSV" in capsys.readouterr().out
+    assert rig.last['profile_name'] == cl.DEFAULT_LAP_CSV and rig.last['profile_rows'] == 68
+
+
+def test_a_run_needs_a_whole_lap_count(rig, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    for bad in (0, None, 2.5):
+        rig.cmd_q.put(cl.transition_command("RUN", bad))
+    time.sleep(0.5)
+    assert rig.state == "ARMED" and rig.crash is None
+    assert capsys.readouterr().out.count("Cannot RUN: laps must be a whole number") == 3
+
+
+def test_a_config_that_cannot_be_used_changes_nothing(rig, capsys):
+    # It used to be reported as rejected after its pack and limits were in force.
+    rig.start()
+    rig.wait_for("IDLE")
+    before = (rig.last['active_settings'], rig.last['active_limits'])
+
+    broken = RigConfig.defaults().to_dict()
+    broken['pack']['parallel_count'] = 0        # a module with no capacity
+    broken['limits']['max_temp'] = 40.0
+    rig.cmd_q.put(("SET_CONFIG", broken))
+    time.sleep(0.5)
+
+    assert "Rejected bad config, nothing changed" in capsys.readouterr().out
+    assert (rig.last['active_settings'], rig.last['active_limits']) == before
+    assert rig.crash is None and rig.threads[2].is_alive()
+
+
 def test_unexpected_error_still_kills_the_load_and_tells_the_gui(rig, monkeypatch, capsys):
     # An error in the loop used to skip the cleanup after it: no KILL, port left
     # open, and the GUI showing the last state it had been sent.
@@ -579,7 +737,12 @@ def test_queued_reset_arm_run_cannot_undo_an_estop(rig, capsys):
 
     rig.wait_for("FAULT")
     time.sleep(1.0)
-    assert set(rig.seen[fault_index:]) == {"FAULT"}
+    # RUNNING packets the loop published before it was held can still be in
+    # tel_q when fault_index is taken, so the tap appends them after it. Once
+    # FAULT is seen, nothing else may follow.
+    first_fault = rig.seen.index("FAULT", fault_index)
+    assert set(rig.seen[fault_index:first_fault]) <= {"RUNNING"}
+    assert set(rig.seen[first_fault:]) == {"FAULT"}
     after = rig.resistor.written()[before:]
     assert b"KILL\n" in after
     assert not any(is_resistance_command(w) for w in after[after.index(b"KILL\n"):])

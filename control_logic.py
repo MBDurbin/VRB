@@ -1277,24 +1277,34 @@ def resistance_to_steps(req_r, min_r=0.0):
 
 
 def heartbeat_due(fsm_state, since_last_s):
-    """Whether the resistor controller should be sent an "alive" now.
+    """Whether the resistor controller should be sent its keep-alive now.
 
-    RUNNING is included deliberately. The heartbeat used to stop once a run
-    began, leaving the per-row resistance commands as the only thing feeding the
-    Arduino's 2 s watchdog. With the shipped 1 s rows that left about 0.9 s of
-    margin; a profile with rows ~2 s apart, or a single command lost on the
-    wire, let the watchdog fire mid-run. That opens the main contactor under full
-    load, and the next command re-closes it a few milliseconds later.
-
-    "alive" moves no relay, so this holds the bank at its current resistance
-    between rows. The watchdog still protects against a stalled host, because
-    the heartbeat comes from this same loop.
-
-    Not in FAULT: the load has been killed, and letting the watchdog lapse there
-    is a second, independent guarantee that it stays shed.
+    In every state, every HEARTBEAT_INTERVAL_S. What is sent depends on the
+    state: see keepalive_message().
     """
-    return (fsm_state in ("IDLE", "ARMED", "RUNNING")
-            and since_last_s > HEARTBEAT_INTERVAL_S)
+    return since_last_s > HEARTBEAT_INTERVAL_S
+
+
+def keepalive_message(fsm_state):
+    """The line the controller is sent every HEARTBEAT_INTERVAL_S in this state.
+
+    RUNNING: "alive". It feeds the Arduino's 2 s watchdog and moves no relay, so
+    it holds the bank at its resistance between rows. Without it a profile with
+    rows ~2 s apart, or one command lost on the wire, let the watchdog open the
+    main contactor under full load, with the next command re-closing it
+    milliseconds later. The watchdog still catches a stalled host, because the
+    heartbeat comes from this same loop.
+
+    Every other state: "KILL". The bank must be disconnected whenever the rig is
+    not running, so the host says so again twice a second instead of saying
+    "alive". KILL does not feed the watchdog, so in FAULT the watchdog still
+    lapses as a second, independent guarantee. The heartbeat here used to be
+    "alive" in IDLE and ARMED: when a run ended, one KILL went out and the rig
+    went back to feeding the watchdog, so had that one line been lost the
+    contactor stayed closed at the last setting with nothing to open it. A failed
+    write still shows a dead link, as "alive" did.
+    """
+    return b"alive\n" if fsm_state == "RUNNING" else b"KILL\n"
 
 
 def is_valid_transition(current_state, command):
@@ -1313,18 +1323,30 @@ def is_valid_transition(current_state, command):
 TRANSITION_COMMANDS = ("ARM", "RUN", "RESET")
 
 
+def press_clock():
+    """The clock every ARM, RUN and RESET press, and every stop and fault, is stamped with.
+
+    time.perf_counter(): one clock for every process on the machine (on Windows
+    since Python 3.10) and fine-grained. time.monotonic() is system-wide too,
+    but on Windows before Python 3.13 it steps every 15.6 ms, so a RESET pressed
+    in the same step as the fault it follows compared equal to it and was
+    thrown away as stale. The operator had to press it again, and the tests for
+    it failed about one run in two.
+    """
+    return time.perf_counter()
+
+
 def transition_command(name, *args):
     """ARM, RUN or RESET as the GUI queues it: (name, *args, issued_at).
 
-    issued_at is time.monotonic() when the operator pressed the button. The logic
+    issued_at is press_clock() when the operator pressed the button. The logic
     process acts on the command only if it was issued after the most recent stop
     or fault (stale_transition() below), so a press already waiting in the queue
-    cannot undo an E-STOP. time.monotonic() is the system-wide clock on Windows
-    and Linux, so the GUI's stamp and the logic process's are comparable.
+    cannot undo an E-STOP.
     """
     if name not in TRANSITION_COMMANDS:
         raise ValueError(f"not a state transition: {name!r}")
-    return (name, *args, time.monotonic())
+    return (name, *args, press_clock())
 
 
 def parse_transition(cmd):
@@ -1340,6 +1362,23 @@ def parse_transition(cmd):
     if not isinstance(cmd, tuple) or len(cmd) != arg_count + 2 or not _finite(cmd[-1]):
         return name, (), None
     return name, tuple(cmd[1:-1]), float(cmd[-1])
+
+
+def run_laps(args):
+    """The lap count a RUN command carries, or None if it is not a count.
+
+    The GUI sends a spinbox value, but anything can put a RUN on the queue, and
+    a None or a 0 here used to reach the lap comparison mid-run.
+    """
+    try:
+        laps = args[0]
+    except (IndexError, TypeError):
+        return None
+    if isinstance(laps, bool) or not isinstance(laps, (int, float)):
+        return None
+    if not math.isfinite(laps) or laps != int(laps) or laps < 1:
+        return None
+    return int(laps)
 
 
 def stale_transition(issued_at, fault_at):
@@ -1373,7 +1412,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                       stop_event: Event, discovery_lock=None, estop_event=None):
     fsm_state = "DISCONNECTED"
     target_res = 0.0
-    # time.monotonic() at the most recent stop or fault; see stale_transition().
+    # press_clock() at the most recent stop or fault; see stale_transition().
     fault_at = None
 
     # --- Resistor controller discovery, off the safety loop ---
@@ -1431,7 +1470,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         """
         nonlocal fsm_state, fault_at, fault_reason, fault_detail
         fsm_state = "FAULT"
-        fault_at = time.monotonic()
+        fault_at = press_clock()
         fault_reason, fault_detail = reason, list(details)
 
     def operator_stop(reason):
@@ -1569,9 +1608,13 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         else:
             drop_resistor_link("resistance command")
 
+    # The profile this process actually holds, reported in every packet. The
+    # window used to show whichever file the operator last picked, loaded or not.
+    profile_name = None
     try:
         lap_data, dropped = load_lap_profile(CSV_FILENAME)
         total_rows = len(lap_data)
+        profile_name = DEFAULT_LAP_CSV
         print(f"[LOGIC] Loaded default lap profile: {total_rows} rows"
               + (f" ({dropped} unusable rows dropped)." if dropped else "."))
     except Exception as e:
@@ -1675,32 +1718,44 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             print("[LOGIC] Ignoring config change while RUNNING. Stop the run first.")
                         else:
                             try:
+                                # Everything that can fail on a bad value is
+                                # worked out first, on the side. The swap below
+                                # then cannot stop half way: a config that
+                                # raised used to be reported as rejected after
+                                # its pack and limits were already in force.
                                 new_config = RigConfig.from_dict(cmd[1])
-                                config = new_config
-                                pack = config.pack
-                                vehicle = config.vehicle
-
-                                limits = config.limits.to_command_dict()
+                                new_pack, new_vehicle = new_config.pack, new_config.vehicle
+                                new_limits = new_config.limits.to_command_dict()
+                                new_capacity = float(new_pack.capacity_ah)
+                                if not (math.isfinite(new_capacity) and new_capacity > 0):
+                                    raise ValueError(f"module capacity {new_capacity!r} Ah")
+                                new_settings_id = new_config.settings_fingerprint()
+                                summary = (f"[LOGIC] Config updated -> {new_pack.cell_model} "
+                                           f"{new_pack.series_count}S{new_pack.parallel_count}P, "
+                                           f"{new_capacity:.1f} Ah, "
+                                           f"{new_vehicle.total_mass_kg:.0f} kg car+driver")
+                                warnings = list(new_config.limits.advisories())
+                            except Exception as exc:
+                                print(f"[LOGIC ERROR] Rejected bad config, nothing changed: {exc}")
+                            else:
+                                config, pack, vehicle = new_config, new_pack, new_vehicle
+                                limits = new_limits
 
                                 # A new pack is judged against the wiring the DAQ is
                                 # running, not the new DAQ section, which waits for a
-                                # restart. Straight after the swap, so nothing below
-                                # can leave it judging the old pack.
+                                # restart. Neither call can raise: both fail closed.
                                 config_problems = config_blockers(running_daq, pack, limits)
                                 expected = expected_measurements(running_daq, pack)
-                                settings_id = config.settings_fingerprint()
+                                settings_id = new_settings_id
 
                                 # Capacity change invalidates the running coulomb
                                 # count, so rebaseline rather than carry a stale Ah.
-                                total_capacity_ah = pack.capacity_ah
+                                total_capacity_ah = new_capacity
                                 remaining_ah = total_capacity_ah
                                 last_coulomb_time = time.time()
 
-                                print(f"[LOGIC] Config updated -> {pack.cell_model} "
-                                      f"{pack.series_count}S{pack.parallel_count}P, "
-                                      f"{pack.capacity_ah:.1f} Ah, "
-                                      f"{vehicle.total_mass_kg:.0f} kg car+driver")
-                                for warning in config.limits.advisories():
+                                print(summary)
+                                for warning in warnings:
                                     print(f"[LOGIC WARNING] {warning}")
 
                                 report_config_problems(config_problems)
@@ -1708,8 +1763,6 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                     print("[LOGIC] DAQ settings changed. They apply on restart; "
                                           "until then ARM is judged against the wiring the DAQ "
                                           "started with.")
-                            except Exception as exc:
-                                print(f"[LOGIC ERROR] Rejected bad config: {exc}")
 
                     elif isinstance(cmd, tuple) and cmd[0] == "SET_OVERRIDE":
                         # Taken in any state, RUNNING included: it moves the load
@@ -1722,12 +1775,20 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             override_due = True
                             print(f"[LOGIC] Load override {describe_override(override)}.")
 
+                    elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV" and fsm_state == "RUNNING":
+                        # Like a new config: not under a run. It used to be taken,
+                        # sending the run back to row 0 of the new profile with the
+                        # old one's speed carried in, and the file was parsed on
+                        # this loop while it was holding a load.
+                        print("[LOGIC] Ignoring profile change while RUNNING. Stop the run first.")
+
                     elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV":
                         filepath = cmd[1]
                         try:
                             lap_data, dropped = load_lap_profile(filepath)
                             total_rows = len(lap_data)
                             current_row_idx = 0
+                            profile_name = os.path.basename(str(filepath))
                             print(f"\n[LOGIC] Successfully loaded new lap profile: {filepath}")
                             print(f"[LOGIC] Total rows: {total_rows}"
                                   + (f" ({dropped} unusable rows dropped)" if dropped else ""))
@@ -1752,8 +1813,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             print("[LOGIC] System ARMED.")
 
                     elif name == "RUN" and is_valid_transition(fsm_state, "RUN"):
-                        if total_rows > 0:
-                            total_laps = args[0]
+                        laps = run_laps(args)
+                        if laps is None:
+                            print(f"[LOGIC] Cannot RUN: laps must be a whole number of 1 or "
+                                  f"more, not {args[0] if args else None!r}.")
+                        elif total_rows > 0:
+                            total_laps = laps
                             fsm_state = "RUNNING"
                             current_row_idx = 0
                             current_lap = 1
@@ -1813,8 +1878,13 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 config_problems=config_problems, bank_steps=settled_steps,
                 expected=expected)
 
-            if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
+            # DISCONNECTED latches too. It used to be skipped along with FAULT, so
+            # a rig waiting on its controller or its temperature board showed
+            # nothing and logged nothing with every cell at 95 C. Only the trips
+            # that apply in every state can fire there: `armed` is False.
+            if is_fault and fsm_state != "FAULT":
                 tripped_in = fsm_state
+                had_link = res_ser is not None
                 latch_fault(trigger_reason)
                 # KILL first: describing, printing and logging the trip all wait
                 # until it has gone out.
@@ -1834,7 +1904,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 append_trip_log(trip_record(
                     trigger_reason, tripped_in, fault_detail, data,
                     ladder_ohm=target_res if tripped_in == "RUNNING" else None,
-                    kill_sent=killed, killed_at=killed_at))
+                    kill_sent=killed if had_link else None, killed_at=killed_at))
 
             # --- E. Coulomb Counting Math ---
             current_time = time.time()
@@ -1846,9 +1916,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             # --- F. Finite State Machine Actions ---
             if res_ser and res_ser.is_open:
                 if heartbeat_due(fsm_state, time.time() - last_heartbeat):
-                    # A failed heartbeat used to be swallowed, leaving the handle in
-                    # place and the rig RUNNING with nothing reaching the Arduino.
-                    if not write_resistor(res_ser, b"alive\n"):
+                    # "alive" while running, KILL in every other state: see
+                    # keepalive_message(). A failed one used to be swallowed,
+                    # leaving the handle in place and the rig RUNNING with
+                    # nothing reaching the Arduino.
+                    if not write_resistor(res_ser, keepalive_message(fsm_state)):
                         drop_resistor_link("heartbeat")
                     last_heartbeat = time.time()
 
@@ -1954,6 +2026,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             data['target_resistance'] = target_res
             data['current_lap'] = current_lap
             data['total_laps'] = total_laps
+            # The profile in force and the row last sent, for the window and
+            # the recording. Rows count from 1; 0 before the first is sent.
+            data['profile_name'] = profile_name
+            data['profile_rows'] = total_rows
+            data['profile_row'] = current_row_idx if fsm_state == "RUNNING" else 0
             data['remaining_ah'] = remaining_ah
             data['true_soc'] = true_soc
             data['hardware_status']['res_arduino'] = (res_ser is not None)

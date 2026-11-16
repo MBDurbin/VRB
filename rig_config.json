@@ -67,6 +67,7 @@
     ],
     "voltage_terminal_config": "RSE",
     "voltage_multiplier": 11.0,
+    "voltage_tap_gains": [],
     "current_amps_per_volt": 100.0,
     "ai_min_volts": -10.0,
     "ai_max_volts": 10.0,

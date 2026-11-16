@@ -534,6 +534,12 @@ CJC_SOURCES = ("BUILT_IN", "CONSTANT_USER_VALUE")
 # module's own; a module without the setting (an NI 9211) needs DEFAULT.
 TC_ADC_MODES = ("HIGH_SPEED", "HIGH_RESOLUTION", "DEFAULT")
 
+# The range a per-tap gain may take (DaqConfig.voltage_tap_gains). A divider of
+# 1% resistors is within about 2% of its nominal ratio; 10% is a wrong part.
+# NaN falls outside it, as every comparison with NaN is False.
+TAP_GAIN_MIN = 0.90
+TAP_GAIN_MAX = 1.10
+
 
 @dataclass
 class DaqConfig:
@@ -589,6 +595,23 @@ class DaqConfig:
     # a 10:1 divider drops to 1/11th, hence 11.0. Get this wrong and every
     # voltage reading -- and therefore every voltage trip -- is off by the ratio.
     voltage_multiplier: float = 11.0
+
+    # One correction per tap, tap 1 first, multiplied in after the divider
+    # multiplier above. Empty means none: every tap takes the multiplier alone.
+    #
+    # Each tap has its own divider, and no two dividers are exactly 10:1. A cell
+    # voltage is the difference of two taps, so the dividers' errors do not
+    # cancel, they grow up the stack: taps 11 and 12 sit near 46 V and 50 V, and
+    # 1% on each can put cell 12 almost a volt out, on a per-cell trip set 0.2 V
+    # above the cutoff. The same mismatch scales cell 12's measured resistance
+    # by up to a fifth, and a bigger current pulse does not shrink it.
+    #
+    # tools/tap_calibrate.py reads every tap and takes a multimeter reading for
+    # each, and prints this list. A value is meter volts over the rig's reading,
+    # so 1.004 means that tap read 0.4% low. Anything outside 0.90 to 1.10 is
+    # not a divider's tolerance but a wrong part or a wrong multiplier, and
+    # blocks ARM, as does a list of the wrong length.
+    voltage_tap_gains: List[float] = field(default_factory=list)
 
     # Current transducer output, amps per volt at the DAQ input.
     # The sensor emits a small voltage proportional to current; this converts it
@@ -665,10 +688,29 @@ class DaqConfig:
     # or normal operation would look like a stalled DAQ.
     sample_period_s: float = 0.1
 
+    def __post_init__(self):
+        # rig_config.json is hand-edited, and a quoted "1.004" would otherwise
+        # reach the DAQ loop as a string. Failing here makes load() fall back to
+        # defaults with a message. NaN converts; safety_problems() blocks on it.
+        self.voltage_tap_gains = [float(g) for g in self.voltage_tap_gains]
+
     @property
     def channel_count(self) -> int:
         """How many voltage taps are configured. Should equal pack.series_count."""
         return len(self.voltage_channels)
+
+    def tap_scales(self):
+        """Volts at the module per volt at the DAQ input, one per tap, tap 1 first.
+
+        The divider multiplier, times that tap's own gain where the gains are a
+        full set. A set of the wrong length is not applied to anything: which
+        tap each value belonged to is no longer known, and safety_problems()
+        blocks ARM on it.
+        """
+        gains = self.voltage_tap_gains
+        if len(gains) != self.channel_count:
+            gains = [1.0] * self.channel_count
+        return [self.voltage_multiplier * g for g in gains]
 
     @property
     def sensor_count(self) -> int:
@@ -764,6 +806,21 @@ class DaqConfig:
             problems.append(f"Current transducer scale {self.current_amps_per_volt} A/V must "
                             f"be positive, or discharge current never reaches the "
                             f"over-current trip.")
+        # Tap gains scale the voltages every voltage trip reads. A set that does
+        # not line up with the taps, or a value no divider tolerance explains,
+        # means the cells are not being read as calibrated.
+        gains = self.voltage_tap_gains
+        if gains and len(gains) != self.channel_count:
+            problems.append(
+                f"{len(gains)} tap gains for {self.channel_count} voltage channels. One per "
+                f"tap, tap 1 first, or none; they are not applied until they match.")
+        bad = [i + 1 for i, g in enumerate(gains)
+               if not TAP_GAIN_MIN <= g <= TAP_GAIN_MAX]
+        if bad:
+            problems.append(
+                f"Tap gain(s) for tap {', '.join(map(str, bad))} are outside "
+                f"{TAP_GAIN_MIN:g} to {TAP_GAIN_MAX:g}. That is more than a divider's "
+                f"tolerance: check the tap, or correct the divider multiplier instead.")
 
         return problems
 
@@ -807,6 +864,7 @@ DAQ_FIELD_LABELS = {
     'voltage_channels':      ("Voltage channels", "comma separated"),
     'voltage_terminal_config': ("Voltage input mode", "RSE NRSE DIFF DEFAULT"),
     'voltage_multiplier':    ("Divider multiplier", "x"),
+    'voltage_tap_gains':     ("Tap gains", "one per tap, from tools/tap_calibrate.py; blank for none"),
     'current_amps_per_volt': ("Current transducer", "A/V"),
     'ai_min_volts':          ("Analog input min", "V"),
     'ai_max_volts':          ("Analog input max", "V"),

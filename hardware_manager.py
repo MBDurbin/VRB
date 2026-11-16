@@ -97,6 +97,17 @@ def read_available_lines(ser, pending):
     return lines, pending
 
 
+def scale_taps(raw_volts, scales):
+    """Tap voltages at the module, from the volts read at the DAQ's inputs.
+
+    `scales` is DaqConfig.tap_scales(): the divider multiplier times each tap's
+    own calibration gain. One multiplier used to serve all twelve taps, so each
+    divider's own error went straight into the cell voltages, and grew up the
+    stack because a cell is the difference of two taps.
+    """
+    return [v * s for v, s in zip(raw_volts, scales)]
+
+
 def derive_cell_voltages(cumulative_voltages):
     """Difference cumulative tap readings into per-cell voltages.
 
@@ -211,6 +222,15 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
         print(f"[DAQ CONFIG ERROR] {problem}")
     for problem in daq_cfg.advisories(pack):
         print(f"[DAQ WARNING] {problem}")
+
+    # Fixed for the life of the process, like the channel list they belong to.
+    tap_scales = daq_cfg.tap_scales()
+    if len(daq_cfg.voltage_tap_gains) == daq_cfg.channel_count and daq_cfg.channel_count:
+        print("[DAQ] Tap gains applied: "
+              + ", ".join(f"{g:.4f}" for g in daq_cfg.voltage_tap_gains))
+    else:
+        print(f"[DAQ] No tap gains: every tap takes the x{daq_cfg.voltage_multiplier:g} "
+              f"divider multiplier alone. tools/tap_calibrate.py measures them.")
 
     hardware_state = {
         'temp_ser': None,
@@ -428,8 +448,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                     daq_data = task.read()
                     current = daq_data[0] * daq_cfg.current_amps_per_volt
                     raw_daq_voltages = daq_data[1:]
-                    actual_cumulative_voltages = [
-                        v * daq_cfg.voltage_multiplier for v in raw_daq_voltages]
+                    actual_cumulative_voltages = scale_taps(raw_daq_voltages, tap_scales)
                 except Exception as exc:
                     # Lost mid-session: USB pulled, chassis powered down. This
                     # used to end the loop, so packets stopped and the logic

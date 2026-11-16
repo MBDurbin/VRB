@@ -338,6 +338,9 @@ INT_FIELD_RANGES = {
     'temp_baud_rate': (300, 2_000_000),
 }
 
+# Configure-dialog list fields that hold numbers, not channel names.
+NUMBER_LIST_FIELDS = {'voltage_tap_gains'}
+
 
 def override_command(mode, shown_value):
     """The SET_OVERRIDE command for a sidebar choice; mode None hands back to the profile."""
@@ -460,8 +463,12 @@ class ConfigDialog(QtWidgets.QDialog):
         if isinstance(value, list):
             # Channel lists edit as comma-separated text; order is meaningful
             # (channel i reads the cumulative tap for series group i).
-            w = QtWidgets.QLineEdit(", ".join(str(v) for v in value))
+            w = QtWidgets.QLineEdit(", ".join(f"{v:g}" if isinstance(v, float) else str(v)
+                                              for v in value))
             w.setProperty('is_list', True)
+            # A list of numbers has to come back as numbers. Its type cannot be
+            # read off the value: an empty list says nothing.
+            w.setProperty('of_numbers', name in NUMBER_LIST_FIELDS)
             w.editingFinished.connect(self.refresh_derived)
             return w
 
@@ -538,7 +545,10 @@ class ConfigDialog(QtWidgets.QDialog):
         if isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
             return widget.value()
         if widget.property('is_list'):
-            return [part.strip() for part in widget.text().split(',') if part.strip()]
+            parts = [part.strip() for part in widget.text().split(',') if part.strip()]
+            # float() raises on text that is not a number; collect()'s callers
+            # show that as an invalid configuration rather than saving it.
+            return [float(p) for p in parts] if widget.property('of_numbers') else parts
         return widget.text()
 
     def collect(self) -> RigConfig:
@@ -640,7 +650,8 @@ class ConfigDialog(QtWidgets.QDialog):
         elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
             widget.setValue(value)
         elif widget.property('is_list'):
-            widget.setText(", ".join(str(v) for v in value))
+            widget.setText(", ".join(f"{v:g}" if isinstance(v, float) else str(v)
+                                     for v in value))
         else:
             widget.setText(str(value))
 

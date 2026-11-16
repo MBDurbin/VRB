@@ -87,6 +87,33 @@ def test_configure_never_clamps_a_loaded_number(app):
     dialog.reject()
 
 
+def test_configure_hands_tap_gains_back_as_numbers(app):
+    # Channel lists come back as text. A list of gains must not: the DAQ
+    # multiplies every tap by them.
+    cfg = RigConfig.defaults()
+    dialog = ConfigDialog(cfg)
+    box = dialog.daq_widgets['voltage_tap_gains']
+    assert box.text() == "" and dialog.collect().daq.voltage_tap_gains == []
+
+    box.setText(", ".join(["1.004"] * 12))
+    saved = dialog.collect().daq
+    assert saved.voltage_tap_gains == [1.004] * 12
+    assert saved.voltage_channels == cfg.daq.voltage_channels     # still text
+
+    box.setText("1.004, high")
+    with pytest.raises(ValueError):
+        dialog.collect()
+    dialog.reject()
+
+
+def test_configure_shows_gains_that_are_already_set(app):
+    cfg = RigConfig.defaults()
+    cfg.daq.voltage_tap_gains = [1.0 + 0.001 * k for k in range(12)]
+    dialog = ConfigDialog(cfg)
+    assert dialog.collect().daq.voltage_tap_gains == pytest.approx(cfg.daq.voltage_tap_gains)
+    dialog.reject()
+
+
 # ================= SIDEBAR =================
 
 def test_warn_line_edit_keeps_derivation_and_sends_nothing(gui):

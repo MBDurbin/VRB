@@ -24,12 +24,12 @@ scholarship; the RS50 replaced it.
 
 | Per module | Value |
 |---|---|
-| Continuous discharge current | 280 A (70 A × 4P) |
+| Continuous discharge current | 280 A (70 A × 4P) until the cells reach 80 °C; 160 A (40 A × 4P) for a whole discharge |
 | Capacity | 20.0 Ah (19.8 Ah minimum) |
 | Charge voltage | 50.4 V |
 | Nominal voltage | 43.2 V |
 | Discharge cutoff | 30.0 V (2.5 V/cell; not on the RS50 listing — confirm) |
-| Internal resistance | 0.012 Ω (4 mΩ/cell; an estimate — confirm) |
+| Internal resistance | 0.0195 Ω (6.5 mΩ/cell, Mooch's measurement, October 2025) |
 | Discharge temperature limit | 80 °C |
 
 ---
@@ -124,7 +124,7 @@ puts the bank in circuit. A received `00000000` is converted to `00000001` —
 |---|---|---|---|---|---|---|---|---|
 | Bank | 8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 |
 | Resistance | 32 Ω | 16 Ω | 8 Ω | 4 Ω | 2 Ω | 1 Ω | 0.5 Ω | 0.25 Ω |
-| Arduino pin | 12 | 11 | 10 | 9 | 8 | 7 | 6 | 5 |
+| Arduino pin | 12 | **10** | **11** | 9 | 8 | 7 | 6 | 5 |
 
 The main contactor is pin 4. In software this table is `COMMAND_BANKS` and
 `BANK_RELAY_PIN` in `control_logic.py`; `tests/test_firmware_bank_map.py`
@@ -132,10 +132,13 @@ compiles the firmware and checks every one of the 255 settings against it.
 
 The host used to send the word reversed, least significant bank first, so 32 Ω
 arrived as `00000001` and switched in bank 1 alone: about 202 A / 10 kW at
-50.4 V instead of 1.6 A / 79 W. **Pin 5 is the only bank the firmware names.**
-That pins 6–12 carry banks 2–8 in order follows from the word being binary, and
-only a meter proves it: run `python tools/bench_relay_check.py`, `walk`, with
-the battery disconnected, before the first run and after any rewiring.
+50.4 V instead of 1.6 A / 79 W.
+
+**Which pin bypasses which bank is the relay board's wiring, and only a meter
+proves it**: run `python tools/bench_relay_check.py`, `walk`, with the battery
+disconnected, before the first run and after any rewiring. The October 2026
+walk found pin 10 on the 16 Ω bank and pin 11 on the 8 Ω bank, the other way
+round from the binary order, so the firmware and `BANK_RELAY_PIN` swap them.
 
 Firmware: `arduino/resistor_bank_controller/`.
 
@@ -185,6 +188,34 @@ output is where `DaqConfig.current_amps_per_volt = 100.0` comes from.
 down and feeds them to the NI-DAQ, which passes them to the application. The
 divider ratio is `DaqConfig.voltage_multiplier = 11.0` (a 10:1 divider).
 
+**The chassis** (cDAQ-9178, read with `tools/discover DAQ.py` in October 2026):
+
+| Slot | Module | Carries |
+|---|---|---|
+| 6 | NI 9212 + TB-9212 mini-TC | Bank thermocouples on jacks TC0, TC2, TC4, TC6 (`ai0`, `ai2`, `ai4`, `ai6`). The odd jacks are empty and read ~2284 °C, the module's open-thermocouple value |
+| 7 | NI 9215 (differential only) | Current sensor on `ai0`: signal on screw terminal 0 (AI0+), sensor 0 V on terminal 1 (AI0−) and terminal 9 (COM) |
+| 8 | NI 9205 (DSUB) + NI 9923 | The 12 cell taps, single-ended (RSE) against COM |
+
+**The 9205's D-SUB does not run in channel order**, and the NI 9923's terminal
+numbers are the D-SUB pin numbers (NI 9205 Getting Started Guide, Figure 1):
+
+| Terminals | Signal |
+|---|---|
+| 1–8 | AI0–AI7 |
+| 9 | DO0, a digital output: never a tap |
+| 10, 29 | COM: the tap ground, and the reference every RSE reading is measured against |
+| 11–18 | AI16–AI23 |
+| 19 | AISENSE |
+| 20–27 | AI8–AI15 |
+| 28 | PFI0 |
+| 30–37 | AI24–AI31 |
+
+The config expects ground on terminal 10 (COM), taps 1–7 on terminals 2–8,
+tap 8 on 20, tap 9 on 21, and taps 10–12 on 11–13. After any rewiring, power
+the taps and run `python tools/tap_map_check.py <top-of-stack volts>`: it reads
+every input and reports which tap each one carries, and whether
+`voltage_channels` matches.
+
 ---
 
 ## Gaps between the hardware and the software
@@ -198,8 +229,10 @@ resistor bank cooking. This is currently a procedural control only: *never run
 without the fan*.
 
 **2. Resistor thermal protection — banks 1–4 only.** One thermocouple per bank
-on banks 1–4, read by the NI-DAQ. The channels are `resistor_tc_channels` in
-`rig_config.json`, default `cDAQ1Mod3/ai0`–`ai3`, bank 1 first, Type K. They are
+on banks 1–4, read by an NI 9212 in slot 3 through its TB-9212 mini-TC block,
+on jacks TC0 (bank 1), TC2 (bank 2), TC4 (bank 3) and TC6 (bank 4). The channels
+are `resistor_tc_channels` in `rig_config.json`: `cDAQ1Mod3/ai0`, `ai2`, `ai4`,
+`ai6`, bank 1 first, Type K. They are
 read on their own thread so a slow thermocouple module cannot slow the voltage
 and current loop. Per-bank trips are `resistor_max_temp_c` in the `limits`
 section. Each bank is held to its own trip, which applies in every state and

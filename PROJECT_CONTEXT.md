@@ -4,8 +4,8 @@ Self-contained summary of the system, its validated constants, and its open
 questions. Written to be dropped into a Claude Project (or read cold by anyone
 new to the repo).
 
-Last updated: 2026-10-08. Reflects the move to Reliance RS50 cells and the
-October 2026 safety-review fixes.
+Last updated: 2026-11-04. Reflects the move to Reliance RS50 cells, the
+October 2026 safety-review fixes, and Mooch's measured RS50 figures.
 
 ---
 
@@ -287,7 +287,7 @@ compute_required_power(velocity_ms, acceleration, params=fast)
 
 | Field | Default | Notes |
 |---|---|---|
-| `mass_car_kg` / `mass_driver_kg` | 260 / 70 | 330 kg total |
+| `mass_car_kg` / `mass_driver_kg` | 233 / 95.3 | 328.3 kg total: the 2026 car as weighed with today's pack, and the heaviest driver (210 lb) |
 | `rotational_mass_factor` | 1.05 | Wheels, rotors, axles, drivetrain as virtual mass |
 | `air_density_kgm3` | 1.2255 | ISA sea level, 15 °C |
 | `gravity_ms2` | 9.81 | |
@@ -321,20 +321,23 @@ than lost in quantisation.
 
 The module has been **Reliance RS50** since it replaced the Molicel
 INR-21700-P45B. The figures come from the supplier's listing (liionwholesale.com,
-"Reliance RS50 70A 5000mAh Flat Top 21700"); there is no RS50 datasheet in the
-repo yet. Two figures the rig needs are **not on that listing** and are flagged
-below. The P45B's datasheet stays in `datasheets/` for reference: some tests pin
-the derivation math to its published figures.
+"Reliance RS50 70A 5000mAh Flat Top 21700") and from **Mooch's independent test
+of the cell (October 2025)**, which the team has from Discord. There is still no
+manufacturer datasheet. Mooch's card asks that it not be shared after April
+2026, so only its numbers are recorded here, not the card or its charts. The
+P45B's datasheet stays in `datasheets/` for reference: some tests pin the
+derivation math to its published figures.
 
 | Quantity | Cell | 12S4P module | Source |
 |---|---|---|---|
-| Capacity | 5000 mAh typical, 4950 mAh min (0.2 C) | 20.0 Ah (19.8 Ah min) | listing |
+| Capacity | 5000 mAh typical, 4950 mAh min (0.2 C) | 20.0 Ah (19.8 Ah min) | listing; Mooch measured 4950 mAh |
 | Full charge | 4.2 V | 50.4 V | listing ("peak voltage") |
 | Nominal | 3.6 V | 43.2 V | listing |
-| Max continuous discharge | 70 A "with 80 °C temperature cut-off" | **280 A** | listing |
-| Discharge temperature limit | 80 °C | 80 °C over-temp trip | listing (its only temperature figure) |
-| Discharge cutoff | 2.5 V | 30.0 V absolute floor | **not on the listing** — usual for the class; confirm |
-| DC internal resistance | 4 mΩ | 12 mΩ | **not on the listing** — an estimate; confirm or measure |
+| Max continuous discharge | 70 A "with 80 °C temperature cut-off" | **280 A** | listing; Mooch confirms 70 A holds only until 80 °C |
+| True continuous (stays under 80 °C) | 40 A | 160 A | Mooch |
+| Discharge temperature limit | 80 °C | 80 °C over-temp trip | listing (its only temperature figure); Mooch rates to the same 80 °C |
+| Discharge cutoff | 2.5 V | 30.0 V absolute floor | **not on the listing**; Mooch's capacity runs end at 2.5 V; no manufacturer figure |
+| DC internal resistance | 6.5 mΩ | 19.5 mΩ | Mooch (was a 4 mΩ estimate); about 8 mΩ effective over a sustained discharge |
 | Energy | 18 Wh | 864 Wh | 5.0 Ah × 3.6 V |
 | Charge current | 15 A max, 8 A standard | — | listing; the rig never charges |
 
@@ -347,12 +350,24 @@ rating carried an 80 °C *test* cut-off while its discharge operating range
 stopped at 60 °C, so the rig used 60. The RS50 listing gives only the 80 °C
 cut-off with its 70 A rating and no separate operating range, so the rig trips at
 80. Lower `cell_max_temp_c` if an RS50 datasheet gives a narrower discharge range.
+The shipped `rig_config.json` uses 65 °C: the sensors sit on the cell tops, which
+read cooler than the side wall a cell test measures.
+
+**70 A, not 40 A, sets the current rating, because the rig enforces the 80 °C
+condition.** Mooch's 70 A holds only until the cell reaches 80 °C; 40 A is what
+it carries for a whole discharge. Every cell has a temperature sensor and the
+over-temp trip sits under 80 °C, so the rig enforces the condition the 70 A
+depends on. The ladder's ~200 A at the bottom step is 50 A per cell, past the
+40 A: a long run at the heaviest settings ends on the temperature trip, not the
+current one. That is the intended order. If the temperature sensors are ever
+off or unplugged, set `cell_max_continuous_a` to 40.
 
 **Why the undervoltage trip sits at 36.0 V and not 30.0 V:** headroom for sag.
-The RS50 module's 12 mΩ sags 3.4 V at its 280 A rating, about 2.4 V at the
-~200 A the ladder can actually draw. The 3.0 V/cell figure came from the P45B,
-whose 45 mΩ sagged 8.1 V at 180 A; it still leaves the RS50 well clear of its
-cutoff.
+The RS50 module's 19.5 mΩ sags 5.5 V at its 280 A rating, about 3.9 V at the
+~200 A the ladder can actually draw (about 4.8 V once polarisation builds over a
+sustained discharge, at Mooch's ~8 mΩ effective). The 3.0 V/cell figure came
+from the P45B, whose 45 mΩ sagged 8.1 V at 180 A; it still leaves the RS50 well
+clear of its cutoff.
 
 `rig_config.json` used to say `max_amps: 180`, the P45B's figure. With
 `derive_from_pack: true` it was replaced by the RS50's 275 A on every load, behind
@@ -525,6 +540,41 @@ power, and the E-STOP command dispatch path.
 structurally cannot reach — process/queue plumbing, GUI responsiveness, timing,
 and shutdown hygiene. Requires the SIL dongle; no battery or DAQ needed.
 
+`tests/BENCH_CHECKLIST.md` tests every trip on the real hardware with bench
+supplies in place of the module: a 30 V / 100 A supply on the power terminals
+and a tap supply into a 12-resistor divider on the cell taps. Three things
+support it, and all three work the same with a battery:
+
+- **The trip log**, `logs/trip_log.csv`. Every stop and fault, one row each,
+  with the reading and limit that tripped it and the milliseconds from the DAQ
+  sample to the KILL. KILL now goes out before the trip is printed or logged.
+  The GUI shows the reason in red beside the hardware pills (`TRIPPED: ...`).
+- **The load override**, in the sidebar: hold a fixed resistance, or a fixed
+  power at the bank (V²/R on the measured module voltage, re-solved every
+  0.5 s), before or during a run. The run keeps the profile's timing and laps.
+  Not saved; every session starts on the profile.
+- **Bench profiles**, a `Resistance (ohm)` column in place of `Speed (mph)`
+  (`profiles/Bench - *.csv`). A 0 Ω row refuses the profile, since the ladder
+  would read it as its heaviest load.
+
+The override and bench rows go through `steps_for_resistance()`, the same
+floors and ratings as a lap row, so neither can command more load than a lap at
+full demand.
+
+**DC resistance, the first module-on measurement.** `profiles/Bench - DC
+Resistance Pulses.csv` steps the module from rest into 12 s pulses at 2.5, 1.25
+and 0.75 Ω (about 20, 40 and 67 A), then takes about a tenth of its charge at
+1.5 Ω. Each pulse uses two or more banks, so no bank rating moves it at either
+bank setting. Record 8 laps from full, then `python tools/dcir_from_log.py`
+reads the newest recording and prints the module's and each cell's resistance at
+1 s and 10 s, down the charge, against `cell_dc_milliohm`. The 0.75 Ω pulse
+needs `max_amps` above 67 A; at the bench-supply 60 A it repeats the 1.25 Ω one.
+Mooch measured 6.5 mΩ per cell, and `cell_dc_milliohm` now carries it; the
+1 s reading should land near that, and the 10 s reading higher (about 8 mΩ). The
+figure matters beyond the rig: the 2027 pack study's cell heat scales with it,
+1.6× from the old 4.0 mΩ estimate to 6.5 mΩ. A module that reads well above
+6.5 mΩ per cell has a weak cell group or a poor collector-plate weld.
+
 ## Bugs found and fixed (2026-07-23 → 25)
 
 | Bug | Consequence |
@@ -555,7 +605,8 @@ doing it on every `RUN` was not.
 rather than *minimum* (4950 mAh, → 19.8 Ah), overstating by up to 1 %; and it
 ignores rate dependence, though the ~200 A the ladder can draw is a 10 C
 discharge where real deliverable capacity is meaningfully lower. Quantifying the
-second needs a discharge-rate curve, and the RS50 listing has none.
+second needs a discharge-rate curve. The RS50 listing has none; Mooch's test has
+curves at 5, 20, 40 and 70 A, not yet folded into the SOC estimate.
 
 **2. The regen branch of the power model is currently inert.**
 `compute_target_resistance()` maps any `req_power <= 0` to `MAX_RESISTANCE`, so

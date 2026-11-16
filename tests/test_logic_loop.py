@@ -8,6 +8,7 @@ it, the DAQ is a thread feeding packets, and the config is the built-in
 defaults rather than whatever rig_config.json holds. Each test takes about a
 second.
 """
+import csv
 import os
 import queue
 import sys
@@ -26,6 +27,7 @@ from rig_config import RigConfig
 def daq_packet(ni_daq, amps=50.0):
     """A healthy rig with the DAQ up, or what hardware_manager sends without it."""
     packet = {
+        'sampled_at': time.time(),
         'amps': amps, 'voltage': 46.0, 'cell_voltages': [3.85] * 12, 'power_kw': 2.3,
         'temperatures': [[30.0] * 8 for _ in range(6)], 'max_temp': 30.0,
         'temp_age_s': 0.05, 'temp_sensor_ages_s': [[0.05] * 8 for _ in range(6)],
@@ -142,8 +144,11 @@ class Rig:
 
 
 @pytest.fixture
-def rig(monkeypatch):
+def rig(monkeypatch, tmp_path):
+    # Trips go to this test's folder, never the rig's own logs/trip_log.csv.
+    monkeypatch.setattr(cl, "TRIP_LOG_PATH", str(tmp_path / "trip_log.csv"))
     r = Rig(monkeypatch)
+    r.trip_log = tmp_path / "trip_log.csv"
     yield r
     r.close()
 
@@ -612,3 +617,159 @@ def test_unstamped_transition_is_refused(rig, capsys):
     time.sleep(0.5)
     assert rig.state == "IDLE"
     assert "Ignoring ARM: no issue time." in capsys.readouterr().out
+
+
+# ================= TRIP LOG AND TRIP REASON =================
+
+def read_trip_log(rig):
+    with open(rig.trip_log, newline='', encoding='utf-8') as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_a_trip_mid_run_is_logged_after_the_kill(rig, monkeypatch, capsys):
+    run_to_running(rig)
+    # What the controller had been sent when the log was written.
+    sent_before_log = []
+    real_append = cl.append_trip_log
+
+    def spy(record, path=None):
+        sent_before_log.append(rig.resistor.written())
+        return real_append(record, path)
+    monkeypatch.setattr(cl, "append_trip_log", spy)
+
+    rig.amps = 400.0                        # past the 280 A trip
+    rig.wait_for("FAULT")
+    time.sleep(0.2)
+
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['State'], row['Kill_Sent']) == ("OVERCURRENT", "RUNNING", "yes")
+    assert row['Detail'] == "Current 400.0 A (trip 280.0 A)"
+    assert row['Amps'] == "400.0" and row['Module_V'] == "46.00"
+    assert 0 <= float(row['Sample_To_Kill_ms']) < 1000
+    assert b"KILL\n" in sent_before_log[0]
+    assert "[LOGIC] Current 400.0 A (trip 280.0 A)" in capsys.readouterr().out
+
+
+def test_the_trip_reason_reaches_the_gui_until_reset(rig):
+    run_to_running(rig)
+    rig.amps = 400.0
+    rig.wait_for("FAULT")
+    time.sleep(0.2)
+    assert rig.last['fault_reason'] == "OVERCURRENT"
+    assert rig.last['fault_detail'] == ["Current 400.0 A (trip 280.0 A)"]
+
+    rig.amps = 50.0
+    time.sleep(0.2)
+    rig.cmd_q.put(cl.transition_command("RESET"))
+    rig.wait_for("IDLE")
+    assert rig.last['fault_reason'] is None and rig.last['fault_detail'] == []
+
+
+def test_an_estop_is_logged_with_the_state_it_stopped(rig):
+    run_to_running(rig)
+    rig.estop.set()
+    rig.wait_for("FAULT")
+    time.sleep(0.2)
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['State'], row['Kill_Sent']) == ("E-STOP", "RUNNING", "yes")
+    assert rig.last['fault_reason'] == "E-STOP"
+
+
+def test_a_lost_controller_is_logged_as_no_kill_sent(rig):
+    run_to_running(rig)
+    rig.resistor.fail = True
+    rig.wait_for("FAULT", timeout=2.0)
+    time.sleep(0.2)
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['Kill_Sent']) == ("RESISTOR LINK LOST", "NO")
+
+
+# ================= LOAD OVERRIDE AND BENCH PROFILES =================
+
+def settings_sent(rig, since=0):
+    """Every ladder setting written since write number `since`, in steps."""
+    return [cl.decode_word(w.decode().strip()) for w in rig.resistor.written()[since:]
+            if is_resistance_command(w)]
+
+
+def wait_for_setting(rig, steps, since=0, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while steps not in settings_sent(rig, since):
+        assert time.monotonic() < deadline, \
+            f"never commanded {steps} steps; sent {settings_sent(rig, since)}"
+        time.sleep(0.01)
+
+
+def arm_and_run(rig):
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
+    rig.wait_for("RUNNING")
+
+
+def test_an_override_set_before_run_holds_its_resistance(rig, monkeypatch):
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 6)    # the profile: 1.5 ohm
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("SET_OVERRIDE", "RESISTANCE", 1.0))
+    arm_and_run(rig)
+
+    wait_for_setting(rig, 4)
+    time.sleep(1.5)                         # across at least one profile row
+    assert set(settings_sent(rig)) == {4}
+    assert rig.last['load_override'] == ("RESISTANCE", 1.0)
+
+
+def test_an_override_changed_mid_run_reaches_the_bank_before_the_next_row(rig, monkeypatch):
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 6)
+    run_to_running(rig)
+    wait_for_setting(rig, 6)
+
+    since = len(rig.resistor.written())
+    sent = time.monotonic()
+    rig.cmd_q.put(("SET_OVERRIDE", "POWER", 46.0 ** 2 / 2.0))  # 2.0 ohm at 46 V
+    wait_for_setting(rig, 8, since)
+    assert time.monotonic() - sent < 0.5    # the shipped rows are 1 s apart
+
+    # Handed back: the profile's own setting at once, not at the next row.
+    since = len(rig.resistor.written())
+    rig.cmd_q.put(("SET_OVERRIDE", None))
+    wait_for_setting(rig, 6, since, timeout=0.5)
+
+
+def test_an_override_is_held_to_the_current_limit(rig):
+    rig.amps = 20.0
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(sidebar_limits(max_amps=40.0))          # floor 46 / 40 = 1.15 ohm
+    rig.cmd_q.put(("SET_OVERRIDE", "RESISTANCE", 0.25))
+    arm_and_run(rig)
+
+    wait_for_setting(rig, 5)                # 1.25 ohm, the first step over the floor
+    time.sleep(1.0)
+    assert min(settings_sent(rig)) == 5
+
+
+def test_a_malformed_override_changes_nothing(rig, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("SET_OVERRIDE", "RESISTANCE", 1.0))
+    rig.cmd_q.put(("SET_OVERRIDE", "RESISTANCE", 0.0))
+    time.sleep(0.5)
+    assert rig.last['load_override'] == ("RESISTANCE", 1.0)
+    assert "Ignoring load override" in capsys.readouterr().out
+
+
+def test_a_bench_profile_sets_the_resistance_it_names(rig, tmp_path):
+    profile = tmp_path / "bench.csv"
+    profile.write_text(f"Time (s),{cl.RESISTANCE_COLUMN}\n0,63.75\n0.3,2\n0.6,63.75\n")
+    # The fake DAQ's current does not follow the ladder. 50 A through 63.75 ohm
+    # would rightly trip banks 7 and 8; keep it under every bank's share.
+    rig.amps = 0.5
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("LOAD_CSV", str(profile)))
+    arm_and_run(rig)
+
+    rig.wait_for("IDLE", timeout=4.0)       # the run ends with the profile
+    assert settings_sent(rig) == [255, 8, 255]

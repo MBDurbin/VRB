@@ -158,6 +158,9 @@ def run_scenario(sc):
     log = io.StringIO()
     t_hang = None
     with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(log):
+        # A simulated trip belongs in the scenario's folder, not the rig's own
+        # trip log in logs/.
+        cl.TRIP_LOG_PATH = os.path.join(tmp, "trip_log.csv")
         # The shipped lap's speeds, re-timed to this scenario's row spacing.
         profile = pd.read_csv(cl.CSV_FILENAME).head(sc.rows).copy()
         profile["Time (s)"] = [sc.row_dt * i for i in range(len(profile))]

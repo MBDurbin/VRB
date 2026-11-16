@@ -18,8 +18,96 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import hardware_manager
 from hardware_manager import (
     derive_cell_voltages, parse_temperature_line, temperature_sensor_ages,
-    apply_thermocouple_readings, reading_ages, TC_MAX_C)
+    apply_thermocouple_readings, reading_ages, TC_MAX_C, await_identity,
+    read_available_lines, MAX_PENDING_BYTES)
 from rig_config import RigConfig
+
+
+# ================= READING THE TEMPERATURE STREAM =================
+
+class WaitingBytes:
+    """A port holding exactly `data`; it refuses any call that could wait."""
+
+    def __init__(self, data):
+        self.data = data
+
+    @property
+    def in_waiting(self):
+        return len(self.data)
+
+    def read(self, n):
+        assert n <= len(self.data), "asked for more than was waiting: that read would block"
+        chunk, self.data = self.data[:n], self.data[n:]
+        return chunk
+
+    def readlines(self):
+        raise AssertionError("readlines() waits for the port to go quiet")
+
+
+class TestReadAvailableLines:
+    def test_complete_lines_now_and_the_partial_one_kept(self):
+        port = WaitingBytes(b"1,20.0,20.5\r\n2,19.5,19.")
+        lines, pending = read_available_lines(port, b"")
+        assert lines == [b"1,20.0,20.5\r"]
+        assert pending == b"2,19.5,19."
+        port.data = b"5\r\n"
+        lines, pending = read_available_lines(port, pending)
+        assert lines == [b"2,19.5,19.5\r"] and pending == b""
+
+    def test_nothing_waiting_reads_nothing(self):
+        lines, pending = read_available_lines(WaitingBytes(b""), b"3,20")
+        assert lines == [] and pending == b"3,20"
+
+    def test_a_runaway_part_line_is_dropped(self):
+        _, pending = read_available_lines(WaitingBytes(b"x" * (MAX_PENDING_BYTES + 1)), b"")
+        assert pending == b""
+
+
+# ================= FINDING THE TEMPERATURE BOARD =================
+
+class BootingBoard:
+    """A port to an Arduino that hears nothing until it has booted, then
+    answers each ?WHOAMI behind a line of streamed readings."""
+
+    def __init__(self, boot_s, identity=b"TEMP_SENSOR"):
+        self.ready_at = time.monotonic() + boot_s
+        self.identity = identity
+        self.out = b""
+
+    def write(self, data):
+        if time.monotonic() >= self.ready_at and data == b"?WHOAMI\n":
+            self.out += b"1,19.5,20.0,19.5\r\n" + self.identity + b"\r\n"
+
+    @property
+    def in_waiting(self):
+        return len(self.out)
+
+    def read(self, n=1):
+        if not self.out:
+            time.sleep(0.01)            # the port's short read timeout
+            return b""
+        chunk, self.out = self.out[:n], self.out[n:]
+        return chunk
+
+
+class TestAwaitIdentity:
+    """Opening a port resets the Arduino. The temperature board takes ~4.8 s to
+    boot, so one ?WHOAMI at 2 s was always lost and the rig never found it."""
+
+    def test_a_board_still_booting_at_the_first_ask_is_found(self):
+        assert await_identity(BootingBoard(boot_s=0.3), "TEMP_SENSOR",
+                              timeout_s=1.0, retry_s=0.1)
+
+    def test_gives_up_when_the_board_never_answers(self):
+        started = time.monotonic()
+        assert not await_identity(BootingBoard(boot_s=60.0), "TEMP_SENSOR",
+                                  timeout_s=0.3, retry_s=0.1)
+        assert time.monotonic() - started < 0.6
+
+    def test_another_board_is_not_taken_for_it(self):
+        for other in (b"RESISTOR_CTRL", b"TEMP_SENSOR_2"):
+            assert not await_identity(BootingBoard(boot_s=0.0, identity=other), "TEMP_SENSOR",
+                                      timeout_s=0.3, retry_s=0.1)
 
 
 # ================= CELL VOLTAGE DIFFERENCING =================
@@ -221,8 +309,9 @@ class TestNoNiDaq:
     from a real one.
     """
 
-    def _collect(self, monkeypatch, task_factory, seconds=1.2, packets=None):
-        monkeypatch.setattr(hardware_manager.serial.tools.list_ports, "comports", lambda: [])
+    def _collect(self, monkeypatch, task_factory, seconds=1.2, packets=None, ports=()):
+        monkeypatch.setattr(hardware_manager.serial.tools.list_ports, "comports",
+                            lambda: list(ports))
         monkeypatch.setattr(hardware_manager.nidaqmx, "Task", task_factory)
 
         config = RigConfig.defaults()
@@ -269,6 +358,9 @@ class TestNoNiDaq:
                     raise RuntimeError("device removed")
                 return [0.5] + [0.35 * (i + 1) for i in range(12)]
 
+            def start(self):
+                pass
+
             def close(self):
                 self.closed = True
 
@@ -284,6 +376,90 @@ class TestNoNiDaq:
         for p in offline:
             assert p['amps'] == 0.0 and p['voltage'] == 0.0 and p['cell_voltages'] == []
         assert tasks[0].closed
+
+    def test_a_temperature_board_that_never_pauses_cannot_stall_the_loop(self, monkeypatch):
+        # The board streams nonstop. readlines() waited for it to go quiet, so
+        # once it was connected the DAQ loop stopped publishing altogether.
+        class Port:
+            device = "COM9"
+
+        class NonstopBoard:
+            LINES = [(f"{bus}," + ",".join(["21.5"] * 8) + "\r\n").encode()
+                     for bus in range(1, 7)]
+
+            is_open = True
+
+            def __init__(self, port, *args, **kwargs):
+                self.port, self.buf, self.n = port, b"", 0
+
+            def _fill(self, size):
+                while len(self.buf) < size:
+                    self.buf += self.LINES[self.n % 6]
+                    self.n += 1
+
+            @property
+            def in_waiting(self):
+                self._fill(300)
+                return len(self.buf)
+
+            def read(self, size=1):
+                self._fill(size)
+                chunk, self.buf = self.buf[:size], self.buf[size:]
+                return chunk
+
+            def write(self, data):
+                if data == b"?WHOAMI\n":
+                    self.buf += b"TEMP_SENSOR\r\n"
+
+            def reset_input_buffer(self):
+                self.buf = b""
+
+            def readlines(self):
+                raise AssertionError("readlines() never returns on this board")
+
+            def close(self):
+                pass
+
+        def no_daq():
+            raise RuntimeError("DaqNotFoundError")
+
+        monkeypatch.setattr(hardware_manager.serial, "Serial", NonstopBoard)
+        _, packets = self._collect(monkeypatch, no_daq, seconds=3.5, ports=[Port()])
+
+        connected = [p for p in packets if p['hardware_status']['temp_arduino']]
+        assert len(connected) >= 5          # still publishing at ~10 Hz after the claim
+        assert connected[-1]['temperatures'] == [[21.5] * 8 for _ in range(6)]
+
+    def test_taps_are_read_in_the_configured_mode_and_the_current_is_not(self, monkeypatch):
+        # On a 9205 the driver's default can pair two taps as one differential
+        # input, so the taps are set explicitly. The current is on a 9215, which
+        # is differential only and refuses RSE.
+        added, started = [], []
+
+        class Channels(_FakeChannels):
+            def add_ai_voltage_chan(self, channel, **kwargs):
+                added.append((channel, kwargs.get('terminal_config')))
+
+        class RecordingTask:
+            def __init__(self):
+                self.ai_channels = Channels()
+
+            def read(self):
+                return [0.0] + [0.3 * (i + 1) for i in range(12)]
+
+            def start(self):
+                started.append(True)
+
+            def close(self):
+                pass
+
+        config, _ = self._collect(monkeypatch, RecordingTask, seconds=0.3)
+        rse = hardware_manager.TerminalConfiguration.RSE
+        assert added[0] == (config.daq.current_channel, None)
+        assert added[1:] == [(ch, rse) for ch in config.daq.voltage_channels]
+        # Started once: a task never started is started and stopped around
+        # every read, 113 ms a read on the rig against 2 ms.
+        assert started == [True]
 
 
 class DrainedBeforeGet(queue.Queue):

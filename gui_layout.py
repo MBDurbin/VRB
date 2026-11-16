@@ -12,7 +12,8 @@ from rig_config import (
     VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, DAQ_FIELD_LABELS, field_label,
 )
 from control_logic import (DEFAULT_LAP_CSV, PROFILES_DIR, PROJECT_DIR, VRB_MAX_POWER_W,
-                           BANK_OVERLOAD_FACTOR, transition_command)
+                           BANK_OVERLOAD_FACTOR, MAX_RESISTANCE, RESISTOR_RESOLUTION,
+                           transition_command)
 import theme
 from PyQt6 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
@@ -197,6 +198,56 @@ def arm_refusal_summary(refusals):
     return f"WILL NOT ARM: {refusals[0]}{more}"
 
 
+# The sidebar's load override: the choices, in order, as (label, mode), and how
+# the value box reads for each mode. `scale` turns the box's unit into the SI
+# value the controller takes (control_logic.parse_override). Every mode starts
+# at a light load, and nothing here is saved: each session starts on the profile.
+OVERRIDE_CHOICES = (("Lap profile", None),
+                    ("Fixed resistance", "RESISTANCE"),
+                    ("Fixed power", "POWER"))
+OVERRIDE_SPINS = {
+    "RESISTANCE": dict(unit="Ω", low=RESISTOR_RESOLUTION, high=MAX_RESISTANCE,
+                       step=RESISTOR_RESOLUTION, start=MAX_RESISTANCE, scale=1.0),
+    "POWER": dict(unit="kW", low=0.01, high=20.0, step=0.1, start=0.5, scale=1000.0),
+}
+
+
+# Range of the Configure dialog's whole-number boxes. The default suits counts:
+# cells in series or parallel, modules, buses, sensors per bus. The baud rate
+# needs more: it used to share 1-999, so opening Configure and pressing Save
+# turned the temperature board's 115200 into 999, and the rig never found it.
+DEFAULT_INT_RANGE = (1, 999)
+INT_FIELD_RANGES = {
+    'temp_baud_rate': (300, 2_000_000),
+}
+
+
+def override_command(mode, shown_value):
+    """The SET_OVERRIDE command for a sidebar choice; mode None hands back to the profile."""
+    if mode is None:
+        return ("SET_OVERRIDE", None)
+    return ("SET_OVERRIDE", mode, shown_value * OVERRIDE_SPINS[mode]['scale'])
+
+
+def override_status(override, fsm_state, target_res):
+    """The line under the override controls: what the controller is holding."""
+    if not override:
+        return "Profile sets the load"
+    mode, value = override
+    asked = f"{value:.2f} Ω" if mode == "RESISTANCE" else f"{value / 1000.0:.2f} kW"
+    if fsm_state == "RUNNING":
+        return f"Holding {asked}, ladder at {target_res:.2f} Ω"
+    return f"Holds {asked} from RUN"
+
+
+def fault_summary(reason, detail):
+    """One line for the main window: why the rig faulted, and the first detail."""
+    if not reason:
+        return ""
+    first = next((line.strip().removeprefix("- ") for line in detail if line.strip()), "")
+    return f"TRIPPED: {reason}" + (f". {first}" if first else "")
+
+
 # ================= CONFIGURATION DIALOG =================
 
 class ConfigDialog(QtWidgets.QDialog):
@@ -284,8 +335,11 @@ class ConfigDialog(QtWidgets.QDialog):
 
     # --- tab construction -------------------------------------------------
 
-    def _make_editor(self, value):
-        """Build an input widget appropriate to the value's type."""
+    def _make_editor(self, value, name=None):
+        """Build an input widget appropriate to the value's type.
+
+        `name` is the field's name, for the ranges in INT_FIELD_RANGES.
+        """
         if isinstance(value, list):
             # Channel lists edit as comma-separated text; order is meaningful
             # (channel i reads the cumulative tap for series group i).
@@ -300,7 +354,10 @@ class ConfigDialog(QtWidgets.QDialog):
             w.stateChanged.connect(self.refresh_derived)
         elif isinstance(value, int):
             w = QtWidgets.QSpinBox()
-            w.setRange(1, 999)
+            low, high = INT_FIELD_RANGES.get(name, DEFAULT_INT_RANGE)
+            # Never narrower than the value loaded: a spinbox clamps silently,
+            # and Save would then write the clamped number back to the file.
+            w.setRange(min(low, value), max(high, value))
             w.setValue(value)
             w.setKeyboardTracking(False)
             w.valueChanged.connect(self.refresh_derived)
@@ -338,7 +395,7 @@ class ConfigDialog(QtWidgets.QDialog):
             )
             label.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: {theme.SIZE_SMALL}px;")
 
-            editor = self._make_editor(value)
+            editor = self._make_editor(value, f.name)
             widget_store[f.name] = editor
             form.addRow(label, editor)
 
@@ -1014,7 +1071,20 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.lbl_arm_refused.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
                                            QtWidgets.QSizePolicy.Policy.Preferred)
         self.shown_arm_refusals = []
+
+        # Why the rig faulted, from the logic process: the trip, and the reading
+        # and limit it crossed. The banner only says FAULT. Full detail in the
+        # tooltip; every trip is also written to logs/trip_log.csv.
+        self.lbl_fault_reason = QtWidgets.QLabel()
+        self.lbl_fault_reason.setStyleSheet(
+            f"color: {theme.DANGER}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+        self.lbl_fault_reason.setVisible(False)
+        self.lbl_fault_reason.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                            QtWidgets.QSizePolicy.Policy.Preferred)
+        self.shown_fault = ("", [])
+
         hw_layout.addSpacing(theme.GAP_MD)
+        hw_layout.addWidget(self.lbl_fault_reason, 1)
         hw_layout.addWidget(self.lbl_arm_refused, 1)
         main_layout.addLayout(hw_layout)
 
@@ -1172,8 +1242,74 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.chk_derate.stateChanged.connect(self.handle_limit_change)
         self.chk_bank_rated.stateChanged.connect(self.handle_bank_rating_change)
 
+        # --- LOAD OVERRIDE ---
+        # Takes the load off the profile: a resistance, or a power at the bank,
+        # chosen here, before or during a run. The run keeps the profile's
+        # timing and laps, and the controller holds the override to every floor
+        # and rating a lap row is held to.
+        override_card = QtWidgets.QFrame()
+        override_card.setProperty("variant", "card")
+        override_inner = QtWidgets.QVBoxLayout(override_card)
+        override_inner.setContentsMargins(theme.GAP_MD, theme.GAP_MD, theme.GAP_MD, theme.GAP_MD)
+        override_inner.setSpacing(theme.GAP_SM)
+
+        override_label = QtWidgets.QLabel("LOAD OVERRIDE")
+        override_label.setProperty("variant", "section")
+        override_inner.addWidget(override_label)
+
+        self.cmb_override = QtWidgets.QComboBox()
+        for text, mode in OVERRIDE_CHOICES:
+            self.cmb_override.addItem(text, mode)
+        self.cmb_override.setToolTip(
+            "Fixed resistance: hold the ladder at this resistance.\n"
+            "Fixed power: hold this power at the bank (module V x I, as the Power card shows),\n"
+            "re-solved as the module voltage falls.\n"
+            "Both are still held to the current limit, the bank's ratings and the derate.")
+
+        # Keyboard tracking off, as for the thresholds: typing 0.5 must not send
+        # the 0 and the 0. on the way, mid-run.
+        self.sb_override = QtWidgets.QDoubleSpinBox()
+        self.sb_override.setKeyboardTracking(False)
+        self.sb_override.setDecimals(2)
+        self.sb_override.setFixedWidth(104)
+        self.override_values = {mode: spec['start'] for mode, spec in OVERRIDE_SPINS.items()}
+
+        override_row = QtWidgets.QHBoxLayout()
+        override_row.setSpacing(theme.GAP_SM)
+        override_row.addWidget(self.cmb_override, 1)
+        override_row.addWidget(self.sb_override)
+        override_inner.addLayout(override_row)
+
+        self.lbl_override_status = QtWidgets.QLabel()
+        self.lbl_override_status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                               QtWidgets.QSizePolicy.Policy.Preferred)
+        override_inner.addWidget(self.lbl_override_status)
+        cell_layout.addWidget(override_card)
+
+        # What this window last asked for, and when, to check the controller took it.
+        self.override_wanted = None
+        self.override_sent_at = 0.0
+        self.shown_override_status = None
+        self.configure_override_box(None)
+        self.show_override_status(override_status(None, "", 0.0), theme.TEXT_DIM)
+
+        self.cmb_override.currentIndexChanged.connect(self.handle_override_mode)
+        self.sb_override.valueChanged.connect(self.handle_override_value)
+
         cell_layout.addStretch()
-        mid_layout.addWidget(sidebar)
+
+        # Scrolls when the window is shorter than the sidebar. Without it, a
+        # maximized window on a laptop screen at 125% scaling squeezed the
+        # sidebar below its own height and crushed the threshold boxes to 8 px,
+        # too small to read or edit. The extra width is for the scrollbar.
+        self.sidebar_scroll = QtWidgets.QScrollArea()
+        self.sidebar_scroll.setWidget(sidebar)
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setFixedWidth(sidebar.width() + 14)
+        self.sidebar_scroll.viewport().setAutoFillBackground(False)
+        mid_layout.addWidget(self.sidebar_scroll)
         main_layout.addLayout(mid_layout)
 
     def send_command(self, cmd):
@@ -1428,6 +1564,59 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.config.limits.bank_rated_power_only = self.chk_bank_rated.isChecked()
         self.send_command(("SET_LIMITS", self.config.limits.to_command_dict()))
 
+    def configure_override_box(self, mode):
+        """Set the value box's unit and range for `mode`, showing that mode's last value.
+
+        Signals blocked: changing the range can move the value, and that must
+        not send an override the operator never chose.
+        """
+        spec = OVERRIDE_SPINS[mode or "RESISTANCE"]
+        box = self.sb_override
+        box.blockSignals(True)
+        box.setSuffix(f" {spec['unit']}")
+        box.setRange(spec['low'], spec['high'])
+        box.setSingleStep(spec['step'])
+        box.setValue(self.override_values[mode or "RESISTANCE"])
+        box.setEnabled(mode is not None)
+        box.blockSignals(False)
+
+    def handle_override_mode(self):
+        mode = self.cmb_override.currentData()
+        self.configure_override_box(mode)
+        self.send_override()
+
+    def handle_override_value(self):
+        mode = self.cmb_override.currentData()
+        if mode is not None:
+            self.override_values[mode] = self.sb_override.value()
+            self.send_override()
+
+    def send_override(self):
+        cmd = override_command(self.cmb_override.currentData(), self.sb_override.value())
+        self.override_wanted = cmd[1:] if cmd[1] is not None else None
+        self.override_sent_at = time.time()
+        self.send_command(cmd)
+
+    def show_override_status(self, text, colour):
+        if (text, colour) != self.shown_override_status:
+            self.shown_override_status = (text, colour)
+            self.lbl_override_status.setText(text)
+            self.lbl_override_status.setStyleSheet(
+                f"color: {colour}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+
+    def update_override_status(self, latest_data):
+        """What the controller is holding, in amber while an override is in force,
+        or in red once it has not taken this window's choice within the grace."""
+        in_force = latest_data.get('load_override')
+        in_force = tuple(in_force) if in_force else None
+        status = override_status(in_force, latest_data.get('fsm_state', ''),
+                                 latest_data.get('target_resistance', 0.0))
+        if (in_force != self.override_wanted
+                and time.time() - self.override_sent_at >= SETTINGS_ACK_GRACE_S):
+            self.show_override_status(f"NOT IN FORCE. Controller: {status}", theme.DANGER)
+        else:
+            self.show_override_status(status, theme.WARNING if in_force else theme.TEXT_DIM)
+
     def toggle_heatmap(self):
         if self.heatmap_window is None:
             self.heatmap_window = HeatmapWindow(
@@ -1520,11 +1709,20 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 self.lbl_arm_refused.setVisible(bool(refusals))
 
             self.update_settings_mismatch(latest_data)
+            self.update_override_status(latest_data)
 
             fsm_state = latest_data.get('fsm_state', 'DISCONNECTED')
             self.last_fsm_state = fsm_state
             self.lbl_fsm_state.setStyleSheet(theme.fsm_style(fsm_state))
             self.lbl_fsm_state.setText(fsm_state)
+
+            fault = (latest_data.get('fault_reason') or "", latest_data.get('fault_detail', []))
+            if fault != self.shown_fault:
+                self.shown_fault = fault
+                self.lbl_fault_reason.setText(fault_summary(*fault))
+                self.lbl_fault_reason.setToolTip("\n".join(
+                    line.strip() for line in [fault[0]] + list(fault[1]) if line.strip()))
+                self.lbl_fault_reason.setVisible(bool(fault[0]))
 
             cur_lap = latest_data.get('current_lap', 0)
             tot_laps = latest_data.get('total_laps', 0)

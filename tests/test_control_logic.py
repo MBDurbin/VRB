@@ -69,6 +69,16 @@ from control_logic import (
     VehicleParams,
     MAX_RESISTANCE,
     RESISTOR_RESOLUTION,
+    PROFILES_DIR,
+    RESISTANCE_COLUMN,
+    profile_resistance,
+    steps_for_resistance,
+    parse_override,
+    override_resistance,
+    trip_details,
+    trip_record,
+    append_trip_log,
+    TRIP_LOG_FIELDS,
 )
 from rig_config import RigConfig
 
@@ -1360,7 +1370,7 @@ class TestDrivetrainEfficiency:
 class TestVehicleParams:
     def test_defaults_match_documented_vehicle(self):
         p = VehicleParams()
-        assert p.total_mass_kg == 330.0
+        assert math.isclose(p.total_mass_kg, 328.3)   # 233 kg car + 95.3 kg driver
         assert 0.0 < p.drivetrain_efficiency <= 1.0
 
     def test_rotational_mass_factor_never_below_one(self):
@@ -1610,3 +1620,198 @@ class TestCoulombCountSurvivesBadSamples:
         # Before, remaining went NaN for good and SOC read 100%.
         remaining, soc = coulomb_step(36.0, 100.0, remaining, 20.0)
         assert math.isclose(remaining, 9.0) and math.isclose(soc, 45.0)
+
+
+# ================= BENCH PROFILES =================
+
+def _bench_steps(voltage, ohms, max_amps=275.0, power_factor=BANK_OVERLOAD_FACTOR):
+    return steps_for_resistance(voltage, ohms, max_amps, 25.0, False, 55.0, 80.0,
+                                power_factor=power_factor)
+
+
+class TestBenchProfile:
+    """A profile that names the resistance instead of a speed, for bench supplies."""
+
+    def test_loads_by_its_resistance_and_drops_trailing_blanks(self, tmp_path):
+        csv = tmp_path / "bench.csv"
+        csv.write_text(f"Time (s),{RESISTANCE_COLUMN}\n0,63.75\n5,1\n20,0.5\n,\n")
+        rows, dropped = load_lap_profile(str(csv))
+        assert [profile_resistance(r) for r in rows] == [63.75, 1.0, 0.5]
+        assert dropped == 1
+
+    def test_a_zero_ohm_row_refuses_the_profile(self, tmp_path):
+        # 0 ohm reads as "off", but the ladder would take it as its heaviest load.
+        csv = tmp_path / "bench.csv"
+        csv.write_text(f"Time (s),{RESISTANCE_COLUMN}\n0,63.75\n5,0\n")
+        with pytest.raises(ValueError, match="line 3 asks for 0 ohm"):
+            load_lap_profile(str(csv))
+
+    def test_a_lap_row_has_no_bench_resistance(self):
+        assert profile_resistance({'Time (s)': 0.0, 'Speed (mph)': 20.0}) is None
+
+    def test_shipped_bench_profiles_load(self):
+        names = [n for n in os.listdir(PROFILES_DIR) if n.startswith("Bench")]
+        assert names, "the bench profiles are missing from profiles/"
+        for name in names:
+            rows, dropped = load_lap_profile(os.path.join(PROFILES_DIR, name))
+            assert rows and dropped == 0
+            assert all(profile_resistance(r) > 0 for r in rows)
+
+    def test_a_request_inside_every_floor_is_sent_as_asked(self):
+        assert _bench_steps(44.0, 1.0) == 4
+
+    def test_held_to_the_current_limit(self):
+        # 0.25 ohm asked, but a 40 A limit at 50.4 V floors at 1.26 ohm: up to 1.5.
+        steps = _bench_steps(50.4, 0.25, max_amps=40.0)
+        assert steps == 6 and 50.4 / (steps * RESISTOR_RESOLUTION) <= 40.0
+
+    def test_held_to_each_banks_rating(self):
+        # 0.5 ohm is bank 2 alone, 5.3 kW at 50.4 V against its 4 kW. 0.75 ohm
+        # shares the load with bank 1, as a lap at full demand would get.
+        assert _bench_steps(50.4, 0.5, power_factor=1.0) == 3
+
+    def test_no_request_reaches_past_what_a_lap_could(self):
+        # Whatever a bench row asks for, the ladder never goes below the setting
+        # a lap at unlimited demand gets at the same voltage.
+        for tenth_volts in range(300, 505, 5):
+            v = tenth_volts / 10.0
+            lap = command_steps(v, 1e12, 275.0, 25.0, False, 55.0, 80.0,
+                                modules_in_series=9, power_factor=BANK_OVERLOAD_FACTOR)
+            for ohms in (0.25, 0.5, 0.75, 1.0):
+                assert _bench_steps(v, ohms) >= lap, (v, ohms)
+
+    def test_nan_asks_for_the_least_load(self):
+        assert _bench_steps(44.0, float('nan')) == 255
+
+
+# ================= LOAD OVERRIDE =================
+
+class TestLoadOverride:
+    def test_parses_each_mode_and_the_hand_back(self):
+        assert parse_override(("SET_OVERRIDE", None)) is None
+        assert parse_override(("SET_OVERRIDE", "RESISTANCE", 1)) == ("RESISTANCE", 1.0)
+        assert parse_override(("SET_OVERRIDE", "POWER", 2500.0)) == ("POWER", 2500.0)
+
+    @pytest.mark.parametrize("cmd", [
+        ("SET_OVERRIDE", "RESISTANCE", 0.0),
+        ("SET_OVERRIDE", "RESISTANCE", -1.0),
+        ("SET_OVERRIDE", "POWER", float('nan')),
+        ("SET_OVERRIDE", "POWER", "2500"),
+        ("SET_OVERRIDE", "CURRENT", 100.0),
+        ("SET_OVERRIDE",),
+        "SET_OVERRIDE",
+    ])
+    def test_refuses_anything_else(self, cmd):
+        with pytest.raises(ValueError):
+            parse_override(cmd)
+
+    def test_resistance_is_asked_for_as_is(self):
+        assert override_resistance(("RESISTANCE", 1.5), 44.0) == 1.5
+
+    def test_power_is_at_the_bank_on_the_module_voltage(self):
+        assert math.isclose(override_resistance(("POWER", 2000.0), 44.0), 44.0 ** 2 / 2000.0)
+
+    @pytest.mark.parametrize("volts", [0.0, -1.0, float('nan')])
+    def test_power_without_a_voltage_asks_for_the_least_load(self, volts):
+        assert override_resistance(("POWER", 2000.0), volts) == MAX_RESISTANCE
+
+
+# ================= TRIP LOG =================
+
+class TestTripDetails:
+    """What the console and trip log say about a trip: the reading and its limit."""
+
+    def _packet(self, **kw):
+        d = {'max_temp': 30.0, 'amps': 50.0, 'voltage': 44.0,
+             'cell_voltages': [3.67] * 12, 'resistor_temps': [40.0] * 4,
+             'temp_sensor_ages_s': _fresh_sensor_ages(), 'resistor_temp_ages_s': [0.1] * 4}
+        d.update(kw)
+        return d
+
+    def test_overcurrent_names_the_current_and_the_trip(self):
+        (line,) = trip_details("OVERCURRENT", self._packet(amps=291.3), _limits(max_amps=275.0))
+        assert line == "Current 291.3 A (trip 280.0 A)"
+
+    def test_overtemp_names_the_hottest_cell(self):
+        (line,) = trip_details("OVERTEMP", self._packet(max_temp=81.0), _limits(max_temp=80.0))
+        assert line == "Hottest cell at 81.0 C (trip 80.0 C)"
+
+    def test_undervoltage_names_the_module(self):
+        (line,) = trip_details("UNDERVOLTAGE", self._packet(voltage=35.9), _limits())
+        assert line == "Module at 35.90 V (trip 36.00 V)"
+
+    def test_cell_undervoltage_names_the_cell(self):
+        cells = [3.67] * 7 + [2.65] + [3.67] * 4
+        (line,) = trip_details("CELL UNDERVOLTAGE", self._packet(cell_voltages=cells), _limits())
+        assert line == "Cell 8 at 2.650 V (trip 2.70 V)"
+
+    def test_sense_fault_points_at_the_lead(self):
+        cells = [0.02] + [3.67] * 11
+        (line,) = trip_details("CELL SENSE FAULT", self._packet(cell_voltages=cells), _limits())
+        assert line.startswith("Cell 1 reads 0.020 V") and "sense lead" in line
+
+    def test_resistor_overtemp_keeps_its_console_wording(self):
+        (line,) = trip_details("RESISTOR OVERTEMP",
+                               self._packet(resistor_temps=[230.0, 40.0, 40.0, 40.0]), _limits())
+        assert line == "Bank 1 at 230 C (trip 225 C)"
+
+    def test_bank_overpower_names_the_bank_once_settled(self):
+        lines = trip_details("BANK OVERPOWER", self._packet(voltage=46.0, amps=5800.0 / 46.0),
+                             _limits(bank_rated_only=False), bank_steps=2)
+        assert lines == ["Ladder at 5800 W (limit 11200 W)", "Bank 2 at 5800 W (limit 5600 W)"]
+
+    def test_config_fault_lists_every_problem(self):
+        assert trip_details("CONFIG FAULT", self._packet(), _limits(),
+                            config_problems=["a", "b"]) == ["  - a", "  - b"]
+
+    def test_a_reason_with_nothing_to_add(self):
+        assert trip_details("NI-DAQ OFFLINE", self._packet(), _limits()) == []
+
+
+class TestTripRecord:
+    def test_a_measured_trip_records_the_reading_and_the_time_to_kill(self):
+        packet = {'amps': 291.3, 'voltage': 38.0, 'cell_voltages': [3.17] * 11 + [3.1],
+                  'max_temp': 24.0, 'resistor_temps': [41.0, None, 39.6, 38.0],
+                  'sampled_at': 1000.0}
+        row = trip_record("OVERCURRENT", "RUNNING", ["Current 291.3 A (trip 280.0 A)"], packet,
+                          ladder_ohm=0.25, kill_sent=True, killed_at=1000.042)
+        assert set(row) == set(TRIP_LOG_FIELDS)
+        assert row['Reason'] == "OVERCURRENT" and row['State'] == "RUNNING"
+        assert row['Amps'] == "291.3"
+        assert row['Module_V'] == "38.00" and row['Min_Cell_V'] == "3.100"
+        assert row['Resistor_Temps_C'] == "41//40/38"     # bank 2 not read yet
+        assert row['Ladder_Ohm'] == "0.25"
+        assert row['Sample_To_Kill_ms'] == "42"
+        assert row['Kill_Sent'] == "yes"
+
+    def test_an_operator_stop_has_no_reading_or_latency(self):
+        row = trip_record("E-STOP", "IDLE", ["Operator stop"], kill_sent=None)
+        assert row['Amps'] == "" and row['Sample_To_Kill_ms'] == "" and row['Kill_Sent'] == ""
+
+    def test_no_latency_when_the_kill_failed_or_the_sample_is_unstamped(self):
+        packet = {'amps': 10.0, 'voltage': 44.0, 'sampled_at': 1000.0}
+        assert trip_record("X", "RUNNING", [], packet, kill_sent=False,
+                           killed_at=1000.1)['Sample_To_Kill_ms'] == ""
+        assert trip_record("X", "RUNNING", [], {'amps': 1.0}, kill_sent=True,
+                           killed_at=1000.1)['Sample_To_Kill_ms'] == ""
+
+    def test_detail_lines_are_joined_without_their_bullets(self):
+        row = trip_record("CONFIG FAULT", "ARMED", ["  - first", "  - second"])
+        assert row['Detail'] == "first; second"
+
+
+class TestAppendTripLog:
+    def test_writes_the_header_once_and_appends(self, tmp_path):
+        path = tmp_path / "logs" / "trip_log.csv"
+        for reason in ("E-STOP", "OVERCURRENT"):
+            assert append_trip_log(trip_record(reason, "RUNNING", []), path=str(path))
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == ",".join(TRIP_LOG_FIELDS)
+        assert len(lines) == 3 and "OVERCURRENT" in lines[2]
+
+    def test_an_unwritable_log_is_reported_not_raised(self, tmp_path, capsys):
+        # A folder where the file should be stands in for one Excel has locked.
+        path = tmp_path / "trip_log.csv"
+        path.mkdir()
+        assert append_trip_log(trip_record("E-STOP", "IDLE", []), path=str(path)) is False
+        assert "Trip not written" in capsys.readouterr().out

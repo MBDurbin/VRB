@@ -376,7 +376,7 @@ class TestPersistence:
 
     def test_empty_dict_yields_defaults(self):
         loaded = RigConfig.from_dict({})
-        assert math.isclose(loaded.vehicle.total_mass_kg, 330.0)
+        assert math.isclose(loaded.vehicle.total_mass_kg, 328.3)
 
     def test_loading_redderives_limits_for_changed_pack(self):
         # Someone edits the JSON to a bigger pack; limits must follow, not
@@ -422,6 +422,20 @@ class TestDaqConfig:
     def test_current_channel_colliding_with_voltage_is_reported(self):
         d = DaqConfig(current_channel="cDAQ1Mod8/ai1")
         assert any("also listed" in p for p in d.validate(PackConfig()))
+
+    def test_taps_are_read_single_ended_by_default(self):
+        # The taps are on a 9205 against COM. The driver's own default can pair
+        # two of them as one differential input.
+        assert DaqConfig().voltage_terminal_config == "RSE"
+
+    def test_an_unknown_input_mode_blocks_arm(self):
+        problems = DaqConfig(voltage_terminal_config="single").safety_problems(PackConfig())
+        assert any("Voltage input mode 'single'" in p for p in problems)
+
+    def test_default_wiring_is_one_tap_per_cell_and_no_shared_inputs(self):
+        d = DaqConfig()
+        assert len(d.voltage_channels) == PackConfig().series_count
+        assert d.safety_problems(PackConfig()) == []
 
     def test_duplicate_voltage_channels_are_reported(self):
         chans = list(DaqConfig().voltage_channels)

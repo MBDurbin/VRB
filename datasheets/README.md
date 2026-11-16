@@ -4,33 +4,44 @@ Source documents for the numbers the rig's safety limits are built from. Kept
 here so an inheriting team can verify every derived limit without hunting for
 the right revision.
 
-## Reliance RS50 — the installed cell (no datasheet here yet)
+## Reliance RS50 — the installed cell (no manufacturer datasheet)
 
 Reliance RS50, 21700, 5000 mAh, 70 A, flat top. The cell in the module under
 test (12S4P, 48 cells per module) since it replaced the Molicel P45B below.
 
 **There is no RS50 datasheet in this folder.** The figures come from the
-supplier's product listing: liionwholesale.com, "Reliance RS50 70A 5000mAh Flat
-Top 21700". If a manufacturer datasheet turns up, add it here and check the two
-flagged rows against it.
+supplier's product listing (liionwholesale.com, "Reliance RS50 70A 5000mAh Flat
+Top 21700") and from **Mooch's independent test of the cell (October 2025)**,
+which the team has from Discord. Mooch's card asks that it not be shared after
+April 2026, so only its numbers are recorded here, not the card or its charts.
+If a manufacturer datasheet turns up, add it here and check the cutoff row
+against it.
 
 | Listing value | `PackConfig` field | Derived module figure (12S4P) |
 |---|---|---|
 | Nominal capacity 5000 mAh | `cell_capacity_ah = 5.0` | 20.0 Ah (× 4P) |
-| Minimum capacity 4950 mAh (0.2 C) | `cell_capacity_min_ah = 4.95` | 19.8 Ah (× 4P) |
-| Max continuous discharge 70 A, "with 80 °C temperature cut-off" | `cell_max_continuous_a = 70` | **280 A** (× 4P) |
+| Minimum capacity 4950 mAh (0.2 C); Mooch measured 4950 mAh | `cell_capacity_min_ah = 4.95` | 19.8 Ah (× 4P) |
+| Max continuous discharge 70 A, "with 80 °C temperature cut-off"; Mooch: 70 A to 80 °C, 40 A true continuous | `cell_max_continuous_a = 70` | **280 A** (× 4P); 160 A true continuous |
 | Peak voltage 4.2 V | `cell_max_voltage = 4.2` | 50.4 V module, ~454 V battery |
 | Nominal voltage 3.6 V | `cell_nominal_voltage = 3.6` | 43.2 V module |
 | 80 °C cut-off (the only temperature given) | `cell_max_temp_c = 80.0` | 80 °C over-temp trip |
-| **Not listed** — discharge cutoff | `cell_min_voltage = 2.5` | 30.0 V absolute floor |
-| **Not listed** — DC impedance | `cell_dc_milliohm = 4.0` | 12 mΩ module (÷4P × 12S) |
+| **Not listed** — discharge cutoff (Mooch's runs end at 2.5 V) | `cell_min_voltage = 2.5` | 30.0 V absolute floor |
+| **Not listed** — DC impedance; Mooch measured 6.5 mΩ | `cell_dc_milliohm = 6.5` | 19.5 mΩ module (÷4P × 12S) |
 | Max charge 15 A, standard 8 A | — | unused: the rig never charges |
 
-**The two unlisted rows are working values, not sourced ones.** 2.5 V is the
-usual cutoff for this class of cell; 4 mΩ is an estimate. The cutoff feeds the
-undervoltage trips (30 V floor, 36 V module trip, 2.70 V per cell), so it is the
-one that matters most to confirm. The impedance only feeds sag estimates and the
-SIL plant; measuring a module's sag under a known load would settle it.
+**The cutoff is still a working value.** 2.5 V is the usual cutoff for this
+class of cell, and Mooch's capacity runs end there, but no manufacturer gives
+it. It feeds the undervoltage trips (30 V floor, 36 V module trip, 2.70 V per
+cell), so it is the one figure left to confirm. The impedance was a 4 mΩ
+estimate until Mooch measured 6.5 mΩ; it only feeds sag estimates and the SIL
+plant. Over a sustained discharge the cell sags more, about 8 mΩ effective, as
+polarisation builds. `tools/dcir_from_log.py` measures this module's own cells.
+
+**70 A stands as the rating because the rig enforces its condition.** Mooch
+holds 70 A only until the cell reaches 80 °C and rates it 40 A for a whole
+discharge. Every cell has a temperature sensor and the over-temp trip sits under
+80 °C, so a long run above 40 A per cell ends on that trip. Set
+`cell_max_continuous_a` to 40 for any run without the temperature sensors.
 
 **80 °C is the right trip here, unlike on the P45B.** The P45B quoted an 80 °C
 cut-off for its current *test* but a 60 °C discharge operating range, and the

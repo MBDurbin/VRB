@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 import serial
+import serial.tools.list_ports
 
 # The rig's modules live one folder up.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,18 +54,20 @@ from control_logic import (
     send_binary_command,
 )
 
-# Arduino pin driven by each character of the command, left to right: 12 down to
-# 5. From the mapping in control_logic, which tests/test_firmware_bank_map.py
-# checks against arduino/resistor_bank_controller.
+# Arduino pin driven by each character of the command, left to right: 12, 10,
+# 11, then 9 down to 5 (pins 10 and 11 are swapped to match the relay board's
+# wiring). From the mapping in control_logic, which
+# tests/test_firmware_bank_map.py checks against arduino/resistor_bank_controller.
 PIN_FOR_CHAR = [BANK_RELAY_PIN[bank - 1] for bank in COMMAND_BANKS]
 
 HEARTBEAT_S = 0.5      # the firmware watchdog sheds load after 2 s of silence
 APPLY_TIMEOUT_S = 1.5  # how long to wait for "New State Received" after a command
 HBTEST_PAUSE_S = 3.5   # long enough to clear the 2 s watchdog with margin
 
-# Lowercase on purpose. Arduino_Slave_Code_v2 only recognises "kill"; v3 and the
-# repo firmware accept "KILL" or "kill". Uppercase would be silently ignored by a
-# v2 board, leaving the contactor closed while the heartbeat keeps it alive.
+# Lowercase on purpose. The firmware in arduino/resistor_bank_controller accepts
+# "KILL" or "kill", but the older Arduino_Slave_Code_v2 sketch, which may still be
+# on a spare board, only "kill". Uppercase would be silently ignored there,
+# leaving the contactor closed while the heartbeat keeps it alive.
 KILL = b"kill\n"
 
 
@@ -204,6 +207,12 @@ def classify(text, mon):
     if text.startswith("New State Received"):
         mon.applied.set()
 
+    elif text.startswith("Error:"):
+        # "Error: Rejected ..." from the repo firmware, "Error: Not a binary
+        # signal." from Arduino_Slave_Code_v3: nothing moved.
+        print("  !! REJECTED: the Arduino did not apply that line. The firmware takes exactly\n"
+              "     8 characters of 0 and 1; type a resistance, or raw with 8 digits.")
+
     elif text.startswith("Arduino Ready"):
         # setup() prints this, so it appears once at startup when opening the
         # port resets the board. After a command has been sent it means the
@@ -255,16 +264,48 @@ def print_status(mon, hb_thread, rd_thread):
     print("  (the firmware never answers 'alive' -- hbtest proves it's arriving)")
 
 
+def busy_ports():
+    """COM ports another program already has open.
+
+    Opened with DTR and RTS held low, so a free port's Arduino is not reset, and
+    closed straight away. The usual culprits are the rig itself (main_v2.py holds
+    both Arduinos) and the Arduino IDE's Serial Monitor. Either way this tool
+    cannot reach a board on that port, and the scan below would just say "not
+    found".
+    """
+    busy = []
+    for info in serial.tools.list_ports.comports():
+        probe = serial.Serial()
+        probe.port, probe.baudrate, probe.dtr, probe.rts = info.device, RESISTOR_BAUD_RATE, False, False
+        try:
+            probe.open()
+        except serial.SerialException:
+            busy.append(info.device)
+        else:
+            probe.close()
+    return busy
+
+
+IN_USE_HINT = ("Close the rig (main_v2.py) and any Arduino IDE Serial Monitor, "
+               "then run this again.")
+
+
 def open_port(port):
+    busy = busy_ports()
     if port is None:
+        if busy:
+            print(f"  ! {', '.join(busy)} already open in another program. {IN_USE_HINT}")
         print("Scanning COM ports for RESISTOR_CTRL (about 2 s per port)...")
         ser = auto_detect_resistor()
         if ser is None:
-            raise SystemExit("Resistor Arduino not found. Plug it in, or pass --port "
-                             "(Arduino_Slave_Code_v2 doesn't answer ?WHOAMI, so it can't be "
-                             "auto-detected).")
+            raise SystemExit("Resistor Arduino not found. "
+                             + (IN_USE_HINT if busy else
+                                "Check its USB cable, or pass --port COMx. A board running "
+                                "Arduino_Slave_Code_v2 does not answer ?WHOAMI and needs --port."))
         return ser
 
+    if port in busy:
+        raise SystemExit(f"{port} is already open in another program. {IN_USE_HINT}")
     ser = serial.Serial(port, RESISTOR_BAUD_RATE, timeout=2)
     time.sleep(2)              # opening the port resets the Arduino; wait out the bootloader
     ser.reset_input_buffer()

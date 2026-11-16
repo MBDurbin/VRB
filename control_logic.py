@@ -1,3 +1,4 @@
+import csv
 import math
 import os
 import threading
@@ -24,6 +25,20 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILES_DIR = os.path.join(PROJECT_DIR, "profiles")
 DEFAULT_LAP_CSV = "FSAE - ETS - Speed and Time 1 Lap.csv"
 CSV_FILENAME = os.path.join(PROFILES_DIR, DEFAULT_LAP_CSV)
+
+# A bench profile names the resistance itself, in this column, instead of a
+# speed for the car model to turn into power. It is for running the rig on bench
+# supplies, where there is no car to model, and for constant-resistance
+# discharges. Every row is held to the same floors and ratings as a lap row, so
+# it can ask for no more load than a lap at full demand can.
+RESISTANCE_COLUMN = "Resistance (ohm)"
+
+# Every stop and fault the logic process latches, one row each, appended across
+# sessions. logs/ is ignored by git, like the GUI's recordings.
+TRIP_LOG_PATH = os.path.join(PROJECT_DIR, "logs", "trip_log.csv")
+TRIP_LOG_FIELDS = ("Time", "State", "Reason", "Detail", "Amps", "Module_V", "Min_Cell_V",
+                   "Max_Cell_Temp_C", "Resistor_Temps_C", "Ladder_Ohm",
+                   "Sample_To_Kill_ms", "Kill_Sent")
 
 MAX_RESISTANCE = 63.75
 RESISTOR_RESOLUTION = 0.25
@@ -54,18 +69,19 @@ BANK_RATED_POWER_W = (8000.0, 4000.0, 2000.0, 1000.0, 500.0, 300.0, 200.0, 400.0
 #
 # The word is written most significant bank first, so it reads as the binary
 # number of 0.25 ohm steps: 32 ohm is 10000000, 0.25 ohm is 00000001. The
-# firmware drives characters 0-6 onto otherRelayPins[] = {12, ..., 6} and the
-# last character onto BANK_1_RELAY, pin 5, which it labels as the 0.25 ohm relay
-# and opens first on every change. The host used to send the word reversed,
-# least significant first, so 32 ohm arrived as 00000001 and switched in bank 1
-# alone: about 202 A at 50.4 V instead of 1.6 A.
+# firmware drives characters 0-6 onto otherRelayPins[] = {12, 10, 11, 9, 8, 7, 6}
+# and the last character onto BANK_1_RELAY, pin 5, which it labels as the
+# 0.25 ohm relay and opens first on every change. The host used to send the word
+# reversed, least significant first, so 32 ohm arrived as 00000001 and switched
+# in bank 1 alone: about 202 A at 50.4 V instead of 1.6 A.
 #
-# Pin 5 is the only bank the firmware names. Pins 6-12 carrying banks 2-8 in
-# order follows from the word being binary; confirm it on the bench with
-# `python tools/bench_relay_check.py` and `walk`, battery disconnected, before a
-# run, and after any rewiring of the relay board.
+# Which pin's relay bypasses which bank is the relay board's wiring, and only a
+# meter proves it: `python tools/bench_relay_check.py` and `walk`, battery
+# disconnected, before a run and after any rewiring. Metered in October 2026:
+# pin 10 bypasses the 16 ohm bank (7) and pin 11 the 8 ohm bank (6), the other
+# way round from the binary order, so the firmware and this table swap them.
 COMMAND_BANKS = (8, 7, 6, 5, 4, 3, 2, 1)
-BANK_RELAY_PIN = (5, 6, 7, 8, 9, 10, 11, 12)    # bank 1 first
+BANK_RELAY_PIN = (5, 6, 7, 8, 9, 11, 10, 12)    # bank 1 first
 
 # How far past the ratings above, and past VRB_MAX_POWER_W, the bank may run
 # unless SafetyLimits.bank_rated_power_only holds it to 100%. Fixed here, so the
@@ -707,6 +723,135 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
 
     return False, None
 
+
+def trip_details(reason, data, limits, config_problems=(), expected=None, bank_steps=None):
+    """What tripped and the limit it crossed, as lines for the console and the trip log.
+
+    So an operator testing a trip can see it fired at the value it should, and
+    one meeting a real trip knows where to look. `bank_steps` is the settled
+    ladder setting, as evaluate_safety() took it. Empty for a reason with
+    nothing to add.
+    """
+    amps = data.get('amps', 0.0)
+    volts = data.get('voltage', 0.0)
+    cells = data.get('cell_voltages', [])
+
+    if reason == "OVERTEMP":
+        return [f"Hottest cell at {data.get('max_temp', 0.0):.1f} C "
+                f"(trip {limits['max_temp']:.1f} C)"]
+    if reason == "OVERCURRENT":
+        return [f"Current {amps:.1f} A (trip {limits['max_amps'] + limits['amp_buffer']:.1f} A)"]
+    if reason == "BANK OVERPOWER":
+        factor = bank_power_factor(limits)
+        lines = [f"Ladder at {volts * amps:.0f} W (limit {VRB_MAX_POWER_W * factor:.0f} W)"]
+        if bank_steps:
+            lines += [f"Bank {b} at {w:.0f} W (limit {lim:.0f} W)"
+                      for b, w, lim in overpowered_banks(volts, amps, bank_steps, factor)]
+        return lines
+    if reason == "RESISTOR OVERTEMP":
+        hot = hot_resistor_banks(data.get('resistor_temps', []), limits['resistor_max_temp'])
+        return [", ".join(f"Bank {b} at {t:.0f} C (trip {lim:.0f} C)" for b, t, lim in hot)]
+    if reason == "UNDERVOLTAGE":
+        return [f"Module at {volts:.2f} V (trip {limits['min_volts']:.2f} V)"]
+    if reason == "CELL UNDERVOLTAGE":
+        low = [(i + 1, v) for i, v in enumerate(cells)
+               if _finite(v) and v <= limits['min_cell_volts']]
+        return [", ".join(f"Cell {i} at {v:.3f} V" for i, v in low)
+                + f" (trip {limits['min_cell_volts']:.2f} V)"]
+    if reason == "CELL SENSE FAULT":
+        low = [(i + 1, v) for i, v in enumerate(cells)
+               if _finite(v) and v < limits['cell_sense_floor']]
+        return [", ".join(f"Cell {i} reads {v:.3f} V" for i, v in low)
+                + f" (below {limits['cell_sense_floor']:.2f} V: check its sense lead)"]
+    if reason == "DAQ DATA STALE":
+        return [f"Last DAQ packet {data.get('daq_age_s', 0.0):.2f} s old "
+                f"(limit {limits['daq_stale_timeout']:.2f} s)"]
+    if reason == "TEMP DATA STALE":
+        return [f"Last temperature reading {data.get('temp_age_s', 0.0):.1f} s old "
+                f"(limit {limits['temp_stale_timeout']:.1f} s)"]
+    if reason == "TEMP SENSOR FAULT":
+        dead = stale_temp_sensors(data.get('temp_sensor_ages_s', []), limits['temp_stale_timeout'])
+        return ["No valid reading from: " + ", ".join(f"bus {b} sensor {s}" for b, s in dead)]
+    if reason == "RESISTOR TC FAULT":
+        dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
+                                    limits['temp_stale_timeout'])
+        return ["No valid thermocouple reading from: " + ", ".join(f"bank {b}" for b in dead)]
+    if reason == "CONFIG FAULT":
+        return [f"  - {problem}" for problem in config_problems]
+    if reason in ("INVALID READING", "INCOMPLETE DATA"):
+        return [f"  - {detail}" for _, detail in measurement_problems(data, expected)]
+    return []
+
+
+def trip_record(reason, state, details, data=None, ladder_ohm=None, kill_sent=None,
+                killed_at=None):
+    """One row of the trip log, keyed by TRIP_LOG_FIELDS.
+
+    `state` is the FSM state the rig tripped from. `data` is the packet that
+    tripped it, for a measured trip; None for an operator stop or a lost link.
+    `kill_sent` is whether KILL reached the controller, None if none was
+    connected. `killed_at` is time.time() just after that write.
+
+    Sample_To_Kill_ms is how long the host took from the DAQ sampling the
+    packet to the KILL leaving it: the queue, the loop and the write. It leaves
+    out the sensor's own response and the contactor opening, which happen
+    outside the host, so time those on the bench.
+    """
+    now = killed_at if killed_at is not None else time.time()
+    record = dict.fromkeys(TRIP_LOG_FIELDS, '')
+    record.update({
+        'Time': (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))
+                 + f".{int(now % 1 * 1000):03d}"),
+        'State': state,
+        'Reason': reason,
+        'Detail': "; ".join(line.strip().removeprefix("- ") for line in details),
+        'Kill_Sent': {True: 'yes', False: 'NO'}.get(kill_sent, ''),
+    })
+    if ladder_ohm:
+        record['Ladder_Ohm'] = f"{ladder_ohm:.2f}"
+    if data is not None:
+        def number(value, spec):
+            return format(value, spec) if _finite(value) else ''
+        cells = [v for v in data.get('cell_voltages', []) if _finite(v)]
+        record.update({
+            'Amps': number(data.get('amps'), '.1f'),
+            'Module_V': number(data.get('voltage'), '.2f'),
+            'Min_Cell_V': number(min(cells), '.3f') if cells else '',
+            'Max_Cell_Temp_C': number(data.get('max_temp'), '.1f'),
+            'Resistor_Temps_C': "/".join(number(t, '.0f')
+                                         for t in data.get('resistor_temps', [])),
+        })
+        sampled_at = data.get('sampled_at')
+        if kill_sent and killed_at is not None and _finite(sampled_at):
+            record['Sample_To_Kill_ms'] = f"{(killed_at - sampled_at) * 1000.0:.0f}"
+    return record
+
+
+def append_trip_log(record, path=None):
+    """Append one trip_record() to the trip log. True if it was written.
+
+    Never raises. Called after the KILL has gone out, so a slow disk delays
+    nothing that matters, and a log that cannot be written -- open in Excel,
+    which locks it on Windows, or a read-only folder -- is reported and
+    skipped rather than taking down the logic process. `path` defaults to
+    TRIP_LOG_PATH, looked up at call time so tests can point it elsewhere.
+    """
+    path = path or TRIP_LOG_PATH
+    try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        with open(path, 'a', newline='', encoding='utf-8') as fh:
+            writer = csv.DictWriter(fh, fieldnames=TRIP_LOG_FIELDS)
+            if new:
+                writer.writeheader()
+            writer.writerow(record)
+        return True
+    except Exception as exc:
+        print(f"[LOGIC WARNING] Trip not written to {path}: {exc}")
+        return False
+
 #Double Checked
 def coulomb_step(amps, dt, remaining_ah, total_capacity_ah):
     """Advances coulomb counting by dt seconds. Returns (new_remaining_ah, true_soc_pct).
@@ -927,12 +1072,30 @@ def compute_target_resistance(voltage, req_power, max_safe_current, current_max_
 def command_steps(voltage, req_power, max_safe_current, current_max_temp,
                   derate_enabled, derate_start_temp, max_safe_temp, modules_in_series=1,
                   power_factor=1.0):
-    """Ladder steps to send for one profile row.
+    """Ladder steps to send for one lap-profile row: the car's power demand,
+    turned into a resistance and then into a setting by steps_for_resistance().
+    """
+    req_r = compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
+                                      derate_enabled, derate_start_temp, max_safe_temp,
+                                      modules_in_series=modules_in_series,
+                                      power_factor=power_factor)
+    return steps_for_resistance(voltage, req_r, max_safe_current, current_max_temp,
+                                derate_enabled, derate_start_temp, max_safe_temp,
+                                power_factor=power_factor)
 
-    The request rounds to the nearest 0.25 ohm step, but the floor rounds UP.
-    Rounding everything to nearest used to undercut the floor at the bottom of
-    the ladder: a 0.29 ohm current-limit clamp became the 0.25 ohm step, which
-    draws 192 A from a full module.
+
+def steps_for_resistance(voltage, req_r, max_safe_current, current_max_temp,
+                         derate_enabled, derate_start_temp, max_safe_temp, power_factor=1.0):
+    """Ladder steps for a requested resistance, held to every floor and rating.
+
+    A lap row's request comes from command_steps(); a bench profile's is the
+    resistance it names (RESISTANCE_COLUMN). Both pass through here, so neither
+    can command more load than the other.
+
+    The request is raised to resistance_floor() and rounds to the nearest
+    0.25 ohm step, but the floor rounds UP. Rounding everything to nearest used
+    to undercut the floor at the bottom of the ladder: a 0.29 ohm current-limit
+    clamp became the 0.25 ohm step, which draws 192 A from a full module.
 
     Then every bank the setting puts in circuit must be within its own rating
     (steps_within_rating). That is not a floor: a bank alone carries the whole
@@ -941,12 +1104,12 @@ def command_steps(voltage, req_power, max_safe_current, current_max_temp,
     that fails moves to the nearest one at or above the floor that passes, the
     higher resistance on a tie.
     """
-    req_r = compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
-                                      derate_enabled, derate_start_temp, max_safe_temp,
-                                      modules_in_series=modules_in_series,
-                                      power_factor=power_factor)
     floor_r = resistance_floor(voltage, max_safe_current, current_max_temp,
                                derate_enabled, derate_start_temp, max_safe_temp, power_factor)
+    if not math.isfinite(req_r):
+        # NaN rounds to the bottom step in resistance_to_steps(). Least load.
+        req_r = MAX_RESISTANCE
+    req_r = max(req_r, floor_r)
     steps = resistance_to_steps(req_r, min_r=floor_r)
     if steps_within_rating(steps, voltage, power_factor):
         return steps
@@ -986,21 +1149,96 @@ def load_lap_profile(path):
     in compute_target_resistance(), so `min(MAX_RESISTANCE, nan)` quietly returns
     MAX_RESISTANCE and the bank sits at minimum load for the tail of every lap
     without anything being reported.
+
+    A bench profile (a RESISTANCE_COLUMN instead of, or as well as, a speed)
+    is read the same way, by its resistance. It is refused outright if a row
+    asks for zero or less: the ladder's lightest load is MAX_RESISTANCE, and a
+    0 ohm row, meant as "off", would command its heaviest.
     """
     df = pd.read_csv(path)
     rows = df.to_dict('records')
+    demand = RESISTANCE_COLUMN if RESISTANCE_COLUMN in df.columns else 'Speed (mph)'
 
     usable = []
-    for row in rows:
+    for line, row in enumerate(rows, start=2):      # line 1 is the header
         try:
-            speed = float(row.get('Speed (mph)'))
+            value = float(row.get(demand))
             stamp = float(row.get('Time (s)'))
         except (TypeError, ValueError):
             continue
-        if math.isfinite(speed) and math.isfinite(stamp):
+        if math.isfinite(value) and math.isfinite(stamp):
+            if demand == RESISTANCE_COLUMN and value <= 0:
+                raise ValueError(
+                    f"line {line} asks for {value:g} ohm. The lightest load the ladder has "
+                    f"is {MAX_RESISTANCE} ohm; use that for no load.")
             usable.append(row)
 
     return usable, len(rows) - len(usable)
+
+
+def profile_resistance(row):
+    """The resistance a bench-profile row asks for, in ohms; None for a lap row."""
+    if RESISTANCE_COLUMN not in row:
+        return None
+    return float(row[RESISTANCE_COLUMN])
+
+
+# ================= LOAD OVERRIDE =================
+# The operator can take the load off the profile and hold a resistance or a power
+# of their own, from the GUI sidebar, before or during a run. The run still
+# follows the profile's clock and laps and ends with them; only the load each
+# moment changes. Like a bench-profile row, the override passes through
+# steps_for_resistance(), so the current limit, the bank's ratings and the
+# thermal derate hold it exactly as they hold a lap.
+OVERRIDE_MODES = ("RESISTANCE", "POWER")
+
+# While running, a changed override reaches the bank on the next loop pass, and
+# a power override is re-solved this often against the module voltage, which
+# falls as the module discharges.
+OVERRIDE_REFRESH_S = 0.5
+
+
+def parse_override(cmd):
+    """The override a SET_OVERRIDE command asks for: None, or (mode, value).
+
+    ("SET_OVERRIDE", None) hands the load back to the profile.
+    ("SET_OVERRIDE", "RESISTANCE", ohms) and ("SET_OVERRIDE", "POWER", watts)
+    hold that value. Anything else raises ValueError, so a malformed command
+    changes nothing.
+    """
+    if isinstance(cmd, tuple) and len(cmd) == 2 and cmd[1] is None:
+        return None
+    if not (isinstance(cmd, tuple) and len(cmd) == 3 and cmd[1] in OVERRIDE_MODES):
+        raise ValueError(f"not an override: {cmd!r}")
+    mode, value = cmd[1], cmd[2]
+    if not (_finite(value) and value > 0):
+        raise ValueError(f"{mode.lower()} must be a positive number, not {value!r}")
+    return mode, float(value)
+
+
+def override_resistance(override, voltage):
+    """The resistance an override asks for at this module voltage, before any floor.
+
+    POWER is power at the bank, V^2 / R, on the measured module voltage: what is
+    across the bank, and what the GUI's Power card shows as V x I. Without a
+    usable voltage it asks for the least load.
+    """
+    mode, value = override
+    if mode == "RESISTANCE":
+        return value
+    if not (_finite(voltage) and voltage > 0):
+        return MAX_RESISTANCE
+    return voltage ** 2 / value
+
+
+def describe_override(override):
+    """The override in words, for the console."""
+    if override is None:
+        return "off: the profile sets the load"
+    mode, value = override
+    if mode == "RESISTANCE":
+        return f"holding {value:.2f} ohm"
+    return f"holding {value / 1000.0:.2f} kW at the bank"
 
 
 def lap_row_interval(lap_data, idx, default=1.0):
@@ -1179,16 +1417,37 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
 
     res_ser = None
 
-    def latch_fault():
+    # Why the rig is in FAULT, for the GUI: the reason and trip_details()'s
+    # lines. Cleared by RESET.
+    fault_reason = None
+    fault_detail = []
+
+    def latch_fault(reason, details=()):
         """Enter FAULT, and void every ARM, RUN and RESET issued before now.
 
         Called for every stop and fault, including a stop while already in
         FAULT: the operator's latest press is a stop, so a RESET made before it
         must not clear it.
         """
-        nonlocal fsm_state, fault_at
+        nonlocal fsm_state, fault_at, fault_reason, fault_detail
         fsm_state = "FAULT"
         fault_at = time.monotonic()
+        fault_reason, fault_detail = reason, list(details)
+
+    def operator_stop(reason):
+        """E-STOP or a queued STOP: latch, KILL at once, then report and log it."""
+        stopped_in = fsm_state
+        had_link = res_ser is not None
+        latch_fault(reason, ["Operator stop"])
+        killed = kill_load(res_ser)
+        killed_at = time.time()
+        print("[LOGIC] EMERGENCY STOP triggered via GUI.")
+        if not killed:
+            drop_resistor_link("KILL")
+        append_trip_log(trip_record(
+            reason, stopped_in, fault_detail,
+            ladder_ohm=target_res if stopped_in == "RUNNING" else None,
+            kill_sent=killed if had_link else None, killed_at=killed_at))
 
     def drop_resistor_link(what):
         """The controller stopped taking writes, or its port closed under us.
@@ -1210,9 +1469,14 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 pass
         print(f"\n[LOGIC] Resistor controller link lost ({what}).")
         if fsm_state in ("ARMED", "RUNNING"):
-            latch_fault()
+            lost_in = fsm_state
+            latch_fault("RESISTOR LINK LOST",
+                        [f"Controller link lost ({what}); its watchdog sheds the load"])
             print("[LOGIC] RESISTOR LINK LOST ALARM! Commands are not reaching the "
                   "controller; its watchdog sheds the load 2 s after the last one did.")
+            append_trip_log(trip_record(
+                "RESISTOR LINK LOST", lost_in, fault_detail,
+                ladder_ohm=target_res if lost_in == "RUNNING" else None, kill_sent=False))
 
     # All limits, the pack spec and the vehicle model come from rig_config.json
     # (falling back to the RS50 12S4P defaults). Nothing here is hardcoded, so a
@@ -1282,6 +1546,29 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     bank_steps = None
     bank_steps_at = 0.0
 
+    # The operator's load override (parse_override()), None to follow the
+    # profile. override_due sends a change on the next pass rather than at the
+    # next row. profile_steps is the profile's own setting for the current row,
+    # computed even while overridden so handing back is immediate.
+    override = None
+    override_due = False
+    override_sent_at = 0.0
+    profile_steps = None
+
+    def set_ladder(steps):
+        """Send a ladder setting while running, and note it for the per-bank trip."""
+        nonlocal target_res, bank_steps, bank_steps_at
+        # What the ladder is actually set to, not the continuous request. Near
+        # the bottom of the ladder the two can differ by a whole step.
+        target_res = steps * RESISTOR_RESOLUTION
+        if send_binary_command(res_ser, steps):
+            # The firmware ignores a repeat of its current setting, so only a
+            # change restarts the settle time.
+            if steps != bank_steps:
+                bank_steps, bank_steps_at = steps, time.time()
+        else:
+            drop_resistor_link("resistance command")
+
     try:
         lap_data, dropped = load_lap_profile(CSV_FILENAME)
         total_rows = len(lap_data)
@@ -1300,6 +1587,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     # finally below can leave it running.
     discovery.start()
     clean_exit = False
+    crash = None
     try:
         while not stop_event.is_set():
             # Never `continue` past the loop body on an empty queue. Doing so skipped
@@ -1346,10 +1634,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             # check and the clear is the same stop.
             if estop_event is not None and estop_event.is_set():
                 estop_event.clear()
-                latch_fault()
-                print("[LOGIC] EMERGENCY STOP triggered via GUI.")
-                if not kill_load(res_ser):
-                    drop_resistor_link("KILL")
+                operator_stop("E-STOP")
 
             # --- C. Process GUI Commands ---
             while not gui_cmd_queue.empty():
@@ -1426,6 +1711,17 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             except Exception as exc:
                                 print(f"[LOGIC ERROR] Rejected bad config: {exc}")
 
+                    elif isinstance(cmd, tuple) and cmd[0] == "SET_OVERRIDE":
+                        # Taken in any state, RUNNING included: it moves the load
+                        # only within the floors a lap row is held to.
+                        try:
+                            override = parse_override(cmd)
+                        except ValueError as exc:
+                            print(f"[LOGIC] Ignoring load override: {exc}")
+                        else:
+                            override_due = True
+                            print(f"[LOGIC] Load override {describe_override(override)}.")
+
                     elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV":
                         filepath = cmd[1]
                         try:
@@ -1438,6 +1734,9 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             if total_rows > 1:
                                 span = lap_row_interval(lap_data, 0)
                                 print(f"[LOGIC] Row interval from profile timestamps: {span:.3f} s")
+                            if lap_data and profile_resistance(lap_data[0]) is not None:
+                                print("[LOGIC] Bench profile: each row sets the resistance, held "
+                                      "to the same current, power and derate floors as a lap.")
                         except Exception as e:
                             print(f"\n[LOGIC ERROR] Failed to load new CSV: {e}")
 
@@ -1462,6 +1761,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             prev_time_s = 0.0
                             row_interval = lap_row_interval(lap_data, 0)
                             bank_steps = None
+                            # An override in force goes out on the first pass;
+                            # without one, the first row does.
+                            profile_steps = None
+                            override_due = False
+                            override_sent_at = 0.0
 
                             # Coulomb count deliberately CARRIES OVER between runs.
                             # Resetting to full here meant two manually-triggered
@@ -1475,20 +1779,21 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                   f"row interval {row_interval:.3f} s | "
                                   f"starting SOC {(remaining_ah / total_capacity_ah) * 100:.1f}% "
                                   f"({remaining_ah:.2f} Ah)")
+                            if override is not None:
+                                print(f"[LOGIC] Load override {describe_override(override)}; "
+                                      f"the profile sets only the timing and laps.")
                         else:
                             print("[LOGIC] Cannot RUN: No lap data loaded!")
 
                     elif cmd == "STOP" and is_valid_transition(fsm_state, "STOP"):
                         # Still accepted from the queue, for callers with no E-STOP
                         # event (the bench tools); the GUI uses the event.
-                        latch_fault()
-                        print("[LOGIC] EMERGENCY STOP triggered via GUI.")
-                        if not kill_load(res_ser):
-                            drop_resistor_link("KILL")
+                        operator_stop("STOP")
 
                     elif name == "RESET" and is_valid_transition(fsm_state, "RESET"):
                         fsm_state = "IDLE"
                         target_res = 0.0
+                        fault_reason, fault_detail = None, []
                 except Empty:
                     break
 
@@ -1509,39 +1814,27 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 expected=expected)
 
             if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
-                latch_fault()
+                tripped_in = fsm_state
+                latch_fault(trigger_reason)
+                # KILL first: describing, printing and logging the trip all wait
+                # until it has gone out.
+                killed = kill_load(res_ser)
+                killed_at = time.time()
                 print(f"\n[LOGIC] {trigger_reason} ALARM! Killing Load.")
-                if trigger_reason == "TEMP SENSOR FAULT":
-                    dead = stale_temp_sensors(data.get('temp_sensor_ages_s', []),
-                                              limits['temp_stale_timeout'])
-                    print("[LOGIC] No valid reading from: "
-                          + ", ".join(f"bus {b} sensor {s}" for b, s in dead))
-                elif trigger_reason == "RESISTOR OVERTEMP":
-                    hot = hot_resistor_banks(data.get('resistor_temps', []),
-                                             limits['resistor_max_temp'])
-                    print("[LOGIC] " + ", ".join(f"Bank {b} at {t:.0f} C (trip {lim:.0f} C)"
-                                                 for b, t, lim in hot))
-                elif trigger_reason == "CONFIG FAULT":
-                    for problem in config_problems:
-                        print(f"[LOGIC]   - {problem}")
-                elif trigger_reason in ("INVALID READING", "INCOMPLETE DATA"):
-                    for _, detail in measurement_problems(data, expected):
-                        print(f"[LOGIC]   - {detail}")
-                elif trigger_reason == "BANK OVERPOWER":
-                    volts, amps = data.get('voltage', 0.0), data.get('amps', 0.0)
-                    factor = bank_power_factor(limits)
-                    print(f"[LOGIC] Ladder at {volts * amps:.0f} W "
-                          f"(limit {VRB_MAX_POWER_W * factor:.0f} W)")
-                    if settled_steps:
-                        for b, w, lim in overpowered_banks(volts, amps, settled_steps, factor):
-                            print(f"[LOGIC] Bank {b} at {w:.0f} W (limit {lim:.0f} W)")
-                elif trigger_reason == "RESISTOR TC FAULT":
-                    dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
-                                                limits['temp_stale_timeout'])
-                    print("[LOGIC] No valid thermocouple reading from: "
-                          + ", ".join(f"bank {b}" for b in dead))
-                if not kill_load(res_ser):
+                try:
+                    fault_detail = trip_details(trigger_reason, data, limits, config_problems,
+                                                expected, settled_steps)
+                except Exception as exc:
+                    # Describing a trip must never stop the loop that handles it.
+                    fault_detail = [f"(could not describe the trip: {exc!r})"]
+                for line in fault_detail:
+                    print(f"[LOGIC] {line}")
+                if not killed:
                     drop_resistor_link("KILL")
+                append_trip_log(trip_record(
+                    trigger_reason, tripped_in, fault_detail, data,
+                    ladder_ohm=target_res if tripped_in == "RUNNING" else None,
+                    kill_sent=killed, killed_at=killed_at))
 
             # --- E. Coulomb Counting Math ---
             current_time = time.time()
@@ -1566,51 +1859,55 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     if time.time() - last_physics_time >= row_interval:
                         if current_row_idx < total_rows:
                             row = lap_data[current_row_idx]
-
-                            # Standing start is the start of the RUN, not of a lap:
-                            # lap 2 onwards inherits the car's carried velocity.
-                            standing_start = (current_lap == 1 and current_row_idx == 0)
-
-                            # On a lap repeat the profile's clock restarts, so the
-                            # raw timestamp difference is large and negative. Bridge
-                            # that one frame with the profile's own sampling
-                            # interval rather than a literal, so this stays correct
-                            # whatever rate the loaded CSV was logged at.
-                            wrap_dt = None
-                            if current_row_idx == 0 and current_lap > 1:
-                                wrap_dt = lap_row_interval(lap_data, 0)
-
-                            velocity_ms, acceleration, current_time_s = compute_lap_physics(
-                                row, prev_velocity_ms, prev_time_s,
-                                standing_start, current_row_idx, lap_wrap_dt=wrap_dt
-                            )
-                            prev_velocity_ms = velocity_ms
-                            prev_time_s = current_time_s
-
-                            req_power = compute_required_power(velocity_ms, acceleration, vehicle)
-
                             voltage = data['voltage']
                             current_max_temp = data['max_temp']
+                            bench_ohms = profile_resistance(row)
 
-                            steps = command_steps(
-                                voltage, req_power, limits['max_amps'], current_max_temp,
-                                limits['derate_en'], limits['derate_start'], limits['max_temp'],
-                                modules_in_series=pack.modules_in_series,
-                                power_factor=bank_power_factor(limits)
-                            )
-
-                            # What the ladder is actually set to, not the continuous
-                            # request. Near the bottom of the ladder the two can
-                            # differ by a whole step.
-                            target_res = steps * RESISTOR_RESOLUTION
-
-                            if send_binary_command(res_ser, steps):
-                                # The firmware ignores a repeat of its current
-                                # setting, so only a change restarts the settle time.
-                                if steps != bank_steps:
-                                    bank_steps, bank_steps_at = steps, time.time()
+                            if bench_ohms is not None:
+                                # A bench profile names the resistance. Held to the
+                                # same floors and ratings as a lap row.
+                                steps = steps_for_resistance(
+                                    voltage, bench_ohms, limits['max_amps'], current_max_temp,
+                                    limits['derate_en'], limits['derate_start'],
+                                    limits['max_temp'], power_factor=bank_power_factor(limits)
+                                )
                             else:
-                                drop_resistor_link("resistance command")
+                                # Standing start is the start of the RUN, not of a
+                                # lap: lap 2 onwards inherits the car's velocity.
+                                standing_start = (current_lap == 1 and current_row_idx == 0)
+
+                                # On a lap repeat the profile's clock restarts, so the
+                                # raw timestamp difference is large and negative.
+                                # Bridge that one frame with the profile's own
+                                # sampling interval rather than a literal, so this
+                                # stays correct whatever rate the CSV was logged at.
+                                wrap_dt = None
+                                if current_row_idx == 0 and current_lap > 1:
+                                    wrap_dt = lap_row_interval(lap_data, 0)
+
+                                velocity_ms, acceleration, current_time_s = compute_lap_physics(
+                                    row, prev_velocity_ms, prev_time_s,
+                                    standing_start, current_row_idx, lap_wrap_dt=wrap_dt
+                                )
+                                prev_velocity_ms = velocity_ms
+                                prev_time_s = current_time_s
+
+                                req_power = compute_required_power(velocity_ms, acceleration,
+                                                                   vehicle)
+
+                                steps = command_steps(
+                                    voltage, req_power, limits['max_amps'], current_max_temp,
+                                    limits['derate_en'], limits['derate_start'],
+                                    limits['max_temp'],
+                                    modules_in_series=pack.modules_in_series,
+                                    power_factor=bank_power_factor(limits)
+                                )
+
+                            # Worked out even while overridden, so the physics keeps
+                            # pace with the lap and handing back is immediate.
+                            profile_steps = steps
+                            if override is None:
+                                set_ladder(steps)
 
                             row_interval = lap_row_interval(lap_data, current_row_idx)
                             current_row_idx += 1
@@ -1632,6 +1929,26 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                     drop_resistor_link("KILL at the end of the run")
                                 last_physics_time = time.time()
 
+                    # The operator's override, in place of the profile's load: sent
+                    # as soon as it changes, and re-solved every OVERRIDE_REFRESH_S
+                    # because a power override follows the module voltage. When it
+                    # is handed back, the current row's own setting goes out at once.
+                    if fsm_state == "RUNNING" and (override is not None or override_due):
+                        if override_due or time.time() - override_sent_at >= OVERRIDE_REFRESH_S:
+                            steps = profile_steps
+                            if override is not None:
+                                voltage = data['voltage']
+                                steps = steps_for_resistance(
+                                    voltage, override_resistance(override, voltage),
+                                    limits['max_amps'], data['max_temp'],
+                                    limits['derate_en'], limits['derate_start'],
+                                    limits['max_temp'], power_factor=bank_power_factor(limits)
+                                )
+                            override_due = False
+                            override_sent_at = time.time()
+                            if steps is not None:
+                                set_ladder(steps)
+
             # --- G. Pipeline Forwarding ---
             data['fsm_state'] = fsm_state
             data['target_resistance'] = target_res
@@ -1649,6 +1966,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             data['active_limits'] = {k: (list(v) if isinstance(v, list) else v)
                                      for k, v in limits.items()}
             data['active_settings'] = settings_id
+            # The override in force, so the window can show it took.
+            data['load_override'] = override
+            # Why it faulted, so the window can say so rather than only FAULT.
+            in_fault = fsm_state == "FAULT"
+            data['fault_reason'] = fault_reason if in_fault else None
+            data['fault_detail'] = list(fault_detail) if in_fault else []
 
             # Never blocks: a blocking get or put here would stall every trip, the
             # E-STOP and the heartbeat behind the GUI's queue. See put_latest().
@@ -1659,8 +1982,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         # does not keep showing the last state it was sent -- RUNNING, say.
         print(f"\n[LOGIC CRITICAL ERROR] {exc!r}. Killing the load and stopping the "
               f"logic process.")
+        crash = exc
         crashed = NEUTRAL_PACKET()
         crashed['fsm_state'] = "FAULT"
+        crashed['fault_reason'] = "LOGIC ERROR"
+        crashed['fault_detail'] = [repr(exc)]
         crashed['hardware_status'] = {'res_arduino': False}
         put_latest(telemetry_queue, crashed)
         raise
@@ -1675,12 +2001,18 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             final_ser = resistor_slot['ser'] or res_ser
             resistor_slot['ser'] = None
 
+        killed = None
         if final_ser is not None:
-            kill_load(final_ser)
+            killed = kill_load(final_ser)
             try:
                 final_ser.close()
             except Exception:
                 pass
+
+        # Logged after the KILL above, like every other trip.
+        if crash is not None:
+            append_trip_log(trip_record("LOGIC ERROR", fsm_state, [repr(crash)],
+                                        kill_sent=killed, killed_at=time.time()))
 
         # The worker is a daemon and waits on logic_done, so it exits on its
         # own; join briefly so its port handles are released before the process

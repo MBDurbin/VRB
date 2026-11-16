@@ -13,6 +13,7 @@ The design, the physics and the safety layers are explained in
 |---|---|
 | The rig | `python main_v2.py` |
 | Desk test without hardware | plug in the SIL dongle, then `python main_v2.py`; follow [tests/SIL_CHECKLIST.md](tests/SIL_CHECKLIST.md) |
+| Trip test on bench supplies, no battery | `python main_v2.py`; follow [tests/BENCH_CHECKLIST.md](tests/BENCH_CHECKLIST.md) |
 | Unit tests | `python -m pytest` (the firmware bank-map test also needs `g++` or `clang++`; it skips without one) |
 | Relay chatter check (no hardware) | `python tools/relay_timing_check.py` |
 
@@ -31,14 +32,14 @@ temperatures are edited in the file itself.
 | `sil_simulator.py` | Desk-test plant model that stands in for the DAQ. |
 | `rig_config.py`, `rig_config.json` | All configuration, and the file it is saved to. |
 | `queue_util.py` | `put_latest()`: publishes DAQ packets and telemetry onto the bounded queues without ever blocking. |
-| `profiles/` | Lap speed profiles (CSV). The GUI's **Load CSV** dialog opens here. |
-| `logs/` | Recordings from the GUI's **Record** button. Not tracked by git. |
+| `profiles/` | Lap speed profiles (CSV), and `Bench - ...` profiles that set the resistance directly. The GUI's **Load Profile** dialog opens here. |
+| `logs/` | Recordings from the GUI's **Record** button, and `trip_log.csv`: every stop and fault with the reading that caused it. Not tracked by git. |
 | `tools/` | Bench and desk tools, run by hand: see below. |
 | `analysis/` | Offline cooling analysis of the bank. Not used by the running rig. |
 | `arduino/` | Firmware for the resistor controller and the temperature array. See its README. |
 | `datasheets/` | The cell and resistor datasheets the limits come from. |
 | `docs/` | Hardware topology and the packaged audit snapshot. |
-| `tests/` | Unit tests and the SIL desk-test checklist. |
+| `tests/` | Unit tests, the SIL desk-test checklist and the bench trip-test checklist. |
 | `legacy/` | Superseded prototypes, kept for reference only. Not maintained. |
 
 ### tools/
@@ -48,7 +49,9 @@ temperatures are edited in the file itself.
 | `bench_relay_check.py` | Command resistances and meter each relay. Battery disconnected. |
 | `relay_timing_check.py` | Replays the control loop's serial traffic against the firmware's relay rules. No hardware. |
 | `thermocouple_check.py` | Reads the resistor thermocouples once (Bryce's bench test). |
-| `discover DAQ.py` | Lists every NI-DAQ channel name, for filling in `rig_config.json`. |
+| `discover DAQ.py` | Lists every NI-DAQ module (model and slot) and channel name, for filling in `rig_config.json`. |
+| `tap_map_check.py` | With the taps powered, reads every input and reports which cell tap each carries, and whether `voltage_channels` matches. |
+| `dcir_from_log.py` | Reads a recording of `Bench - DC Resistance Pulses.csv` and prints the module's and each cell's DC resistance at 1 s and 10 s, step by step down the charge. No hardware. |
 | `Current Sensor.py` | Streams the current transducer reading. |
 
 ### analysis/

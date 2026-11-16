@@ -105,13 +105,15 @@ class VehicleParams:
     # Dry mass of the car itself: chassis, battery, motor, bodywork, fluids.
     # Feeds BOTH the inertia term (F = ma) and the rolling-resistance term (via
     # weight pressing the tyres down), so an error here shifts the whole power
-    # curve, not just acceleration.
-    mass_car_kg: float = 260.0 #kg
+    # curve, not just acceleration. 233 kg is the 2026 car as weighed, with
+    # today's nine-module pack; a different pack changes it by the pack's mass.
+    mass_car_kg: float = 233.0 #kg
 
     # Driver mass, kept separate from the car so it can be changed per driver
     # without touching the chassis figure. Summed with the above in
-    # total_mass_kg; the physics never uses either one alone.
-    mass_driver_kg: float = 70.0 #kg
+    # total_mass_kg; the physics never uses either one alone. 95.3 kg is the
+    # team's heaviest driver (210 lb): the worst case for energy and current.
+    mass_driver_kg: float = 95.3 #kg
 
     # Rotational inertia of wheels, brake rotors, axles and drivetrain, modelled
     # as extra "virtual" mass. Applies to acceleration ONLY: spinning components
@@ -223,9 +225,11 @@ class PackConfig:
 
     Defaults describe the Reliance RS50 (21700, 5000 mAh, 70 A) in 12S4P, the
     cell installed since it replaced the Molicel P45B. The capacity, voltage,
-    current and temperature figures are the supplier's listing (see
-    datasheets/README.md); the 2.5 V cutoff and 4.0 mOhm impedance are not on
-    it and still want a datasheet. Replace with your own cell's numbers.
+    current and temperature figures are the supplier's listing; the 6.5 mOhm
+    impedance is Mooch's independent test (October 2025), which also confirms
+    the 4950 mAh and the 70 A-to-80 C rating. There is still no manufacturer
+    datasheet, so the 2.5 V cutoff is the usual figure for the class (see
+    datasheets/README.md). Replace with your own cell's numbers.
 
     THE RULE FOR THIS CLASS: every field is a number you can read directly off a
     cell datasheet or count off the physical pack. Nothing here is calculated by
@@ -277,6 +281,15 @@ class PackConfig:
     # safety-critical number in this file: it sets the over-current trip for the
     # whole rig via max_current_a below. Check the datasheet carefully -- many
     # cells quote a higher "pulse" rating that must NOT be used here.
+    #
+    # The RS50's 70 A is a temperature-limited rating: Mooch's test (Oct 2025)
+    # holds 70 A only until the cell reaches 80 C, and puts its true continuous
+    # rating at 40 A. 70 A stands here because the rig enforces the condition:
+    # every cell has a temperature sensor and the over-temp trip sits at or
+    # below 80 C. The sensors sit on the cell tops, which read cooler than the
+    # side wall a cell test measures, so keep the trip under 80 (rig_config.json
+    # ships 65). A run held above 40 A/cell (160 A for 4P) for long ends on the
+    # temperature trip, not the current one.
     cell_max_continuous_a: float = 70
 
     # Fully-charged resting voltage of one cell. Sets the top of the pack's
@@ -300,16 +313,18 @@ class PackConfig:
     # can be lower than the cut-off quoted beside a current rating. The old P45B
     # listed 60 C operating but an 80 C cut-off for its 45 A test, and 60 was the
     # right figure. The RS50 listing gives only its 70 A rating "with 80 C
-    # temperature cut-off", so 80 it is -- lower it if a datasheet gives a
-    # narrower discharge range.
+    # temperature cut-off", and Mooch's test rates it the same way, so 80 it is
+    # -- lower it if a datasheet gives a narrower discharge range.
     cell_max_temp_c: float = 80.0           # discharge ceiling
 
     # DC internal resistance of one cell, in milliohms, measured at 50% state of
     # charge. Drives the sag calculations: series adds and parallel divides, so
-    # 4 mOhm in 12S4P gives a 12 mOhm module, sagging 3.4 V at the 280 A rating.
-    # Not on the RS50 listing: an estimate until a datasheet or a bench
-    # measurement replaces it.
-    cell_dc_milliohm: float = 4.0         # DC impedance at 50% SOC
+    # 6.5 mOhm in 12S4P gives a 19.5 mOhm module, sagging 5.5 V at the 280 A
+    # rating. Not on the RS50 listing: 6.5 is Mooch's DC measurement (Oct 2025).
+    # Over a sustained discharge the cell sags more, about 8 mOhm effective, as
+    # polarisation builds. tools/dcir_from_log.py measures this module's own
+    # cells at 1 s and 10 s.
+    cell_dc_milliohm: float = 6.5         # DC impedance at 50% SOC
 
     # Use minimum rather than typical capacity for SOC. Conservative: a worst-case
     # pack really does hold less, and overstating SOC is the dangerous direction.
@@ -426,8 +441,8 @@ class PackConfig:
 
     def sag_volts(self, current_a: float) -> float:
         """Voltage drop across pack internal resistance at a given current."""
-        # Ohm's law. At the RS50 module's 280 A rating with 12 mOhm this is
-        # 3.4 V (the old P45B's 45 mOhm sagged 8.1 V at its 180 A), which is why
+        # Ohm's law. At the RS50 module's 280 A rating with 19.5 mOhm this is
+        # 5.5 V (the old P45B's 45 mOhm sagged 8.1 V at its 180 A), which is why
         # the undervoltage trip cannot sit at the cells' absolute cutoff.
         return current_a * self.resistance_ohm
 
@@ -481,19 +496,33 @@ PACK_FIELD_LABELS = {
 # error, so double-check against the physical wiring.
 #
 # The "cDAQ1ModN/aiM" form is National Instruments' addressing: chassis 1,
-# module N, analog input M. Each module here carries 4 inputs, so 12 taps plus
-# one current channel spans four modules.
+# module N, analog input M.
+#
+# The taps are on an NI 9205 in slot 8, read single-ended against its COM
+# (voltage_terminal_config), through an NI 9923 screw-terminal block. The 9923's
+# terminal numbers are the D-SUB pin numbers, and the 9205's D-SUB does NOT run
+# in channel order: pins 1-8 are AI0-AI7, pin 9 is a digital output (DO0), pin
+# 10 is COM, pins 11-18 are AI16-AI23, and pins 20-27 are AI8-AI15 (NI 9205
+# Getting Started Guide, Figure 1). So taps 1-9 are on terminals 2-8, 20 and 21
+# (AI1-AI9), taps 10-12 on terminals 11-13 (AI16-AI18), and the tap ground on
+# terminal 10 (COM). tools/tap_map_check.py reads every input to confirm it.
 DEFAULT_VOLTAGE_CHANNELS = [
-    "cDAQ1Mod8/ai1", "cDAQ1Mod8/ai2", "cDAQ1Mod8/ai3",
-    "cDAQ1Mod7/ai0", "cDAQ1Mod7/ai1", "cDAQ1Mod7/ai2", "cDAQ1Mod7/ai3",
-    "cDAQ1Mod6/ai0", "cDAQ1Mod6/ai1", "cDAQ1Mod6/ai2", "cDAQ1Mod6/ai3",
-    "cDAQ1Mod5/ai0",
+    "cDAQ1Mod8/ai1", "cDAQ1Mod8/ai2", "cDAQ1Mod8/ai3", "cDAQ1Mod8/ai4",
+    "cDAQ1Mod8/ai5", "cDAQ1Mod8/ai6", "cDAQ1Mod8/ai7", "cDAQ1Mod8/ai8",
+    "cDAQ1Mod8/ai9", "cDAQ1Mod8/ai16", "cDAQ1Mod8/ai17", "cDAQ1Mod8/ai18",
 ]
 
 # Thermocouple inputs for resistor banks 1-4, in bank order. See DaqConfig.
+# Every other jack of the NI 9212's TB-9212 mini-TC block: TC0, TC2, TC4, TC6.
 DEFAULT_RESISTOR_TC_CHANNELS = [
-    "cDAQ1Mod3/ai0", "cDAQ1Mod3/ai1", "cDAQ1Mod3/ai2", "cDAQ1Mod3/ai3",
+    "cDAQ1Mod6/ai0", "cDAQ1Mod6/ai2", "cDAQ1Mod6/ai4", "cDAQ1Mod6/ai6",
 ]
+
+# How each voltage tap is measured, as nidaqmx's TerminalConfiguration names it.
+# RSE is single-ended against the module's COM, which is how the 9205 is wired.
+# DEFAULT leaves it to the driver, which on a 9205 can pair channels as
+# differential inputs (AI1 against AI9): two taps read as one meaningless value.
+TERMINAL_CONFIGS = ("RSE", "NRSE", "DIFF", "DEFAULT")
 
 # Accepted values for the thermocouple settings, kept here so rig_config does
 # not have to import nidaqmx. They are the member names of nidaqmx's
@@ -501,6 +530,9 @@ DEFAULT_RESISTOR_TC_CHANNELS = [
 # separate CJC channel this config has no field for.
 THERMOCOUPLE_TYPES = ("B", "E", "J", "K", "N", "R", "S", "T")
 CJC_SOURCES = ("BUILT_IN", "CONSTANT_USER_VALUE")
+# nidaqmx ADCTimingMode names for the thermocouple module. DEFAULT leaves the
+# module's own; a module without the setting (an NI 9211) needs DEFAULT.
+TC_ADC_MODES = ("HIGH_SPEED", "HIGH_RESOLUTION", "DEFAULT")
 
 
 @dataclass
@@ -528,7 +560,11 @@ class DaqConfig:
     # also appear in voltage_channels; validate() checks for that collision
     # because miswiring it would silently turn a current reading into a cell
     # voltage.
-    current_channel: str = "cDAQ1Mod8/ai0"
+    #
+    # The LEM sensor is on the NI 9215 in slot 7, channel ai0: signal on screw
+    # terminal 0 (AI0+), its 0 V on terminal 1 (AI0-) and on terminal 9 (COM).
+    # The 9215 is differential only, which is what the driver's default gives.
+    current_channel: str = "cDAQ1Mod7/ai0"
 
     # Ordered list of cumulative voltage taps, one per series group.
     #
@@ -538,6 +574,12 @@ class DaqConfig:
     # wraps list() to hand out a fresh copy each time.
     voltage_channels: List[str] = field(
         default_factory=lambda: list(DEFAULT_VOLTAGE_CHANNELS))
+
+    # How the voltage taps are measured: one of TERMINAL_CONFIGS. RSE for taps
+    # wired to a 9205 against its COM. A module that cannot measure that way
+    # (a 9215 is differential only) stops the DAQ task starting, so the rig
+    # refuses ARM rather than reading the taps some other way.
+    voltage_terminal_config: str = "RSE"
 
     # --- Scaling ---
     # Resistor divider on each tap: a 10:1 divider means multiply by 11.
@@ -588,9 +630,11 @@ class DaqConfig:
     # Arduino. Entry i is bank i+1, so ORDER IS MEANINGFUL, as with the voltage
     # taps. Banks 5-8 carry too little current to need one (docs/hardware_topology.md).
     #
-    # Module 3 per Bryce Marshall's bench test (tools/thermocouple_check.py),
-    # which read cDAQ1Mod3/ai0:1. Banks 3 and 4 on ai2/ai3 assume the remaining
-    # inputs of the same module -- check against the wiring.
+    # Slot 6 is an NI 9212 (8 thermocouple channels) with the TB-9212 mini-TC
+    # block, one channel per jack. The banks are on jacks TC0 (bank 1, 0.25
+    # ohm), TC2 (bank 2), TC4 (bank 3) and TC6 (bank 4), checked on the rig in
+    # October 2026. The odd jacks are empty: listing one would read an open
+    # thermocouple, and once armed fault as RESISTOR TC FAULT.
     resistor_tc_channels: List[str] = field(
         default_factory=lambda: list(DEFAULT_RESISTOR_TC_CHANNELS))
 
@@ -604,6 +648,15 @@ class DaqConfig:
     # what the bench test got by not setting it -- every reading is then off by
     # however far the terminal block is from 25 C.
     resistor_tc_cjc_source: str = "BUILT_IN"
+
+    # How the thermocouple module converts, one of TC_ADC_MODES. The NI 9212's
+    # default, HIGH_RESOLUTION, took 2.2 s to read the four banks (550 ms with
+    # the task kept running), against a 3 s staleness trip. HIGH_SPEED reads them
+    # in 12 ms, so the banks really are read every RESISTOR_TC_PERIOD_S, and read
+    # within 0.1 C of high resolution at room temperature (measured October
+    # 2026). High resolution rejects 50/60 Hz pickup better: switch back if bank
+    # readings jitter with the fan and supplies running.
+    resistor_tc_adc_mode: str = "HIGH_SPEED"
 
     # --- Loop timing ---
     # Target seconds per DAQ cycle. 0.1 s is 10 Hz. The loop sleeps for whatever
@@ -687,6 +740,10 @@ class DaqConfig:
         if tc_dupes:
             problems.append(f"Duplicate thermocouple channels: {', '.join(sorted(tc_dupes))}; "
                             f"two banks would show the same temperature.")
+        # Stops the voltage and current task starting, so nothing is measured.
+        if self.voltage_terminal_config not in TERMINAL_CONFIGS:
+            problems.append(f"Voltage input mode '{self.voltage_terminal_config}' is not one "
+                            f"of {', '.join(TERMINAL_CONFIGS)}.")
         # Either one stops the thermocouple task starting, so no bank is read.
         if self.thermocouple_type not in THERMOCOUPLE_TYPES:
             problems.append(f"Thermocouple type '{self.thermocouple_type}' is not one of "
@@ -694,6 +751,9 @@ class DaqConfig:
         if self.resistor_tc_cjc_source not in CJC_SOURCES:
             problems.append(f"Cold-junction source '{self.resistor_tc_cjc_source}' is not one "
                             f"of {', '.join(CJC_SOURCES)}.")
+        if self.resistor_tc_adc_mode not in TC_ADC_MODES:
+            problems.append(f"Thermocouple mode '{self.resistor_tc_adc_mode}' is not one "
+                            f"of {', '.join(TC_ADC_MODES)}.")
         # Zero reads every cell and the current as zero. A negative current scale
         # reads discharge as negative, which never reaches the over-current trip.
         # `not > 0` rather than `<= 0` so a NaN from the JSON is caught too.
@@ -745,6 +805,7 @@ class DaqConfig:
 DAQ_FIELD_LABELS = {
     'current_channel':       ("Current channel", ""),
     'voltage_channels':      ("Voltage channels", "comma separated"),
+    'voltage_terminal_config': ("Voltage input mode", "RSE NRSE DIFF DEFAULT"),
     'voltage_multiplier':    ("Divider multiplier", "x"),
     'current_amps_per_volt': ("Current transducer", "A/V"),
     'ai_min_volts':          ("Analog input min", "V"),
@@ -755,6 +816,7 @@ DAQ_FIELD_LABELS = {
     'resistor_tc_channels':  ("Resistor thermocouples", "bank 1 first, comma separated"),
     'thermocouple_type':     ("Thermocouple type", "B E J K N R S T"),
     'resistor_tc_cjc_source': ("Cold-junction source", "BUILT_IN or CONSTANT_USER_VALUE"),
+    'resistor_tc_adc_mode':  ("Thermocouple mode", "HIGH_SPEED HIGH_RESOLUTION DEFAULT"),
     'sample_period_s':       ("DAQ sample period", "s"),
 }
 

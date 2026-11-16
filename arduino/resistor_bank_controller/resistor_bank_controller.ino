@@ -13,7 +13,12 @@ bool noSignalAnnounced = false;
 // ================= HARDWARE CONFIGURATION =================
 const int RELAY_MAIN_PIN = 4;       // Main relay d4
 const int BANK_1_RELAY   = 5;        // Bank 1, 0.25 ohm: the LAST character
-const int otherRelayPins[] = {12, 11, 10, 9, 8, 7, 6}; // Banks 8 (32 ohm) down to 2 (0.5 ohm)
+// Banks 8 (32 ohm) down to 2 (0.5 ohm). Pins 10 and 11 are not in order: on the
+// bench in October 2026 the relay on pin 11 bypassed the 8 ohm bank and the one
+// on pin 10 the 16 ohm bank, so 16 ohm (the 2nd character) drives pin 10 and
+// 8 ohm (the 3rd) pin 11. Meter with tools/bench_relay_check.py `walk` after
+// any rewiring.
+const int otherRelayPins[] = {12, 10, 11, 9, 8, 7, 6};
 const int numOtherRelays = sizeof(otherRelayPins) / sizeof(otherRelayPins[0]);
 
 // One character per ladder relay: otherRelayPins in order, then BANK_1_RELAY.

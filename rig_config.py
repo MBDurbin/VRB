@@ -1306,6 +1306,16 @@ class RigConfig:
     def advisories(self):
         """Problems worth showing that leave nothing unwatched. Never block ARM."""
         problems = self.limits.advisories() + self.daq.advisories(self.pack)
+        # A trip below the cutoff blocks ARM. One sitting exactly on it does
+        # not, but it only fires as the cell reaches the voltage that damages
+        # it, and a cell voltage is the difference of two taps, each with its
+        # own error. The bench-supply tests left the file like this once.
+        if math.isclose(self.limits.min_cell_volts, self.pack.cell_min_voltage, abs_tol=1e-6):
+            problems.append(
+                f"Per-cell trip {self.limits.min_cell_volts:.2f} V is the cell's cutoff "
+                f"itself, with no margin for sag or for the taps' own error. Pack "
+                f"derivation sets {self.pack.cell_min_voltage + 0.20:.2f} V."
+            )
         # Limits and channels live in different sections, so only this level can
         # see whether every thermocoupled bank has a trip of its own.
         n_tc, n_lim = len(self.daq.resistor_tc_channels), len(self.limits.resistor_max_temp_c)

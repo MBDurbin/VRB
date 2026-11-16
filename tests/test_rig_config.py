@@ -612,6 +612,17 @@ class TestArmBlockers:
         assert cfg.arm_blockers() == []
         assert any("thermistors configured" in p for p in cfg.advisories())
 
+    def test_a_cell_trip_sitting_on_the_cutoff_is_pointed_out(self):
+        # Below the cutoff blocks ARM; exactly on it does not, and is how the
+        # bench-supply tests once left the file for the first module.
+        cfg = RigConfig.defaults()
+        assert not any("cutoff itself" in p for p in cfg.advisories())
+        cfg.limits.derive_from_pack = False
+        cfg.limits.min_cell_volts = cfg.pack.cell_min_voltage
+        assert cfg.arm_blockers() == []
+        (note,) = [p for p in cfg.advisories() if "cutoff itself" in p]
+        assert "2.50 V" in note and "sets 2.70 V" in note
+
     def test_current_on_a_voltage_channel_blocks(self):
         assert any("also listed" in p
                    for p in _blocked_by(current_channel=DEFAULT_VOLTAGE_CHANNELS[3]))

@@ -28,13 +28,13 @@
     "use_minimum_capacity": false
   },
   "limits": {
-    "derive_from_pack": false,
-    "max_amps": 60.0,
-    "amp_buffer": 4.0,
+    "derive_from_pack": true,
+    "max_amps": 275.0,
+    "amp_buffer": 5.0,
     "max_temp": 65.0,
     "min_volts": 36.0,
     "warn_volts": 38.0,
-    "min_cell_volts": 2.5,
+    "min_cell_volts": 2.7,
     "cell_sense_floor": 0.5,
     "temp_stale_timeout_s": 3.0,
     "daq_stale_timeout_s": 1.0,
@@ -46,7 +46,8 @@
       225.0,
       150.0
     ],
-    "bank_rated_power_only": false
+    "bank_rated_power_only": false,
+    "load_check_enabled": true
   },
   "daq": {
     "current_channel": "cDAQ1Mod7/ai0",

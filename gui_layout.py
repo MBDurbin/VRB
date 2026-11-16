@@ -149,6 +149,7 @@ LIMIT_LABELS = {
     'temp_stale_timeout': "Temp stale timeout", 'daq_stale_timeout': "DAQ stale timeout",
     'derate_en': "Thermal derate", 'derate_start': "Derate start",
     'resistor_max_temp': "Resistor trips", 'bank_rated_only': "Bank at rated power only",
+    'load_check': "Check load against ladder",
 }
 
 # How long the controller may take to acknowledge a settings change before the
@@ -188,6 +189,34 @@ def settings_mismatch(config, data):
         lines.append("Vehicle, pack or wiring: the controller is still using the previous "
                      "configuration")
     return lines
+
+
+def setup_notices(config):
+    """Settings that are right for a bench session and wrong to forget, as (short, full).
+
+    Neither stops the rig, so neither is an ARM blocker. Both are saved with the
+    config when the window closes, which is how a session on bench supplies left
+    a 60 A limit and a per-cell trip on the cutoff waiting for the first module.
+    """
+    limits, pack = config.limits, config.pack
+    notices = []
+    if not limits.derive_from_pack:
+        derived = replace(limits, derive_from_pack=True).apply_pack_derivation(pack)
+        notices.append((
+            "LIMITS HAND-SET",
+            f"The limits are hand-set, not derived from the pack: "
+            f"{limits.max_amps:.0f} A (+{limits.amp_buffer:.0f}), {limits.max_temp:.0f} C, "
+            f"{limits.min_volts:.1f} V, {limits.min_cell_volts:.2f} V/cell. The pack gives "
+            f"{derived.max_amps:.0f} A (+{derived.amp_buffer:.0f}), {derived.max_temp:.0f} C, "
+            f"{derived.min_volts:.1f} V, {derived.min_cell_volts:.2f} V/cell. Tick "
+            f"\"Derive limits from pack\" in the sidebar to go back to those."))
+    if not limits.load_check_enabled:
+        notices.append((
+            "LOAD CHECK OFF",
+            "The load check is off, for bench supplies. With a module on, tick "
+            "\"Check load against ladder\" in the sidebar: nothing else notices a bank "
+            "that is not at the resistance commanded."))
+    return notices
 
 
 def arm_refusal_summary(refusals):
@@ -1036,10 +1065,20 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.mismatch_since = None
         self.shown_mismatch = []
 
+        # Settings that suit the bench supplies and not a module, in amber for
+        # as long as they stand. The config is saved on exit, so without this a
+        # bench session's hand-set limits carried over to the next run unseen.
+        self.lbl_setup_notices = QtWidgets.QLabel()
+        self.lbl_setup_notices.setStyleSheet(
+            f"color: {theme.WARNING}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+        self.lbl_setup_notices.setVisible(False)
+        self.refresh_setup_notices()
+
         sub_top_layout.addWidget(self.lbl_active_csv)
         sub_top_layout.addWidget(self._divider())
         sub_top_layout.addWidget(self.lbl_active_config)
         sub_top_layout.addSpacing(theme.GAP_MD)
+        sub_top_layout.addWidget(self.lbl_setup_notices)
         sub_top_layout.addWidget(self.lbl_settings_mismatch, 1)
         main_layout.addLayout(sub_top_layout)
 
@@ -1227,9 +1266,32 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         form_layout.addRow(self._field_label("Derate start", "°C"), self.sb_t_derate)
         form_layout.addRow(self._field_label("Max temp", "°C"), self.sb_t_crit)
 
+        # Whether the measured current is checked against the ladder setting.
+        # Off only for the bench supplies, which do not agree with each other.
+        self.chk_load_check = QtWidgets.QCheckBox("Check load against ladder")
+        self.chk_load_check.setChecked(self.config.limits.load_check_enabled)
+        self.chk_load_check.setToolTip(
+            "Ticked: a run faults as LOAD MISMATCH when the measured current does not fit\n"
+            "the resistance commanded: a wrong bank, a relay or contactor that did not\n"
+            "move, a controller restart, a dead current sensor.\n"
+            "Untick only for bench supplies, where the taps and the bank are on\n"
+            "different supplies. Saved with the config, so tick it again for a module.")
+
+        # Pack derivation, on or off. A threshold edit above switches it off;
+        # this is the way back, which used to mean editing rig_config.json.
+        self.chk_derive = QtWidgets.QCheckBox("Derive limits from pack")
+        self.chk_derive.setChecked(self.config.limits.derive_from_pack)
+        self.chk_derive.setToolTip(
+            "Ticked: V crit, cell min, max current, max temp and derate start are worked\n"
+            "out from the cell and pack in Configure, and follow them.\n"
+            "Editing one of those boxes unticks this and keeps your value.\n"
+            "Ticking it again puts the derived values back.")
+
         limits_inner.addLayout(form_layout)
         limits_inner.addWidget(self.chk_derate)
         limits_inner.addWidget(self.chk_bank_rated)
+        limits_inner.addWidget(self.chk_load_check)
+        limits_inner.addWidget(self.chk_derive)
         cell_layout.addWidget(limits_card)
 
         self.sb_v_warn.valueChanged.connect(self.handle_warn_change)
@@ -1241,6 +1303,8 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.sb_t_derate.valueChanged.connect(self.handle_limit_change)
         self.chk_derate.stateChanged.connect(self.handle_limit_change)
         self.chk_bank_rated.stateChanged.connect(self.handle_bank_rating_change)
+        self.chk_load_check.stateChanged.connect(self.handle_load_check_change)
+        self.chk_derive.stateChanged.connect(self.handle_derive_change)
 
         # --- LOAD OVERRIDE ---
         # Takes the load off the profile: a resistance, or a power at the bank,
@@ -1497,9 +1561,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.chk_derate.setChecked(limits.derate_enabled)
         self.chk_derate.blockSignals(False)
 
-        self.chk_bank_rated.blockSignals(True)
-        self.chk_bank_rated.setChecked(limits.bank_rated_power_only)
-        self.chk_bank_rated.blockSignals(False)
+        for box, ticked in ((self.chk_bank_rated, limits.bank_rated_power_only),
+                            (self.chk_load_check, limits.load_check_enabled),
+                            (self.chk_derive, limits.derive_from_pack)):
+            box.blockSignals(True)
+            box.setChecked(ticked)
+            box.blockSignals(False)
+        self.refresh_setup_notices()
 
         self.lim_v_warn = limits.warn_volts
         self.lim_v_crit = limits.min_volts
@@ -1563,6 +1631,33 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         # limits and must not switch derive_from_pack off.
         self.config.limits.bank_rated_power_only = self.chk_bank_rated.isChecked()
         self.send_command(("SET_LIMITS", self.config.limits.to_command_dict()))
+
+    def handle_load_check_change(self):
+        # Not derived from the pack either, so it leaves derivation alone.
+        self.config.limits.load_check_enabled = self.chk_load_check.isChecked()
+        self.refresh_setup_notices()
+        self.send_command(("SET_LIMITS", self.config.limits.to_command_dict()))
+
+    def handle_derive_change(self):
+        """Pack derivation switched on or off from the sidebar.
+
+        On: the derived values replace whatever the boxes held, are shown, and
+        go to the controller. Off: the values stay as they are, and now survive
+        the next load. A threshold edit switches it off by the same route.
+        """
+        limits = self.config.limits
+        limits.derive_from_pack = self.chk_derive.isChecked()
+        if limits.derive_from_pack:
+            limits.apply_pack_derivation(self.config.pack)
+        self.apply_config_to_widgets()
+        self.send_command(("SET_LIMITS", limits.to_command_dict()))
+
+    def refresh_setup_notices(self):
+        """Show, in amber, the settings that are fine on a bench and not on a module."""
+        notices = setup_notices(self.config)
+        self.lbl_setup_notices.setText("  ·  ".join(short for short, _ in notices))
+        self.lbl_setup_notices.setToolTip("\n".join(f"- {full}" for _, full in notices))
+        self.lbl_setup_notices.setVisible(bool(notices))
 
     def configure_override_box(self, mode):
         """Set the value box's unit and range for `mode`, showing that mode's last value.

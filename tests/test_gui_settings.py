@@ -274,3 +274,76 @@ def test_the_trip_reason_shows_only_while_faulted(gui):
     gui.queue.put({**reading, 'fsm_state': "IDLE", 'fault_reason': None, 'fault_detail': []})
     gui.update_gui()
     assert gui.lbl_fault_reason.isHidden()
+
+
+# ================= BENCH SETTINGS THAT MUST NOT BE FORGOTTEN =================
+
+def test_a_threshold_edit_unticks_derivation_and_says_so(gui):
+    assert gui.chk_derive.isChecked() and gui.lbl_setup_notices.isHidden()
+    gui.sb_c_crit.setValue(60.0)                    # the bench supply's limit
+
+    assert not gui.chk_derive.isChecked()
+    assert not gui.lbl_setup_notices.isHidden()
+    assert gui.lbl_setup_notices.text() == "LIMITS HAND-SET"
+    assert "60 A" in gui.lbl_setup_notices.toolTip()
+    assert "The pack gives 275 A (+5)" in gui.lbl_setup_notices.toolTip()
+
+
+def test_ticking_derivation_puts_the_pack_limits_back(gui):
+    # The way back used to be editing rig_config.json by hand.
+    gui.sb_c_crit.setValue(60.0)
+    gui.sb_cell_min.setValue(2.5)
+    drain(gui.gui_cmd_queue)
+
+    gui.chk_derive.setChecked(True)
+    limits = gui.config.limits
+    assert limits.derive_from_pack is True
+    assert (limits.max_amps, limits.min_cell_volts) == (275.0, 2.7)
+    assert (gui.sb_c_crit.value(), gui.sb_cell_min.value()) == (275.0, 2.7)
+    assert gui.lbl_setup_notices.isHidden()
+    (cmd,) = drain(gui.gui_cmd_queue)
+    assert cmd[0] == "SET_LIMITS" and cmd[1]['max_amps'] == 275.0
+
+
+def test_unticking_derivation_keeps_the_values(gui):
+    gui.chk_derive.setChecked(False)
+    assert gui.config.limits.derive_from_pack is False
+    assert gui.config.limits.max_amps == 275.0
+    assert gui.lbl_setup_notices.text() == "LIMITS HAND-SET"
+
+
+def test_the_load_check_switch_reaches_the_controller_and_warns_while_off(gui):
+    assert gui.chk_load_check.isChecked()
+    gui.chk_load_check.setChecked(False)
+
+    assert gui.config.limits.load_check_enabled is False
+    assert gui.config.limits.derive_from_pack is True      # no override of the pack limits
+    (cmd,) = drain(gui.gui_cmd_queue)
+    assert cmd[0] == "SET_LIMITS" and cmd[1]['load_check'] is False
+    assert gui.lbl_setup_notices.text() == "LOAD CHECK OFF"
+
+    gui.chk_load_check.setChecked(True)
+    assert gui.lbl_setup_notices.isHidden()
+
+
+def test_both_notices_show_together():
+    cfg = RigConfig.defaults()
+    assert gui_layout.setup_notices(cfg) == []
+    cfg.limits.derive_from_pack = False
+    cfg.limits.load_check_enabled = False
+    assert [short for short, _ in gui_layout.setup_notices(cfg)] \
+        == ["LIMITS HAND-SET", "LOAD CHECK OFF"]
+
+
+def test_a_window_opened_on_bench_settings_says_so_at_once(app, monkeypatch):
+    bench = RigConfig.defaults()
+    bench.limits.derive_from_pack = False
+    bench.limits.max_amps = 60.0
+    monkeypatch.setattr(RigConfig, "load", staticmethod(lambda *a, **k: bench))
+    window = TelemetryGUI(queue.Queue(), queue.Queue(maxsize=10), threading.Event())
+    try:
+        assert window.lbl_setup_notices.text() == "LIMITS HAND-SET"
+        assert not window.chk_derive.isChecked()
+    finally:
+        window.timer.stop()
+        window.deleteLater()

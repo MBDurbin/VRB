@@ -1242,9 +1242,9 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.lbl_notice.setVisible(False)
         self.lbl_notice.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
                                       QtWidgets.QSizePolicy.Policy.Preferred)
-        self.notice_timer = QtCore.QTimer(self)
-        self.notice_timer.setSingleShot(True)
-        self.notice_timer.timeout.connect(lambda: self.lbl_notice.setVisible(False))
+        # When the notice comes down, checked on the window's own 50 ms tick.
+        # A timer of its own could fire after the window had gone.
+        self.notice_until = None
 
         hw_layout.addSpacing(theme.GAP_MD)
         hw_layout.addWidget(self.lbl_fault_reason, 1)
@@ -1547,7 +1547,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.lbl_notice.setText(text)
         self.lbl_notice.setToolTip(text)
         self.lbl_notice.setVisible(True)
-        self.notice_timer.start(int(NOTICE_SHOW_S * 1000))
+        self.notice_until = time.time() + NOTICE_SHOW_S
 
     def refuse_while_running(self, what):
         """True, after saying so in the window, if a run is in progress.
@@ -1939,6 +1939,9 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         latest_data = packets[-1] if packets else None
 
         now = time.time()
+        if self.notice_until is not None and now >= self.notice_until:
+            self.notice_until = None
+            self.lbl_notice.setVisible(False)
         if packets:
             self.last_packet_at = now
             if self.is_logging and self.csv_writer:

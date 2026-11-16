@@ -156,6 +156,94 @@ LIMIT_LABELS = {
 # window says it is not in force. A command normally lands within ~0.2 s.
 SETTINGS_ACK_GRACE_S = 1.0
 
+# With no packet from the logic process for this long, the window says so. It
+# used to go on showing the last state and readings it was sent, RUNNING and
+# all, with nothing to tell a hung or dead controller from a steady one. The
+# logic process publishes ten times a second. The longer figure is for
+# start-up, before the first packet: the process takes a few seconds to load.
+TELEMETRY_STALE_S = 1.5
+TELEMETRY_STARTUP_S = 10.0
+
+# How long a passing notice stays up, and how long the controller has to report
+# a profile the operator picked before the window says it was not loaded.
+NOTICE_SHOW_S = 8.0
+PROFILE_ACK_S = 2.0
+
+
+def telemetry_lost_for(now, opened_at, last_packet_at):
+    """Seconds without telemetry once that is too long, else None."""
+    if last_packet_at is None:
+        waited = now - opened_at
+        return waited if waited > TELEMETRY_STARTUP_S else None
+    waited = now - last_packet_at
+    return waited if waited > TELEMETRY_STALE_S else None
+
+
+# Recording columns, in order. The first eight, the cells and the cell
+# temperatures are as they have always been, so older recordings and
+# tools/dcir_from_log.py read the same; everything newer follows them.
+RECORD_LEAD = ["Timestamp", "Pack_V", "Amps", "Power_kW", "Max_Temp", "SOC_Est",
+               "FSM_State", "Target_Res"]
+RECORD_RUN = ["Lap", "Row", "Asked_Res", "Expected_A", "Remaining_Ah", "DAQ_Age_s"]
+
+
+def record_headers(series, parallel, bank_count):
+    """The recording's header row for this pack and wiring."""
+    headers = list(RECORD_LEAD)
+    headers += [f"Cell_{i + 1}_V" for i in range(series)]
+    headers += [f"S{s}_T{p}" for s in range(1, series + 1) for p in range(1, parallel + 1)]
+    headers += RECORD_RUN
+    headers += [f"Bank_{b + 1}_T" for b in range(bank_count)]
+    return headers
+
+
+def _cell(value, digits):
+    """A number for the CSV, or an empty field for anything that is not one.
+
+    Empty, not 0.0: a reading that is missing and one that is zero are different
+    events, and an empty field reads back as NaN in pandas and plots as a gap.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return ''
+    return round(value, digits)
+
+
+def _padded(values, count, digits):
+    """`count` fields from a list of readings, empty where there is none."""
+    row = [_cell(v, digits) for v in list(values)[:count]]
+    return row + [''] * (count - len(row))
+
+
+def record_row(packet, started_at, series, parallel, bank_count, received_at=None):
+    """One recording row for one telemetry packet, matching record_headers().
+
+    Timestamp is when the DAQ took the sample, in seconds from `started_at`,
+    not when this window got round to drawing it: the window redraws on a 50 ms
+    timer, so its own clock put up to that much jitter on every row, and on a
+    step into load that is most of the first sample. `received_at` stands in
+    for a packet with no sample time (the SIL plant before it had one).
+    """
+    sampled_at = packet.get('sampled_at')
+    if not (isinstance(sampled_at, (int, float)) and math.isfinite(sampled_at)):
+        sampled_at = received_at if received_at is not None else time.time()
+
+    row = [
+        round(sampled_at - started_at, 3), _cell(packet.get('voltage'), 3),
+        _cell(packet.get('amps'), 2), _cell(packet.get('power_kw'), 3),
+        _cell(packet.get('max_temp'), 2), _cell(packet.get('true_soc'), 2),
+        packet.get('fsm_state', ''), _cell(packet.get('target_resistance'), 2),
+    ]
+    row += _padded(packet.get('cell_voltages', []), series, 3)
+    flat_temps = [t for bus in packet.get('temperatures', []) for t in bus]
+    row += _padded(flat_temps, series * parallel, 1)
+    row += [
+        packet.get('current_lap', ''), packet.get('profile_row', ''),
+        _cell(packet.get('requested_resistance'), 3), _cell(packet.get('expected_amps'), 2),
+        _cell(packet.get('remaining_ah'), 3), _cell(packet.get('daq_age_s'), 3),
+    ]
+    row += _padded(packet.get('resistor_temps', []), bank_count, 1)
+    return row
+
 
 def _same_setting(a, b):
     if isinstance(a, bool) or isinstance(b, bool):
@@ -885,8 +973,21 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.is_logging = False
         self.csv_file = None
         self.csv_writer = None
+        # The sample time of the last row recorded, so a packet the logic
+        # process carried forward is not written a second time.
+        self.last_logged_sample = None
         self.heatmap_window = None
         self.resistor_map_window = None
+
+        # When the last packet arrived, for the NO TELEMETRY banner. None until
+        # the first. See telemetry_lost_for().
+        self.opened_at = time.time()
+        self.last_packet_at = None
+        self.telemetry_lost = False
+
+        # A profile the operator picked that the controller has not reported
+        # yet, as (file name, when it was sent).
+        self.profile_wanted = None
 
         # Vehicle, pack and safety limits all come from rig_config.json, falling
         # back to the RS50 12S4P defaults. Editable from the Configure dialog so
@@ -999,10 +1100,20 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.btn_run.clicked.connect(lambda: self.send_command(
             transition_command("RUN", self.spin_laps.value())))
 
-        self.btn_stop = QtWidgets.QPushButton("E-STOP")
+        self.btn_stop = QtWidgets.QPushButton("E-STOP  (Esc)")
         self.btn_stop.setProperty("variant", "danger")
-        self.btn_stop.setToolTip("Immediately shed all load and latch a fault")
+        self.btn_stop.setToolTip("Immediately shed all load and latch a fault.\n"
+                                 "Esc does the same from any of the rig's windows.")
         self.btn_stop.clicked.connect(
+            lambda: request_estop(self.estop_event, self.gui_cmd_queue))
+        # The button was the only way to stop from this window, and it cannot
+        # be clicked from the thermal or resistor map. Application-wide, so it
+        # works with any of them in front. Qt holds shortcuts back while a
+        # modal dialog is open, which is why nothing modal opens during a run:
+        # see refuse_while_running().
+        self.estop_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), self)
+        self.estop_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        self.estop_shortcut.activated.connect(
             lambda: request_estop(self.estop_event, self.gui_cmd_queue))
 
         self.btn_reset = QtWidgets.QPushButton("Reset")
@@ -1122,9 +1233,23 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                                             QtWidgets.QSizePolicy.Policy.Preferred)
         self.shown_fault = ("", [])
 
+        # A passing notice: something the operator asked for that was not done,
+        # and why. In the window, not in a dialog box: a box has to be clicked
+        # away before anything else in the window can be, E-STOP included.
+        self.lbl_notice = QtWidgets.QLabel()
+        self.lbl_notice.setStyleSheet(
+            f"color: {theme.WARNING}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+        self.lbl_notice.setVisible(False)
+        self.lbl_notice.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                      QtWidgets.QSizePolicy.Policy.Preferred)
+        self.notice_timer = QtCore.QTimer(self)
+        self.notice_timer.setSingleShot(True)
+        self.notice_timer.timeout.connect(lambda: self.lbl_notice.setVisible(False))
+
         hw_layout.addSpacing(theme.GAP_MD)
         hw_layout.addWidget(self.lbl_fault_reason, 1)
         hw_layout.addWidget(self.lbl_arm_refused, 1)
+        hw_layout.addWidget(self.lbl_notice, 1)
         main_layout.addLayout(hw_layout)
 
         # 3. MIDDLE (Graphs & Cells Sidebar)
@@ -1417,7 +1542,30 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         lbl.setText(f"{'●' if is_connected else '○'}  {name}")
         lbl.setStyleSheet(theme.pill_style(is_connected))
 
+    def show_notice(self, text):
+        """Say something in the window for NOTICE_SHOW_S, without a dialog box."""
+        self.lbl_notice.setText(text)
+        self.lbl_notice.setToolTip(text)
+        self.lbl_notice.setVisible(True)
+        self.notice_timer.start(int(NOTICE_SHOW_S * 1000))
+
+    def refuse_while_running(self, what):
+        """True, after saying so in the window, if a run is in progress.
+
+        The file dialog and the Configure dialog are both modal: while one is
+        open nothing else in the window takes a click, E-STOP included, and Qt
+        holds the Esc shortcut back too. So neither opens during a run, and the
+        refusal is a line in the window rather than another box to click away.
+        """
+        if self.last_fsm_state != "RUNNING":
+            return False
+        self.show_notice(f"Run in progress: stop it before {what}.")
+        return True
+
     def load_csv_dialog(self):
+        # The controller does not swap a profile under a run either.
+        if self.refuse_while_running("loading a profile"):
+            return
         filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Lap Telemetry CSV",
@@ -1426,8 +1574,28 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         )
         if filepath:
             self.send_command(("LOAD_CSV", filepath))
-            filename = os.path.basename(filepath)
-            self.lbl_active_csv.setText(f"Profile: {filename}")
+            # The label follows what the controller reports it holds, not what
+            # was picked here: a file it could not read used to be shown as
+            # the profile while the rig went on with the old one.
+            self.profile_wanted = (os.path.basename(filepath), time.time())
+
+    def update_profile_label(self, latest_data):
+        """Show the profile the controller holds, and say if a picked one never took."""
+        if 'profile_name' in latest_data:
+            name = latest_data['profile_name']
+            rows = latest_data.get('profile_rows', 0)
+            self.lbl_active_csv.setText(
+                f"Profile: {name}  ({rows} rows)" if name else "Profile: none loaded")
+        else:
+            name = None
+        if self.profile_wanted:
+            wanted, sent_at = self.profile_wanted
+            if name == wanted:
+                self.profile_wanted = None
+            elif time.time() - sent_at >= PROFILE_ACK_S:
+                self.profile_wanted = None
+                self.show_notice(f"{wanted} was not loaded: the console says why. "
+                                 f"The profile in force is unchanged.")
 
     def refresh_config_label(self):
         pack = self.config.pack
@@ -1467,14 +1635,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         apply and save it anyway, so it showed limits that were not protecting
         the rig -- a lowered max temp that was not in force, say.
         """
-        if self.last_fsm_state != "RUNNING":
-            return False
-        QtWidgets.QMessageBox.information(
-            self, "Run in progress",
-            "Stop the run before changing the configuration.\n\n"
-            "The controller does not take a new configuration mid-run, so only "
-            "this window would change.")
-        return True
+        return self.refuse_while_running("changing the configuration")
 
     def open_config_dialog(self):
         if self.refuse_config_while_running():
@@ -1749,19 +1910,12 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             log_dir = os.path.join(PROJECT_DIR, "logs")
             os.makedirs(log_dir, exist_ok=True)
             filename = os.path.join(log_dir, f"telemetry_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-            self.csv_file = open(filename, 'w', newline='')
+            # Line buffered: every row reaches the disk as it is written, so a
+            # crash or a pulled plug loses nothing already recorded.
+            self.csv_file = open(filename, 'w', newline='', buffering=1)
             self.csv_writer = csv.writer(self.csv_file)
-
-            series = self.config.pack.series_count
-            parallel = self.config.pack.parallel_count
-
-            headers = ["Timestamp", "Pack_V", "Amps", "Power_kW", "Max_Temp", "SOC_Est", "FSM_State", "Target_Res"]
-            headers.extend([f"Cell_{i + 1}_V" for i in range(series)])
-            for s in range(1, series + 1):
-                for p in range(1, parallel + 1):
-                    headers.append(f"S{s}_T{p}")
-
-            self.csv_writer.writerow(headers)
+            self.last_logged_sample = None
+            self.csv_writer.writerow(record_headers(*self.record_shape()))
         else:
             self.is_logging = False
             self.btn_record.setText("Record")
@@ -1773,12 +1927,24 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.close()
             return
 
-        latest_data = None
+        # Every packet waiting, oldest first. The window draws the newest; the
+        # recording takes them all. It used to keep only the newest, so two
+        # samples arriving inside one 50 ms tick left one out of the file.
+        packets = []
         while not self.queue.empty():
             try:
-                latest_data = self.queue.get_nowait()
+                packets.append(self.queue.get_nowait())
             except Empty:
                 break
+        latest_data = packets[-1] if packets else None
+
+        now = time.time()
+        if packets:
+            self.last_packet_at = now
+            if self.is_logging and self.csv_writer:
+                for packet in packets:
+                    self.record_packet(packet, now)
+        self.update_telemetry_banner(now)
 
         if latest_data:
             volts = latest_data['voltage']
@@ -1805,6 +1971,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
 
             self.update_settings_mismatch(latest_data)
             self.update_override_status(latest_data)
+            self.update_profile_label(latest_data)
 
             fsm_state = latest_data.get('fsm_state', 'DISCONNECTED')
             self.last_fsm_state = fsm_state
@@ -1885,36 +2052,52 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 self.p_voltage.setXRange(self.time_data[0], self.time_data[-1], padding=0)
                 self.p_current.setXRange(self.time_data[0], self.time_data[-1], padding=0)
 
-            if self.is_logging and self.csv_writer:
-                row_data = [
-                    round(current_time, 3), round(volts, 2), round(amps, 2),
-                    round(latest_data.get('power_kw', 0), 2), round(max_t, 2),
-                    round(true_soc, 1), fsm_state, round(latest_data.get('target_resistance', 0.0), 2)
-                ]
+    def record_shape(self):
+        """(series, parallel, banks) the recording's columns are laid out for."""
+        return (self.config.pack.series_count, self.config.pack.parallel_count,
+                len(self.config.daq.resistor_tc_channels))
 
-                # Pad/truncate to the configured pack size so every row matches
-                # the header width even if the hardware reports a different count.
-                series = self.config.pack.series_count
-                sensor_count = series * self.config.pack.parallel_count
+    def record_packet(self, packet, received_at):
+        """Write one packet to the recording, unless it is a sample already written.
 
-                # Pad short rows with EMPTY fields, not 0.0. A missing sensor and
-                # a sensor genuinely reading 0.0 are different events -- one is a
-                # wiring fault, the other a dead cell -- and writing 0.0 for both
-                # makes them indistinguishable in the log forever after. An empty
-                # CSV field reads back as NaN in pandas and plots as a gap.
-                cell_row = [round(v, 3) for v in cells][:series]
-                cell_row += [''] * (series - len(cell_row))
-                row_data.extend(cell_row)
+        When the DAQ goes quiet the logic process sends its last packet again
+        with a greater age, so the same reading used to be recorded several
+        times over, each with a new time.
+        """
+        sampled_at = packet.get('sampled_at')
+        if sampled_at is not None and sampled_at == self.last_logged_sample:
+            return
+        self.last_logged_sample = sampled_at
+        try:
+            self.csv_writer.writerow(
+                record_row(packet, self.start_time, *self.record_shape(),
+                           received_at=received_at))
+        except (OSError, ValueError) as exc:
+            # A full disk or a file closed under us must not stop the window:
+            # E-STOP runs through the same timer.
+            self.is_logging = False
+            self.btn_record.setChecked(False)
+            self.btn_record.setText("Record")
+            self.show_notice(f"Recording stopped: {exc}")
 
-                flat_temps = []
-                for bus in temps:
-                    flat_temps.extend(bus)
-
-                temp_row = [round(t, 1) for t in flat_temps][:sensor_count]
-                temp_row += [''] * (sensor_count - len(temp_row))
-                row_data.extend(temp_row)
-
-                self.csv_writer.writerow(row_data)
+    def update_telemetry_banner(self, now):
+        """Say so, over the state banner, when the logic process has gone quiet."""
+        lost = telemetry_lost_for(now, self.opened_at, self.last_packet_at)
+        if lost is not None:
+            self.telemetry_lost = True
+            self.lbl_fsm_state.setStyleSheet(theme.fsm_style("FAULT"))
+            self.lbl_fsm_state.setText(f"NO TELEMETRY  {lost:.0f} s")
+            self.lbl_fsm_state.setToolTip(
+                "Nothing has arrived from the logic process. Every reading in this "
+                "window is the last one it sent, not a live one.\n"
+                "The resistor controller opens the contactor by itself 2 s after the "
+                "logic process stops talking to it.\n"
+                "Check the console, then close and restart the rig.")
+        elif self.telemetry_lost:
+            self.telemetry_lost = False
+            self.lbl_fsm_state.setToolTip("")
+            self.lbl_fsm_state.setStyleSheet(theme.fsm_style(self.last_fsm_state))
+            self.lbl_fsm_state.setText(self.last_fsm_state)
 
     def closeEvent(self, event):
         self.stop_event.set()

@@ -17,7 +17,7 @@ subtract that reading. Lead resistance is the same size as what you're measuring
 
 At the prompt:
     8               command 8 ohms, encoded exactly as the rig would
-    raw 00010000    send a raw 8-bit pattern (raw 00000000 hits the firmware interlock)
+    raw 00010000    send a raw 8-bit pattern (raw 00000000 is refused by the firmware)
     walk            one relay at a time, pausing so you can meter each
     status          heartbeat and reader health, plus resets and watchdog trips seen
     hbtest          pause the heartbeat to prove it's what holds the watchdog off
@@ -125,7 +125,8 @@ def describe(pattern, weights):
     it in circuit. '0' closes the bypass and shorts that resistor out.
     """
     if set(pattern) == {"0"}:
-        pattern = pattern[:-1] + "1"   # firmware interlock rewrites the last character
+        # Every bank bypassed would short the ladder. The firmware refuses it.
+        return "none", "no change: the Arduino rejects all zeros"
     ones = [i for i, bit in enumerate(pattern) if bit == "1"]
     pins = ", ".join(str(PIN_FOR_CHAR[i]) for i in ones) or "none"
     if ones and all(weights[i] is not None for i in ones):
@@ -367,7 +368,9 @@ def main():
                     print("  raw needs exactly 8 characters of 0/1, e.g. raw 00010000")
                     continue
                 if set(pattern) == {"0"}:
-                    print("  expect the Arduino to reply 'SAFETY ACTION' and apply 00000001")
+                    print("  expect the Arduino to reply 'Error: Rejected' and move nothing.\n"
+                          "  A board that replies 'SAFETY ACTION' and applies 00000001 is on\n"
+                          "  the older sketch: reflash it from arduino/resistor_bank_controller.")
                 send(ser, mon, pattern, weights, f"raw {pattern}")
                 continue
 
@@ -386,10 +389,10 @@ def main():
     except (KeyboardInterrupt, EOFError):
         print()
     finally:
-        # KILL only. Never follow it with 00000000: that is a valid command (the
-        # firmware interlock turns it into 00000001), so it re-closes the main
-        # contactor with a resistor in circuit until the 2 s watchdog fires.
-        # Isolated Master Sender.py and Master_Code_v1.py both do that.
+        # KILL only. Never follow it with 00000000, as Isolated Master Sender.py
+        # and Master_Code_v1.py both do. The sketch in this repo now refuses that
+        # word, but one flashed before November 2026 turns it into 00000001 and
+        # re-closes the main contactor on 0.25 ohm until the 2 s watchdog fires.
         try:
             send_kill(ser, mon)
             time.sleep(0.3)    # let the Arduino's reply print

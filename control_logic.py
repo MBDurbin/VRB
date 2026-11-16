@@ -245,12 +245,17 @@ def classify_controller_line(line):
 def encode_steps(steps):
     """The command word for a ladder setting: one character per bank, COMMAND_BANKS order.
 
-    '1' puts that bank in circuit. Zero steps becomes bank 1 alone (0.25 ohm), as
-    the firmware's own all-zero interlock would, so the bank is never commanded
-    to zero resistance.
+    '1' puts that bank in circuit. A setting outside the ladder, zero or less or
+    more than every bank together, becomes every bank together: 63.75 ohm, the
+    lightest load there is. Nothing in the rig asks for one, so it would be a
+    bug, and a bug must not be answered with load. Zero used to become bank 1
+    alone, 0.25 ohm, the heaviest load, as the firmware's interlock made of an
+    all-zero word; the firmware now refuses that word outright, and the host
+    never writes it.
     """
-    if steps == 0:
-        steps = 1
+    every_bank = 2 ** len(COMMAND_BANKS) - 1
+    if not 1 <= steps <= every_bank:
+        steps = every_bank
     return "".join("1" if (steps >> (bank - 1)) & 1 else "0" for bank in COMMAND_BANKS)
 
 

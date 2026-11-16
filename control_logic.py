@@ -1367,7 +1367,17 @@ def lap_row_interval(lap_data, idx, default=1.0):
     over-draining the pack by the same factor. Since compute_lap_physics()
     already derives acceleration from these timestamps, playback ignoring them
     also made the two disagree about how much time a row represents.
+
+    The last row has no row after it to say how long it lasts: see
+    last_row_interval().
     """
+    if lap_data and idx == len(lap_data) - 1:
+        return last_row_interval(lap_data, default)
+    return _row_gap(lap_data, idx, default)
+
+
+def _row_gap(lap_data, idx, default):
+    """Seconds from row idx to the row after it, or `default` if that is unusable."""
     try:
         here = float(lap_data[idx].get('Time (s)'))
         nxt = float(lap_data[idx + 1].get('Time (s)'))
@@ -1378,6 +1388,28 @@ def lap_row_interval(lap_data, idx, default=1.0):
     if math.isfinite(dt) and dt > 0:
         return dt
     return default
+
+
+def last_row_interval(lap_data, default=1.0):
+    """Real seconds to hold a profile's last row.
+
+    Nothing follows it, so its length is taken from the rest of the profile. An
+    evenly sampled log holds it for one sample, as every other row. The default
+    second was used for all of them, so a 10 Hz lap stood on its final row ten
+    times too long, every lap.
+
+    A profile with uneven rows is a bench profile of steps and holds, and its
+    last row is the marker that ends the hold before it, not a sample. That one
+    keeps the default, or the shortest row if that is shorter still.
+    """
+    gaps = [_row_gap(lap_data, i, None) for i in range(len(lap_data) - 1)]
+    gaps = [g for g in gaps if g is not None]
+    if not gaps:
+        return default
+    shortest, longest = min(gaps), max(gaps)
+    if longest - shortest <= 0.01 * longest:
+        return longest
+    return min(default, shortest)
 
 
 def resistance_to_steps(req_r, min_r=0.0):

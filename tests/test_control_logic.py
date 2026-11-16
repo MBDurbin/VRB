@@ -253,8 +253,17 @@ class TestLapRowInterval:
         assert math.isclose(lap_row_interval(rows, 0), 0.5)
         assert math.isclose(lap_row_interval(rows, 1), 2.0)
 
-    def test_last_row_falls_back_to_default(self):
-        assert math.isclose(lap_row_interval(self._profile(0.25), 4), 1.0)
+    def test_last_row_of_an_even_log_is_held_for_one_sample(self):
+        # It used to stand for the default second: ten samples of a 10 Hz lap.
+        assert math.isclose(lap_row_interval(self._profile(0.25), 4), 0.25)
+        assert math.isclose(lap_row_interval(self._profile(2.0), 4), 2.0)
+
+    def test_last_row_of_a_bench_profile_keeps_the_default(self):
+        # Uneven rows are steps and holds; the last row only ends the hold.
+        rows = [{'Time (s)': t} for t in (0, 120, 132, 180, 480)]
+        assert math.isclose(lap_row_interval(rows, 4), 1.0)
+        fast = [{'Time (s)': t} for t in (0, 0.2, 5.0)]
+        assert math.isclose(lap_row_interval(fast, 2), 0.2)
 
     def test_missing_or_bad_timestamps_fall_back(self):
         assert math.isclose(lap_row_interval([{'Speed (mph)': 10}, {'Speed (mph)': 12}], 0), 1.0)

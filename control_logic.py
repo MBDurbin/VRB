@@ -1174,16 +1174,28 @@ def compute_target_resistance(voltage, req_power, max_safe_current, current_max_
     bench it under-loaded by a factor of N: an 81 kW lap demand drew 20 A instead
     of 180 A, and no plausible car power could reach the ladder's 0.25 ohm step.
     """
-    modules = max(1, modules_in_series)
-
-    if req_power <= 0:
-        req_r = MAX_RESISTANCE
-    else:
-        req_r = min(MAX_RESISTANCE, (modules * voltage ** 2) / req_power)
-
+    req_r = requested_resistance(voltage, req_power, modules_in_series)
     return max(req_r, resistance_floor(voltage, max_safe_current, current_max_temp,
                                        derate_enabled, derate_start_temp, max_safe_temp,
                                        power_factor))
+
+
+def requested_resistance(voltage, req_power, modules_in_series=1):
+    """The resistance that puts the car's current through one module: N * V^2 / P.
+
+    Before any floor, rating or ladder step, so it is what the car model asked
+    for and not what the bank was given. The two are reported side by side: the
+    ladder's 0.25 ohm steps are coarse where the heavy rows sit, and a row
+    asking for 0.36 ohm gets 0.25, 43% more current. Over the shipped lap that
+    leaves the charge within 5% of the ask but I^2 t, the cell heating, 3 to
+    17% high. No rounding rule removes it: nearest current reads 1 to 15% low
+    instead, and carrying the error forward trades it for larger single rows.
+    A power of zero or less, braking, asks for the lightest load.
+    """
+    modules = max(1, modules_in_series)
+    if req_power <= 0:
+        return MAX_RESISTANCE
+    return min(MAX_RESISTANCE, (modules * voltage ** 2) / req_power)
 
 
 def command_steps(voltage, req_power, max_safe_current, current_max_temp,
@@ -1374,6 +1386,22 @@ def lap_row_interval(lap_data, idx, default=1.0):
     if lap_data and idx == len(lap_data) - 1:
         return last_row_interval(lap_data, default)
     return _row_gap(lap_data, idx, default)
+
+
+def next_row_due(due_at, now, hold_s):
+    """When the row after the one just sent is due.
+
+    One hold after this row was DUE, not after it was sent. The loop sends a
+    row on the first pass after it falls due, a little late each time, and
+    timing the next from the sending let that lateness add up: a 10 Hz lap ran
+    about 5% long, and the bank held every load that much longer.
+
+    If that moment has already gone, the loop is a whole row behind, after a
+    stall or because the rows come faster than the loop turns. The schedule
+    then restarts from now, so missed rows are not fired off in a burst.
+    """
+    due = due_at + hold_s
+    return due if due > now else now + hold_s
 
 
 def _row_gap(lap_data, idx, default):
@@ -1744,7 +1772,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     settings_id = config.settings_fingerprint()
 
     last_heartbeat = time.time()
-    last_physics_time = time.time()
+    # When the next profile row is due while running. See next_row_due().
+    next_row_at = 0.0
 
     # --- COULOMB COUNTING VARIABLES ---
     total_capacity_ah = pack.capacity_ah
@@ -1783,6 +1812,14 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     override_due = False
     override_sent_at = 0.0
     profile_steps = None
+
+    # The resistance asked for before any floor, rating or 0.25 ohm step: the
+    # row's own (profile_asked), and whichever of that and the override is in
+    # force (asked_res). Reported beside the setting sent, because near the
+    # bottom of the ladder the two differ by a large part of the load. See
+    # requested_resistance().
+    profile_asked = None
+    asked_res = None
 
     def set_ladder(steps):
         """Send a ladder setting while running, and note it for the per-bank trip."""
@@ -2063,10 +2100,13 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             prev_velocity_ms = 0.0
                             prev_time_s = 0.0
                             row_interval = lap_row_interval(lap_data, 0)
+                            # The first row is due now.
+                            next_row_at = time.time()
                             bank_steps = None
                             # An override in force goes out on the first pass;
                             # without one, the first row does.
                             profile_steps = None
+                            profile_asked = asked_res = None
                             override_due = False
                             override_sent_at = 0.0
 
@@ -2180,7 +2220,16 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     # Dwell on each row for the interval the profile itself declares,
                     # not a fixed second. A 10 Hz log played at 1 row/s would run ten
                     # times too slow and hold every power demand ten times too long.
-                    if time.time() - last_physics_time >= row_interval:
+                    # Rows are due on the profile's own timeline: next_row_due().
+                    now = time.time()
+                    if now >= next_row_at:
+                        if current_row_idx >= total_rows and current_lap < total_laps:
+                            # Straight on to the next lap's first row in this
+                            # pass. The wrap used to cost a pass of its own.
+                            current_lap += 1
+                            current_row_idx = 0
+                            print(f"[LOGIC] Starting Lap {current_lap} of {total_laps}")
+
                         if current_row_idx < total_rows:
                             row = lap_data[current_row_idx]
                             voltage = data['voltage']
@@ -2190,6 +2239,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             if bench_ohms is not None:
                                 # A bench profile names the resistance. Held to the
                                 # same floors and ratings as a lap row.
+                                profile_asked = bench_ohms
                                 steps = steps_for_resistance(
                                     voltage, bench_ohms, limits['max_amps'], current_max_temp,
                                     limits['derate_en'], limits['derate_start'],
@@ -2219,6 +2269,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                 req_power = compute_required_power(velocity_ms, acceleration,
                                                                    vehicle)
 
+                                profile_asked = requested_resistance(
+                                    voltage, req_power, pack.modules_in_series)
                                 steps = command_steps(
                                     voltage, req_power, limits['max_amps'], current_max_temp,
                                     limits['derate_en'], limits['derate_start'],
@@ -2231,27 +2283,21 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             # pace with the lap and handing back is immediate.
                             profile_steps = steps
                             if override is None:
+                                asked_res = profile_asked
                                 set_ladder(steps)
 
-                            row_interval = lap_row_interval(lap_data, current_row_idx)
+                            hold = lap_row_interval(lap_data, current_row_idx)
                             current_row_idx += 1
-                            last_physics_time = time.time()
+                            next_row_at = next_row_due(next_row_at, now, hold)
                         else:
-                            if current_lap < total_laps:
-                                current_lap += 1
-                                current_row_idx = 0
-                                row_interval = lap_row_interval(lap_data, 0)
-                                print(f"[LOGIC] Starting Lap {current_lap} of {total_laps}")
+                            target_res = 0.0
+                            if kill_load(res_ser):
+                                fsm_state = "IDLE"
+                                print(f"[LOGIC] All {total_laps} laps completed. System Idling.")
                             else:
-                                target_res = 0.0
-                                if kill_load(res_ser):
-                                    fsm_state = "IDLE"
-                                    print(f"[LOGIC] All {total_laps} laps completed. System Idling.")
-                                else:
-                                    # Still RUNNING here, so this latches a fault:
-                                    # the KILL that ends the run never went out.
-                                    drop_resistor_link("KILL at the end of the run")
-                                last_physics_time = time.time()
+                                # Still RUNNING here, so this latches a fault:
+                                # the KILL that ends the run never went out.
+                                drop_resistor_link("KILL at the end of the run")
 
                     # The operator's override, in place of the profile's load: sent
                     # as soon as it changes, and re-solved every OVERRIDE_REFRESH_S
@@ -2260,10 +2306,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     if fsm_state == "RUNNING" and (override is not None or override_due):
                         if override_due or time.time() - override_sent_at >= OVERRIDE_REFRESH_S:
                             steps = profile_steps
+                            asked_res = profile_asked
                             if override is not None:
                                 voltage = data['voltage']
+                                asked_res = override_resistance(override, voltage)
                                 steps = steps_for_resistance(
-                                    voltage, override_resistance(override, voltage),
+                                    voltage, asked_res,
                                     limits['max_amps'], data['max_temp'],
                                     limits['derate_en'], limits['derate_start'],
                                     limits['max_temp'], power_factor=bank_power_factor(limits)
@@ -2287,6 +2335,9 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             # the recording: the load check's own figure. None when not running.
             data['expected_amps'] = (expected_load_amps(data.get('voltage'), bank_steps)
                                      if fsm_state == "RUNNING" else None)
+            # What was asked for before it was rounded to a step, beside
+            # target_resistance, the step sent.
+            data['requested_resistance'] = asked_res if fsm_state == "RUNNING" else None
             data['remaining_ah'] = remaining_ah
             data['true_soc'] = true_soc
             data['hardware_status']['res_arduino'] = (res_ser is not None)

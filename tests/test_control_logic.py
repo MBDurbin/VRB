@@ -83,6 +83,8 @@ from control_logic import (
     append_trip_log,
     TRIP_LOG_FIELDS,
     expected_load_amps,
+    next_row_due,
+    requested_resistance,
     load_mismatch,
     read_controller_lines,
     classify_controller_line,
@@ -264,6 +266,27 @@ class TestLapRowInterval:
         assert math.isclose(lap_row_interval(rows, 4), 1.0)
         fast = [{'Time (s)': t} for t in (0, 0.2, 5.0)]
         assert math.isclose(lap_row_interval(fast, 2), 0.2)
+
+    def test_rows_keep_to_the_profiles_timeline_not_the_loops(self):
+        # Sent 60 ms late, the next row is still due a second after this one
+        # was due. Timing it from the sending let the lateness add up.
+        assert math.isclose(next_row_due(10.0, 10.06, 1.0), 11.0)
+        due = 0.0
+        for _ in range(100):                    # a hundred rows, each sent late
+            due = next_row_due(due, due + 0.03, 0.1)
+        assert math.isclose(due, 10.0)
+
+    def test_a_stalled_loop_restarts_the_schedule_instead_of_bursting(self):
+        # Three rows behind: the next is one hold from now, not three in a row.
+        assert math.isclose(next_row_due(10.0, 13.5, 1.0), 14.5)
+        assert math.isclose(next_row_due(10.0, 11.0, 1.0), 12.0)   # exactly a row behind
+
+    def test_the_ask_before_any_floor_or_step(self):
+        # 81 kW from nine modules at 46 V each: 0.235 ohm, under the bottom step.
+        assert math.isclose(requested_resistance(46.0, 81000.0, 9), 9 * 46.0 ** 2 / 81000.0)
+        assert requested_resistance(46.0, 0.0, 9) == MAX_RESISTANCE
+        assert requested_resistance(46.0, -5000.0, 9) == MAX_RESISTANCE
+        assert requested_resistance(46.0, 1.0, 9) == MAX_RESISTANCE          # capped
 
     def test_missing_or_bad_timestamps_fall_back(self):
         assert math.isclose(lap_row_interval([{'Speed (mph)': 10}, {'Speed (mph)': 12}], 0), 1.0)

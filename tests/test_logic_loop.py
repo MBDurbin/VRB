@@ -50,7 +50,25 @@ class FakeResistor:
         self.fail = False       # set to make every write raise, like a pulled cable
         self.writes = []
         self.ohms = None        # the ladder setting in circuit; None with the contactor open
+        self.incoming = b""     # what the board has printed and the host has not read
+        self.read_fails = False
         self._lock = threading.Lock()
+
+    def say(self, line):
+        """The board prints a line, as the firmware does over serial."""
+        with self._lock:
+            self.incoming += line.encode() + b"\r\n"
+
+    @property
+    def in_waiting(self):
+        if self.read_fails:
+            raise serial.SerialException("ClearCommError failed")
+        return len(self.incoming)
+
+    def read(self, n):
+        with self._lock:
+            out, self.incoming = self.incoming[:n], self.incoming[n:]
+        return out
 
     def write(self, data):
         if self.fail:
@@ -901,7 +919,6 @@ def test_an_override_changed_mid_run_reaches_the_bank_before_the_next_row(rig, m
 
 
 def test_an_override_is_held_to_the_current_limit(rig):
-    rig.amps = 20.0
     rig.start()
     rig.wait_for("IDLE")
     rig.cmd_q.put(sidebar_limits(max_amps=40.0))          # floor 46 / 40 = 1.15 ohm
@@ -926,9 +943,6 @@ def test_a_malformed_override_changes_nothing(rig, capsys):
 def test_a_bench_profile_sets_the_resistance_it_names(rig, tmp_path):
     profile = tmp_path / "bench.csv"
     profile.write_text(f"Time (s),{cl.RESISTANCE_COLUMN}\n0,63.75\n0.3,2\n0.6,63.75\n")
-    # The fake DAQ's current does not follow the ladder. 50 A through 63.75 ohm
-    # would rightly trip banks 7 and 8; keep it under every bank's share.
-    rig.amps = 0.5
     rig.start()
     rig.wait_for("IDLE")
     rig.cmd_q.put(("LOAD_CSV", str(profile)))
@@ -936,3 +950,188 @@ def test_a_bench_profile_sets_the_resistance_it_names(rig, tmp_path):
 
     rig.wait_for("IDLE", timeout=4.0)       # the run ends with the profile
     assert settings_sent(rig) == [255, 8, 255]
+
+
+# ================= LOAD CHECK =================
+
+def hold_one_ohm(rig, monkeypatch):
+    """Every profile row asks for 1 ohm: 46 A at the fake DAQ's 46 V."""
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 4)
+
+
+def test_a_bank_that_draws_what_it_should_runs_on(rig, monkeypatch):
+    hold_one_ohm(rig, monkeypatch)
+    run_to_running(rig)
+    time.sleep(cl.BANK_SETTLE_S + 1.0)
+    assert rig.state == "RUNNING"
+    assert abs(rig.last['expected_amps'] - 46.0) < 0.01
+
+
+def test_no_current_at_a_loaded_setting_faults_the_run(rig, monkeypatch, capsys):
+    # A contactor that did not close, a controller that restarted, or a current
+    # sensor that stopped reading. Nothing used to notice any of them.
+    hold_one_ohm(rig, monkeypatch)
+    rig.amps = 0.0
+    run_to_running(rig)
+    wait_for_setting(rig, 4)
+    commanded_at = time.monotonic()
+    before = len(rig.resistor.written())
+
+    rig.wait_for("FAULT", timeout=3.0)
+    # Not before the relays and the DAQ have caught up with the setting.
+    assert time.monotonic() - commanded_at >= cl.BANK_SETTLE_S - 0.1
+    assert b"KILL\n" in rig.resistor.written()[before:]
+    out = capsys.readouterr().out
+    assert "LOAD MISMATCH ALARM! Killing Load." in out
+    assert "Ladder at 1.00 ohm and 46.0 V should draw 46.0 A; measured 0.0 A" in out
+
+    time.sleep(0.2)
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['State'], row['Ladder_Ohm']) == ("LOAD MISMATCH", "RUNNING", "1.00")
+    assert rig.last['fault_reason'] == "LOAD MISMATCH"
+
+
+def test_far_more_current_than_the_setting_allows_faults_the_run(rig, monkeypatch, capsys):
+    # The reversed command word: a light setting commanded, a heavy one in circuit.
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 64)       # 16 ohm, 2.9 A
+    rig.amps = 40.0
+    run_to_running(rig)
+    rig.wait_for("FAULT", timeout=3.0)
+    out = capsys.readouterr().out
+    # 40 A through 16 ohm would be 25 kW in bank 7, so its own trip speaks first.
+    assert "BANK OVERPOWER ALARM!" in out or "LOAD MISMATCH ALARM!" in out
+
+
+def test_the_load_check_can_be_switched_off_for_bench_supplies(rig, monkeypatch):
+    hold_one_ohm(rig, monkeypatch)
+    rig.amps = 28.0                         # the bank on a lower supply than the taps
+    rig.start()
+    rig.wait_for("IDLE")
+    bench = RigConfig.defaults().limits
+    bench.load_check_enabled = False
+    rig.cmd_q.put(("SET_LIMITS", bench.to_command_dict()))
+    arm_and_run(rig)
+    time.sleep(cl.BANK_SETTLE_S + 1.0)
+    assert rig.state == "RUNNING"
+
+    # Switched back on mid-run, it faults.
+    bench.load_check_enabled = True
+    rig.cmd_q.put(("SET_LIMITS", bench.to_command_dict()))
+    rig.wait_for("FAULT", timeout=2.0)
+    assert rig.last['fault_reason'] == "LOAD MISMATCH"
+
+
+def test_sil_mode_runs_without_the_load_check(rig, monkeypatch):
+    # The SIL plant's current is a slider, not what the ladder would draw.
+    hold_one_ohm(rig, monkeypatch)
+    rig.amps = 0.0
+    monkeypatch.setattr(rig, "_logic", lambda: cl.run_logic_process(
+        rig.daq_q, rig.tel_q, rig.cmd_q, rig.stop, None, rig.estop, sil_mode=True))
+    run_to_running(rig)
+    time.sleep(cl.BANK_SETTLE_S + 1.0)
+    assert rig.state == "RUNNING"
+
+
+# ================= WHAT THE CONTROLLER SAYS =================
+
+BANNER = "Arduino Ready. Waiting for Binary Signal..."
+NO_SIGNAL = "No Signal: System Reset / All Off"
+
+
+def test_a_controller_restart_mid_run_faults(rig, monkeypatch, capsys):
+    # The board dropped every relay, came back, and took the next row's command
+    # as if nothing had happened. The host never read what it printed.
+    monkeypatch.setattr(cl, "CONTROLLER_BOOT_S", 0.0)
+    run_to_running(rig)
+    before = len(rig.resistor.written())
+    rig.resistor.say(BANNER)
+    rig.wait_for("FAULT", timeout=1.0)
+
+    assert b"KILL\n" in rig.resistor.written()[before:]
+    assert "CONTROLLER RESET ALARM! Killing Load." in capsys.readouterr().out
+    time.sleep(0.2)
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['State'], row['Kill_Sent']) == ("CONTROLLER RESET", "RUNNING", "yes")
+    assert rig.last['fault_reason'] == "CONTROLLER RESET"
+
+
+def test_the_banner_from_opening_the_port_is_not_a_restart(rig, capsys):
+    # Opening the port restarts the board; its banner can land after the handshake.
+    rig.resistor.say(BANNER)
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    time.sleep(0.3)
+    assert rig.state == "ARMED" and "FAULT" not in rig.seen
+    assert "restarted" not in capsys.readouterr().out
+
+
+def test_a_restart_while_idle_is_reported_without_a_fault(rig, monkeypatch, capsys):
+    monkeypatch.setattr(cl, "CONTROLLER_BOOT_S", 0.0)
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.resistor.say(BANNER)
+    time.sleep(0.4)
+    assert rig.state == "IDLE" and "FAULT" not in rig.seen
+    assert "The resistor controller restarted." in capsys.readouterr().out
+
+
+def test_the_controllers_own_watchdog_firing_mid_run_faults(rig, capsys):
+    run_to_running(rig)
+    wait_for_setting(rig, 255)              # the first row has gone out
+    rig.resistor.say(NO_SIGNAL)
+    rig.wait_for("FAULT", timeout=1.0)
+    assert "CONTROLLER SHED LOAD ALARM!" in capsys.readouterr().out
+
+
+def test_the_shed_notice_after_a_kill_is_not_a_fault(rig):
+    # The firmware prints the same line when the host's own KILL sheds the load.
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.resistor.say(NO_SIGNAL)
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    rig.resistor.say(NO_SIGNAL)
+    time.sleep(0.4)
+    assert rig.state == "ARMED" and "FAULT" not in rig.seen
+
+
+REJECTED = "Error: Rejected. A command is exactly 8 binary digits."
+
+
+def test_a_rejected_command_is_sent_again_and_the_run_goes_on(rig, monkeypatch, capsys):
+    # One row's command mangled on the wire left the bank at the row before.
+    hold_one_ohm(rig, monkeypatch)
+    run_to_running(rig)
+    wait_for_setting(rig, 4)
+    time.sleep(0.15)                        # between rows: nothing else is due
+    since = len(rig.resistor.written())
+    rig.resistor.say(REJECTED)
+    wait_for_setting(rig, 4, since, timeout=0.4)
+
+    time.sleep(cl.BANK_SETTLE_S + 0.6)
+    assert rig.state == "RUNNING"
+    assert "rejected a line (1 so far)" in capsys.readouterr().out
+
+
+def test_a_setting_is_sent_again_only_once(rig, monkeypatch):
+    # A board that refuses everything must not be answered in a loop. The row's
+    # own command still goes out each second; the load check judges the result.
+    hold_one_ohm(rig, monkeypatch)
+    run_to_running(rig)
+    wait_for_setting(rig, 4)
+    time.sleep(0.15)
+    since = len(rig.resistor.written())
+    for _ in range(5):
+        rig.resistor.say(REJECTED)
+    time.sleep(0.5)
+    assert settings_sent(rig, since) == [4]
+
+
+def test_a_port_that_cannot_be_read_is_a_lost_link(rig, capsys):
+    run_to_running(rig)
+    rig.resistor.read_fails = True
+    rig.wait_for("FAULT", timeout=1.0)
+    assert "link lost (read)" in capsys.readouterr().out
+    assert rig.last['fault_reason'] == "RESISTOR LINK LOST"

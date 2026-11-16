@@ -955,6 +955,20 @@ class SafetyLimits:
     # can raise the bank past 140%. The GUI sidebar toggles it live.
     bank_rated_power_only: bool = False
 
+    # Whether a run is faulted when the measured current does not fit the ladder
+    # setting commanded (LOAD MISMATCH; load_mismatch() in control_logic.py). It
+    # is what notices a wrong bank, a relay or contactor that did not move, a
+    # controller that restarted, or a current sensor that stopped reading.
+    #
+    # Leave it True with a module on. Switch it off only for the bench-supply
+    # tests, where the taps read one supply and the bank runs on another, so the
+    # two do not agree: 44 V on the taps and 30 V on the bank reads 32% low
+    # before any wiring, right on the check's edge, and 43% low once the supply
+    # is in current limit. The main window says so in amber for as long as it is
+    # off, because this file is saved on exit and the setting would otherwise
+    # carry over to a module.
+    load_check_enabled: bool = True
+
     def __post_init__(self):
         # rig_config.json is hand-edited, and a quoted "225" would otherwise reach
         # the safety check as a string. Failing here makes load() fall back to
@@ -1068,6 +1082,13 @@ class SafetyLimits:
                 f"Derate start {self.derate_start:.1f} C is not below max temp "
                 f"{self.max_temp:.1f} C; derating cannot ramp."
             )
+        # Every trip still works without it, but nothing then notices a bank
+        # that is not at the resistance commanded.
+        if not self.load_check_enabled:
+            warnings.append(
+                "The load check is off: a wrong bank, a controller restart or a dead "
+                "current sensor will not fault a run. For bench supplies only."
+            )
         return warnings
 
     def to_command_dict(self):
@@ -1100,6 +1121,7 @@ class SafetyLimits:
             # A copy, so the logic process never shares a list with this object.
             'resistor_max_temp': list(self.resistor_max_temp_c),
             'bank_rated_only': self.bank_rated_power_only,
+            'load_check': self.load_check_enabled,
         }
 
 

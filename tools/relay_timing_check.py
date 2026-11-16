@@ -118,6 +118,7 @@ def run_scenario(sc):
 
     class FakeResistor:
         is_open = True
+        replies = b""           # what the board has printed and the host has not read
 
         def write(self, data):
             if hung.is_set():
@@ -132,6 +133,18 @@ def run_scenario(sc):
                 plant['ohms'] = cl.decode_word(line) * cl.RESISTOR_RESOLUTION
             elif line == "KILL":
                 plant['ohms'] = None
+            elif classify(data) == "rejected":
+                # As the firmware answers a line it will not act on. The host
+                # reads it and sends the setting again.
+                self.replies += b"Error: Rejected. A command is exactly 8 binary digits.\r\n"
+
+        @property
+        def in_waiting(self):
+            return len(self.replies)
+
+        def read(self, n):
+            out, self.replies = self.replies[:n], self.replies[n:]
+            return out
 
         def close(self):
             self.is_open = False

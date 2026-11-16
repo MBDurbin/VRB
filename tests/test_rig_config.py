@@ -180,7 +180,18 @@ class TestLimitDerivation:
         assert keys == {'max_amps', 'amp_buffer', 'max_temp', 'min_volts',
                         'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout',
                         'daq_stale_timeout', 'derate_en', 'derate_start',
-                        'resistor_max_temp', 'bank_rated_only'}
+                        'resistor_max_temp', 'bank_rated_only', 'load_check'}
+
+    def test_load_check_ships_on_and_says_so_when_off(self):
+        # Off is for the bench supplies only, and saved on exit, so it warns.
+        limits = SafetyLimits()
+        assert limits.load_check_enabled is True
+        assert limits.to_command_dict()['load_check'] is True
+        assert not any("load check" in w for w in limits.advisories())
+
+        limits.load_check_enabled = False
+        assert limits.to_command_dict()['load_check'] is False
+        assert any("load check is off" in w for w in limits.advisories())
 
     def test_per_cell_trip_derives_above_cell_cutoff(self):
         pack = PackConfig()

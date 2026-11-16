@@ -82,6 +82,11 @@ from control_logic import (
     trip_record,
     append_trip_log,
     TRIP_LOG_FIELDS,
+    expected_load_amps,
+    load_mismatch,
+    read_controller_lines,
+    classify_controller_line,
+    CONTROLLER_LINES,
 )
 from rig_config import RigConfig
 
@@ -1840,3 +1845,142 @@ class TestAppendTripLog:
         path.mkdir()
         assert append_trip_log(trip_record("E-STOP", "IDLE", []), path=str(path)) is False
         assert "Trip not written" in capsys.readouterr().out
+
+
+# ================= LOAD CHECK =================
+
+class TestLoadCheck:
+    """Measured current against what the ladder setting commanded should draw."""
+
+    def test_the_current_the_setting_draws(self):
+        assert math.isclose(expected_load_amps(48.0, 4), 48.0)        # 1 ohm
+        assert math.isclose(expected_load_amps(50.4, 1), 201.6)       # 0.25 ohm
+        assert expected_load_amps(48.0, None) is None
+        assert expected_load_amps(float("nan"), 4) is None
+
+    def test_a_reading_that_fits_is_no_problem(self):
+        assert load_mismatch(48.0, 48.0, 4) is None
+        # Wiring and hot elements in series: a fifth low is still the bank.
+        assert load_mismatch(48.0, 48.0 * 0.80, 4) is None
+        # Elements at the low end of their tolerance: 5% high.
+        assert load_mismatch(48.0, 48.0 * 1.05, 4) is None
+
+    def test_the_crossed_relays_would_have_been_caught(self):
+        # 8 ohm commanded, the 16 ohm bank switched in: half the current.
+        problem = load_mismatch(48.0, 3.0, 32)
+        assert "should draw 6.0 A; measured 3.0 A" in problem and "Less" in problem
+
+    def test_the_reversed_command_word_would_have_been_caught(self):
+        # 32 ohm commanded, 0.25 ohm in circuit: 1.6 A asked for, 202 A drawn.
+        problem = load_mismatch(50.4, 201.6, 128)
+        assert "Ladder at 32.00 ohm" in problem and "More" in problem
+
+    def test_a_dead_current_sensor_or_an_open_contactor_reads_low(self):
+        assert "Less" in load_mismatch(46.0, 0.0, 4)                  # 46 A expected
+
+    def test_more_current_is_held_tighter_than_less(self):
+        # Nothing innocent puts more through the ladder than its setting allows.
+        assert load_mismatch(48.0, 48.0 * 1.20, 4) is not None
+        assert load_mismatch(48.0, 48.0 * 0.70, 4) is None
+        assert load_mismatch(48.0, 48.0 * 0.60, 4) is not None
+
+    def test_a_few_amps_at_the_top_of_the_ladder_is_the_sensor_not_the_bank(self):
+        # 63.75 ohm draws 0.75 A; an amp or two of offset is not a wrong bank.
+        assert load_mismatch(48.0, 2.7, 255) is None
+        assert load_mismatch(48.0, -1.0, 255) is None
+        assert load_mismatch(48.0, 6.0, 255) is not None
+
+    def test_bench_supplies_do_not_agree_which_is_why_it_can_be_switched_off(self):
+        # Taps on a 44 V supply and the bank on a 30 V, 100 A one: 0.25 ohm
+        # reads 176 A expected against the supply's 100 A current limit.
+        assert load_mismatch(44.0, 100.0, 1) is not None
+        # Out of current limit it sits right on the edge, 32% low before any
+        # wiring, which is no better: it would trip some runs and not others.
+        assert load_mismatch(44.0, 30.0, 4) is None
+        assert load_mismatch(44.0, 30.0 * 0.94, 4) is not None
+
+    def test_nothing_to_judge_without_a_setting_or_a_number(self):
+        assert load_mismatch(48.0, 48.0, None) is None
+        assert load_mismatch(48.0, float("nan"), 4) is None
+        assert load_mismatch(None, 48.0, 4) is None
+
+    def test_it_faults_only_once_armed_and_only_when_told(self):
+        packet = TestEvaluateSafety()._packet()
+        assert evaluate_safety(packet, _limits()) == (False, None)
+        assert evaluate_safety(packet, _limits(), load_problem="x") == (True, "LOAD MISMATCH")
+        assert evaluate_safety(packet, _limits(), armed=False, load_problem="x") == (False, None)
+
+    def test_a_measured_danger_is_reported_ahead_of_it(self):
+        packet = TestEvaluateSafety()._packet(amps=400.0)
+        assert evaluate_safety(packet, _limits(), load_problem="x") == (True, "OVERCURRENT")
+
+    def test_the_trip_says_what_was_expected_and_what_was_read(self):
+        packet = TestEvaluateSafety()._packet(voltage=46.0, amps=0.2)
+        (line,) = trip_details("LOAD MISMATCH", packet, _limits(), bank_steps=4)
+        assert "Ladder at 1.00 ohm and 46.0 V should draw 46.0 A; measured 0.2 A" in line
+
+
+class _Chatty:
+    """A port with something to read, as the real controller's is."""
+
+    def __init__(self, data=b"", raises=None):
+        self.data, self.raises = data, raises
+
+    @property
+    def in_waiting(self):
+        if self.raises:
+            raise self.raises
+        return len(self.data)
+
+    def read(self, n):
+        out, self.data = self.data[:n], self.data[n:]
+        return out
+
+
+class TestControllerLines:
+    """What the host reads back from the resistor controller."""
+
+    def test_whole_lines_are_returned_and_a_part_line_waits(self):
+        port = _Chatty(b"New State Received: 00000100\r\nAction: 0.25 rel")
+        lines, pending = read_controller_lines(port, b"")
+        assert lines == ["New State Received: 00000100"] and pending == b"Action: 0.25 rel"
+
+        port.data = b"ay opened\r\n"
+        lines, pending = read_controller_lines(port, pending)
+        assert lines == ["Action: 0.25 relay opened"] and pending == b""
+
+    def test_nothing_waiting_reads_nothing(self):
+        assert read_controller_lines(_Chatty(), b"") == ([], b"")
+
+    def test_a_port_with_no_read_side_is_silent(self):
+        assert read_controller_lines(object(), b"") == ([], b"")
+
+    def test_a_failed_port_is_reported_not_raised(self):
+        import serial
+        for exc in (serial.SerialException("gone"), OSError("gone")):
+            assert read_controller_lines(_Chatty(raises=exc), b"") is None
+
+    def test_noise_without_a_newline_is_dropped_not_grown(self):
+        lines, pending = read_controller_lines(_Chatty(b"x" * 2000), b"")
+        assert lines == [] and pending == b""
+
+    def test_the_lines_the_host_acts_on(self):
+        # The strings resistor_bank_controller.ino prints.
+        assert classify_controller_line("Arduino Ready. Waiting for Binary Signal...") == "reset"
+        assert classify_controller_line("No Signal: System Reset / All Off") == "shed"
+        assert classify_controller_line(
+            "Error: Rejected. A command is exactly 8 binary digits.") == "rejected"
+        for chatter in ("New State Received: 00000100", "Action: 0.25 relay opened",
+                        "RESISTOR_CTRL", ""):
+            assert classify_controller_line(chatter) is None
+
+    def test_the_sketch_still_prints_those_lines(self):
+        # The host matches on text the firmware prints. If the sketch is
+        # reworded, this fails until CONTROLLER_LINES is changed with it.
+        sketch = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "arduino", "resistor_bank_controller",
+                              "resistor_bank_controller.ino")
+        with open(sketch, encoding="utf-8") as fh:
+            source = fh.read()
+        for start, _ in CONTROLLER_LINES:
+            assert f'"{start}' in source, start

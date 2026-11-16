@@ -192,6 +192,56 @@ def write_resistor(ser, payload):
         return False
 
 
+# What the resistor controller prints that the host acts on, as the start of the
+# line (arduino/resistor_bank_controller). The rest of what it prints is
+# progress chatter: "New State Received", "Action: ...".
+#
+# The host used to write to the controller and never read it. A board that
+# restarted mid-run dropped every relay, came back two seconds later, took the
+# next row's command and carried on, with nothing on record.
+CONTROLLER_LINES = (
+    ("Arduino Ready", "reset"),     # setup() ran: the board restarted
+    ("No Signal", "shed"),          # shedAllLoad(): its watchdog fired, or a KILL
+    ("Error:", "rejected"),         # a line it would not act on
+)
+
+# Opening the port restarts the board, and its start-up banner can arrive after
+# the handshake has already claimed the port. A banner this soon after is that
+# start, not a restart.
+CONTROLLER_BOOT_S = 5.0
+
+# Longest part-line kept between passes; a real line is under 60 bytes.
+MAX_CONTROLLER_PENDING = 512
+
+
+def read_controller_lines(ser, pending):
+    """Complete lines the controller has printed, without waiting: (lines, pending).
+
+    None, not the pair, if the port failed: the loop treats that as a lost
+    link, like a failed write. Only what has already arrived is read, so this
+    never holds the loop; a line still arriving stays in `pending`. A port with
+    nothing to read from (the test fakes) reads as silent.
+    """
+    try:
+        waiting = getattr(ser, 'in_waiting', 0)
+        if waiting:
+            pending += ser.read(waiting)
+    except (serial.SerialException, OSError):
+        return None
+    *raw, pending = pending.split(b"\n")
+    if len(pending) > MAX_CONTROLLER_PENDING:
+        pending = b""
+    return [line.decode('utf-8', errors='ignore').strip() for line in raw], pending
+
+
+def classify_controller_line(line):
+    """'reset', 'shed' or 'rejected' for a line the host acts on, else None."""
+    for start, kind in CONTROLLER_LINES:
+        if line.startswith(start):
+            return kind
+    return None
+
+
 def encode_steps(steps):
     """The command word for a ladder setting: one character per bank, COMMAND_BANKS order.
 
@@ -291,6 +341,62 @@ def check_bank_power(voltage, amps, steps=None, power_factor=1.0):
     if steps and overpowered_banks(voltage, amps, steps, power_factor):
         return True, "BANK OVERPOWER"
     return False, None
+
+
+# The load check: whether the current measured fits the ladder setting commanded.
+#
+# Nothing else compares the two. Both wiring faults found so far were of this
+# kind, and both were found with a meter: the command word sent in reverse
+# (202 A where 1.6 A was asked for) and the 8 and 16 ohm relays crossed. It
+# also catches a controller that restarted, a contactor or relay that did not
+# move, and a current sensor that has stopped reading, which leaves the
+# over-current and bank-power trips blind.
+#
+# More current than the setting allows has no innocent cause: the module
+# voltage is measured at the taps, so every element at the low end of its
+# tolerance is +5% at most. Less has several: cable, contactor and relay
+# contacts in series with the ladder, elements at the top of their tolerance,
+# and their resistance rising as they heat. About -23% at the 0.25 ohm step
+# with 40 mOhm of wiring, so the low side is the looser.
+#
+# The floor in amps is for the top of the ladder, where an amp or two is the
+# 400 A sensor's own offset rather than the bank. It is low enough to see the
+# crossed 8 and 16 ohm relays (3 A against 6 A at 48 V), and it means a wrong
+# bank above about 16 ohm, where a volt or two moves less than 2 A, is not seen.
+LOAD_CHECK_HIGH = 0.15
+LOAD_CHECK_LOW = 0.35
+LOAD_CHECK_ABS_A = 2.0
+# Readings in a row that must disagree before it faults, each from a new DAQ
+# sample taken after the setting had settled (BANK_SETTLE_S). 0.3 s at 10 Hz.
+LOAD_CHECK_SAMPLES = 3
+
+
+def expected_load_amps(voltage, steps):
+    """The current a ladder setting draws at this module voltage. None if unknown."""
+    if not steps or not _finite(voltage):
+        return None
+    return voltage / (steps * RESISTOR_RESOLUTION)
+
+
+def load_mismatch(voltage, amps, steps):
+    """How one reading disagrees with the ladder setting, in words. None if it fits.
+
+    `steps` is the setting in circuit once it has settled. None also when there
+    is nothing to judge: no setting, or a reading that is not a number, which
+    INVALID READING reports.
+    """
+    expected = expected_load_amps(voltage, steps)
+    if expected is None or not _finite(amps):
+        return None
+    ohms = steps * RESISTOR_RESOLUTION
+    line = (f"Ladder at {ohms:.2f} ohm and {voltage:.1f} V should draw {expected:.1f} A; "
+            f"measured {amps:.1f} A")
+    if amps - expected > max(LOAD_CHECK_ABS_A, LOAD_CHECK_HIGH * expected):
+        return line + ". More: a bank that should be in circuit is bypassed"
+    if expected - amps > max(LOAD_CHECK_ABS_A, LOAD_CHECK_LOW * expected):
+        return line + (". Less: the contactor or a relay is open, the controller "
+                       "restarted, or the current sensor is not reading")
+    return None
 
 
 def check_cell_safety(cell_voltages, min_cell_voltage, sense_floor=0.5):
@@ -614,7 +720,7 @@ def report_config_problems(problems):
 
 
 def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=None,
-                    expected=None):
+                    expected=None, load_problem=None):
     """All safety checks against one telemetry packet. Returns (is_fault, reason).
 
     Measured dangers are reported ahead of data-integrity faults: if the pack is
@@ -650,6 +756,11 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     `expected` is expected_measurements() for the running wiring and pack, for
     the count and range checks in measurement_problems(). Like the other
     integrity checks they apply once armed.
+
+    `load_problem` is load_mismatch()'s description once the measured current
+    has disagreed with the ladder setting for LOAD_CHECK_SAMPLES readings in a
+    row; the loop does the counting. Reported last: every other fault names a
+    cause, and this one only says the bank is not doing what it was told.
     """
     fault, reason = check_thermal_and_current(
         data.get('max_temp', 0.0), data.get('amps', 0.0),
@@ -721,6 +832,9 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     if fault:
         return True, reason
 
+    if load_problem:
+        return True, "LOAD MISMATCH"
+
     return False, None
 
 
@@ -780,6 +894,9 @@ def trip_details(reason, data, limits, config_problems=(), expected=None, bank_s
         return [f"  - {problem}" for problem in config_problems]
     if reason in ("INVALID READING", "INCOMPLETE DATA"):
         return [f"  - {detail}" for _, detail in measurement_problems(data, expected)]
+    if reason == "LOAD MISMATCH":
+        problem = load_mismatch(volts, amps, bank_steps)
+        return [problem] if problem else []
     return []
 
 
@@ -1409,7 +1526,14 @@ def kill_load(res_ser):
 
 
 def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Queue,
-                      stop_event: Event, discovery_lock=None, estop_event=None):
+                      stop_event: Event, discovery_lock=None, estop_event=None,
+                      sil_mode=False):
+    """The logic process: state machine, trips, lap playback and the resistor controller.
+
+    `sil_mode` is True when main_v2 found the SIL dongle and the DAQ is the
+    desk-test plant model. Its current is a slider the operator drags, not what
+    the ladder would draw, so the load check is skipped there.
+    """
     fsm_state = "DISCONNECTED"
     target_res = 0.0
     # press_clock() at the most recent stop or fault; see stale_transition().
@@ -1455,6 +1579,13 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     discovery = threading.Thread(target=resistor_discovery_worker, daemon=True)
 
     res_ser = None
+    # What the controller has printed that is not yet a whole line, and when
+    # this handle was taken. See read_controller_lines() and CONTROLLER_BOOT_S.
+    res_pending = b""
+    res_connected_at = 0.0
+    controller_rejects = 0
+    # bank_steps_at of the setting last sent a second time after a rejection.
+    resent_setting_at = None
 
     # Why the rig is in FAULT, for the GUI: the reason and trip_details()'s
     # lines. Cleared by RESET.
@@ -1516,6 +1647,25 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             append_trip_log(trip_record(
                 "RESISTOR LINK LOST", lost_in, fault_detail,
                 ladder_ohm=target_res if lost_in == "RUNNING" else None, kill_sent=False))
+
+    def controller_fault(reason, detail, packet):
+        """The controller reported something a loaded rig cannot carry on from.
+
+        KILL first, as for a measured trip: after a restart the board is back
+        and listening, and its next valid command would reconnect the bank.
+        """
+        tripped_in = fsm_state
+        latch_fault(reason, [detail])
+        killed = kill_load(res_ser)
+        killed_at = time.time()
+        print(f"\n[LOGIC] {reason} ALARM! Killing Load.")
+        print(f"[LOGIC] {detail}")
+        if not killed:
+            drop_resistor_link("KILL")
+        append_trip_log(trip_record(
+            reason, tripped_in, fault_detail, packet,
+            ladder_ohm=target_res if tripped_in == "RUNNING" else None,
+            kill_sent=killed, killed_at=killed_at))
 
     # All limits, the pack spec and the vehicle model come from rig_config.json
     # (falling back to the RS50 12S4P defaults). Nothing here is hardcoded, so a
@@ -1585,6 +1735,14 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     bank_steps = None
     bank_steps_at = 0.0
 
+    # The load check: how many settled readings in a row have disagreed with
+    # the ladder setting, and the latest one's description. See load_mismatch().
+    load_check_run = 0
+    load_problem = None
+    if sil_mode:
+        print("[LOGIC] SIL mode: the load check is off. The plant's current is a slider, "
+              "not what the ladder would draw.")
+
     # The operator's load override (parse_override()), None to follow the
     # profile. override_due sends a change on the next pass rather than at the
     # next row. profile_steps is the profile's own setting for the current row,
@@ -1643,11 +1801,13 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 data = daq_queue.get(timeout=0.1)
                 last_data = data
                 last_daq_rx = time.time()
+                fresh_sample = True
             except Empty:
                 # Carry the last packet forward, tagged with its age so the staleness
                 # check can fault on it. Copy it: section G writes FSM fields into
                 # the packet before forwarding.
                 data = dict(last_data) if last_data is not None else NEUTRAL_PACKET()
+                fresh_sample = False
 
             data['daq_age_s'] = time.time() - last_daq_rx
 
@@ -1657,12 +1817,58 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             if res_ser is None:
                 with slot_lock:
                     res_ser = resistor_slot['ser']
+                if res_ser is not None:
+                    res_pending, res_connected_at = b"", time.time()
 
             # A port that closed under us is a lost link, like a failed write. It
             # used to drop a running rig to DISCONNECTED, and a reconnect then took
             # it straight back to IDLE with no fault on record.
             if res_ser is not None and not res_ser.is_open:
                 drop_resistor_link("port closed")
+
+            # --- A2. What the controller has to say ---
+            # Read before the commands below, so a line is judged against the
+            # state the rig was in when the controller printed it.
+            if res_ser is not None:
+                heard = read_controller_lines(res_ser, res_pending)
+                if heard is None:
+                    drop_resistor_link("read")
+                else:
+                    lines, res_pending = heard
+                    for kind in filter(None, map(classify_controller_line, lines)):
+                        if kind == "rejected":
+                            controller_rejects += 1
+                            print(f"[LOGIC WARNING] The resistor controller rejected a line "
+                                  f"({controller_rejects} so far). A command may not have "
+                                  f"been applied.")
+                            # If that was this row's command, the bank is still at
+                            # the row before. Say it again, once per setting; the
+                            # firmware ignores a repeat of what it already holds.
+                            # If it is refused again the load check faults the run.
+                            if (fsm_state == "RUNNING" and bank_steps is not None
+                                    and resent_setting_at != bank_steps_at):
+                                resent_setting_at = bank_steps_at = time.time()
+                                if not send_binary_command(res_ser, bank_steps):
+                                    drop_resistor_link("resistance command")
+                                    break
+                        elif kind == "reset":
+                            if time.time() - res_connected_at < CONTROLLER_BOOT_S:
+                                continue
+                            if fsm_state in ("ARMED", "RUNNING"):
+                                controller_fault(
+                                    "CONTROLLER RESET",
+                                    "The resistor controller restarted, which drops every "
+                                    "relay. Check its supply: a brownout or noise as the "
+                                    "contactor or relay coils switch", data)
+                            else:
+                                print("[LOGIC WARNING] The resistor controller restarted.")
+                        elif kind == "shed" and fsm_state == "RUNNING" and bank_steps is not None:
+                            # The host sends no KILL while RUNNING, so this was the
+                            # controller's own watchdog: heartbeats did not reach it.
+                            controller_fault(
+                                "CONTROLLER SHED LOAD",
+                                "The resistor controller's watchdog opened the contactor "
+                                "mid-run: it went 2 s without hearing from the host", data)
 
             if res_ser is None:
                 if fsm_state != "FAULT":
@@ -1873,10 +2079,24 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     and time.time() - bank_steps_at >= BANK_SETTLE_S):
                 settled_steps = bank_steps
 
+            # The load check counts new DAQ samples only, each taken after the
+            # setting had settled: a packet carried forward is the same reading
+            # again, and one sampled before the relays moved belongs to the
+            # setting before. A reading that fits clears the count.
+            if fsm_state != "RUNNING" or sil_mode or not limits.get('load_check', True):
+                load_check_run, load_problem = 0, None
+            elif fresh_sample and settled_steps is not None:
+                sampled_at = data.get('sampled_at')
+                if not _finite(sampled_at) or sampled_at - bank_steps_at >= BANK_SETTLE_S:
+                    load_problem = load_mismatch(data.get('voltage'), data.get('amps'),
+                                                 settled_steps)
+                    load_check_run = load_check_run + 1 if load_problem else 0
+
             is_fault, trigger_reason = evaluate_safety(
                 data, limits, armed=fsm_state in ("ARMED", "RUNNING"),
                 config_problems=config_problems, bank_steps=settled_steps,
-                expected=expected)
+                expected=expected,
+                load_problem=load_problem if load_check_run >= LOAD_CHECK_SAMPLES else None)
 
             # DISCONNECTED latches too. It used to be skipped along with FAULT, so
             # a rig waiting on its controller or its temperature board showed
@@ -2031,6 +2251,10 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             data['profile_name'] = profile_name
             data['profile_rows'] = total_rows
             data['profile_row'] = current_row_idx if fsm_state == "RUNNING" else 0
+            # What the ladder setting in circuit should draw at this voltage, for
+            # the recording: the load check's own figure. None when not running.
+            data['expected_amps'] = (expected_load_amps(data.get('voltage'), bank_steps)
+                                     if fsm_state == "RUNNING" else None)
             data['remaining_ah'] = remaining_ah
             data['true_soc'] = true_soc
             data['hardware_status']['res_arduino'] = (res_ser is not None)

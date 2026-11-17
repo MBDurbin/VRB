@@ -14,18 +14,30 @@ Unit tests cover the decision math (`pytest`). This covers everything else.
 python -m pytest
 ```
 
-All 48 tests must pass before starting. Then plug in the SIL dongle and:
+All of them must pass before starting. Then plug in the SIL dongle and:
 
 ```bash
 python main_v2.py
 ```
 
 The SIL plant models the pack and sensor layout in `rig_config.json`, so the
-figures below assume the shipped Reliance RS50 12S4P (12 mΩ module). On another
+figures below assume the shipped Reliance RS50 12S4P (19.5 mΩ module: 6.5 mΩ
+per cell, as measured by Mooch in October 2025). On another
 pack, recompute the sag and trip currents from its resistance.
 
 Confirm the console prints `--> SIL KEY UNLOCKED on COMx` and both the SIL
 plant-model window and the main telemetry GUI appear.
+
+**Most of sections B, C and D need a resistor controller on USB.** The state
+only leaves `DISCONNECTED` once the logic process has found one, and `ARM` is
+taken only from `IDLE`. Plug the resistor Arduino in with the relay supply off
+and **the battery disconnected**: in SIL mode it is driven from the sliders, not
+from a module. Without a controller, the trips that apply in every state still
+latch from `DISCONNECTED` (B1, B4, B5, B16 to B18), and that is all that can be
+tried.
+
+SIL mode skips the load check: the plant's current is a slider, not what the
+ladder would draw. The console says so at start-up.
 
 ---
 
@@ -46,10 +58,10 @@ plant-model window and the main telemetry GUI appear.
 | B1 | Raise temp slider past **Max Temp** (default 80 °C, the RS50's cut-off) | State goes `FAULT` (red), console logs `OVERTEMP ALARM!` |
 | B2 | While in FAULT, lower temp back to 25 °C | State **stays** `FAULT` — must not self-clear |
 | B3 | Press **RESET** | Returns to `IDLE` |
-| B4 | Set **Max Amp** to 120 A, then raise current slider past 125 A (Max Amp + E-Stop Buffer) | `FAULT`, console logs `OVERCURRENT ALARM!`. The derived RS50 limit is 280 A, past the slider, and the bank's total power trip (B16) fires first at any limit above ~230 A (~160 A with **Bank at rated power only** ticked) |
+| B4 | Set **Max Amp** to 120 A, then raise current slider past 125 A (Max Amp + E-Stop Buffer) | `FAULT`, console logs `OVERCURRENT ALARM!`. The derived RS50 limit is 280 A, past the slider, and the bank's total power trip (B16) fires first at any limit above ~245 A (~170 A with **Bank at rated power only** ticked) |
 | B5 | RESET, then press **E-STOP** with no fault present | Immediately `FAULT` regardless of prior state |
 | B6 | RESET, then drag SIL **Pack OCV** down to 3.00 V/cell | `FAULT`, console logs `UNDERVOLTAGE ALARM!` |
-| B7 | RESET, set OCV to 3.05 V/cell, then raise current to ~100 A | `FAULT` on sag alone — pack reads 35.4 V under load despite 36.6 V at rest (12 mΩ RS50 module) |
+| B7 | RESET, set OCV to 3.05 V/cell, then raise current to ~100 A | `FAULT` on sag alone — pack reads 34.65 V under load despite 36.6 V at rest (19.5 mΩ RS50 module) |
 | B8 | With all three faults possible at once (hot + high amps + low OCV) | Console reports `OVERTEMP` — priority is temp > current > bank power > voltage |
 | B9 | RESET, ARM, then tick **Simulate hardware interlock fault** | `FAULT` logging `NI-DAQ OFFLINE` — the toggle drops the NI-DAQ and the temperature link together, and the DAQ is reported first because its 0.0 V would otherwise read as undervoltage |
 | B10 | Untick the fault, RESET, stay in `IDLE`, tick it again | **No** fault — sensor checks apply only in ARMED/RUNNING, so the rig can still be brought up |
@@ -58,8 +70,8 @@ plant-model window and the main telemetry GUI appear.
 | B13 | From B12, press **ARM** | `FAULT` — arming on a 0.0 V reading must not be silently permitted |
 | B14 | ARM+RUN, then close the SIL window so the plant stops feeding | `FAULT` logging `DAQ DATA STALE` within ~1 s, and the GUI keeps updating rather than freezing |
 | B15 | Repeat B14 but press **E-STOP** while the plant is stopped | E-STOP is still processed — the logic loop no longer skips its body on an empty queue |
-| B16 | RESET, tick **Bank at rated power only**, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~165 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 8000 W)` once V × I passes 8 kW, in `IDLE` as well. Console logs `bank power 100% of rating` when the box is ticked. No Max Amp setting moves this trip. 2000 A is past the cells' rating, so `WILL NOT ARM: Over-current trip ...` shows beside the pills until Max Amp is set back |
-| B16a | Untick **Bank at rated power only**, RESET, raise current past ~236 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 11200 W)` once V × I passes 11.2 kW (140%). Console logs `bank power 140% of rating` |
+| B16 | RESET, tick **Bank at rated power only**, set **Max Amp** to 2000 A (the spinbox maximum), OCV 4.20 V/cell, raise current past ~170 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 8000 W)` once V × I passes 8 kW, in `IDLE` as well. Console logs `bank power 100% of rating` when the box is ticked. No Max Amp setting moves this trip. 2000 A is past the cells' rating, so `WILL NOT ARM: Over-current trip ...` shows beside the pills until Max Amp is set back |
+| B16a | Untick **Bank at rated power only**, RESET, raise current past ~246 A | `FAULT` logging `BANK OVERPOWER` and `Ladder at ... W (limit 11200 W)` once V × I passes 11.2 kW (140%). Console logs `bank power 140% of rating` |
 | B17 | RESET, ARM, drag SIL **Bank 1 resistor** past 225 °C | `FAULT` logging `RESISTOR OVERTEMP` and `Bank 1 at ... C (trip 225 C)`. Fires in `IDLE` as well |
 | B18 | Open **Resistor Map** while dragging the Bank 1 slider | Bank 1's four top-row elements recolour toward red as they near 225 °C; banks 5–8 read `NO SENSOR` |
 | B19 | RESET, tick **Simulate hardware interlock fault** in `IDLE`, press **ARM** | ARM **refused**: state stays `IDLE` (no FAULT, nothing to reset), console logs `Cannot ARM: NI-DAQ OFFLINE`, and `WILL NOT ARM: NI-DAQ OFFLINE` shows in red beside the hardware pills. Untick, press ARM again: `ARMED` |
@@ -67,7 +79,8 @@ plant-model window and the main telemetry GUI appear.
 | B21 | ARM, then repeat B20's change to 14S | `FAULT` logging `CONFIG FAULT` and naming the voltage-channel mismatch — a config change that leaves cells unwatched while armed kills the load |
 
 **Not reachable from the SIL sliders** — the plant model generates uniform cells
-and always-fresh timestamps, so these need either a unit test or real hardware:
+and always-fresh timestamps, so these need either a unit test or real hardware
+([BENCH_CHECKLIST.md](BENCH_CHECKLIST.md) runs them on bench supplies):
 
 - `CELL SENSE FAULT` (one cell reading below `cell_sense_floor`, i.e. a pulled
   sense lead). Covered by `test_implausibly_low_reading_is_a_sense_fault_not_undervoltage`.
@@ -112,7 +125,10 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
 | D4 | Set `Derate Start` above `Max Temp`, enable derate, then RUN | No crash. Logic process stays alive (fail-safe full derate) |
 | D5 | Set `Max Amp` to 0, then RUN | No crash, no divide-by-zero |
 | D8 | Set `V Crit` to 45 V while running at 4.20 V/cell OCV | Trips `UNDERVOLTAGE` — confirms the spinbox actually reaches the logic process |
-| D9 | While `RUNNING`, press **Configure** | Refused with "Run in progress"; nothing changes or saves. The controller ignores a new config mid-run |
+| D9 | While `RUNNING`, press **Configure**, then **Load Profile** | Neither opens. An amber line beside the hardware pills says `Run in progress: stop it before ...`; nothing changes or saves. No dialog box appears: one would take E-STOP's clicks until it was dismissed |
+| D13 | While `RUNNING`, with the Thermal Map window in front, press **Esc** | Immediate `FAULT`, as the E-STOP button. Esc is the E-STOP from any of the rig's windows |
+| D14 | From `IDLE`, change `Max Amp` to 60, then tick **Derive limits from pack** | `LIMITS HAND-SET` appears in amber beside the car and pack label after the edit, and the box unticks itself. Ticking it puts 275 A back and the notice goes |
+| D15 | End the logic process from Task Manager (it is the `python.exe` that is not drawing a window; try until the banner changes) | Within 2 s the state banner reads `NO TELEMETRY` and counts up. It used to go on showing the last state it was sent |
 | D10 | From `IDLE`, **Configure**, change the cell's max temp, press **Cancel**. Then nudge `E-stop buffer` | Sidebar `Max Temp` is unchanged before and after the nudge, and no `NOT IN FORCE` line appears: the cancelled preview did not leak into the live limits |
 | D11 | Drag `V Warn` to a new value | Only the dashed plot line moves. Console shows no `Limits updated`, and after a restart there is no "Hand-edited limits were replaced" dialog |
 | D12 | Use the rig normally through C and D | The red `NOT IN FORCE ON THE CONTROLLER` line beside the car and pack label never appears. If it does, the controller is not using the settings shown |
@@ -123,8 +139,8 @@ and always-fresh timestamps, so these need either a unit test or real hardware:
 
 | # | Step | Expected |
 |---|------|----------|
-| E1 | START RECORDING, run 1 lap, STOP RECORDING | `logs/telemetry_*.csv` created with 68 columns + header |
-| E2 | Open the CSV | Rows are contiguous, SOC decreases monotonically, no blank/garbage rows |
+| E1 | START RECORDING, run 1 lap, STOP RECORDING | `logs/telemetry_*.csv` created with 78 columns + header for the shipped 12S4P and four bank thermocouples: the 68 it always had, then lap, row, `Asked_Res`, `Expected_A`, remaining Ah, packet age and four bank temperatures. Bus-bar columns follow if any are configured |
+| E2 | Open the CSV | Rows are contiguous, `Timestamp` rises by the plant's 0.05 s with no repeats, SOC decreases monotonically, no blank/garbage rows |
 | E3 | START RECORDING then close the GUI without stopping | File closes cleanly, no truncation/corruption |
 
 ## F. Shutdown / process hygiene
@@ -170,8 +186,8 @@ loop takes ahead of every queued command. Covered by `TestEstopSignal` and
 were never placed in `limits_dict`, so they never reached the logic process.
 `check_safety_trip` only ever saw temperature and current — nothing stopped a
 discharge below the cells' 2.5 V/cell cutoff. `V Crit` now trips a genuine
-UNDERVOLTAGE fault (default 36.0 V = 3.0 V/cell, leaving room for sag: 3.4 V
-for the RS50 module's 12 mΩ at its 280 A rating, and 8.1 V for the 45 mΩ Molicel
+UNDERVOLTAGE fault (default 36.0 V = 3.0 V/cell, leaving room for sag: 5.5 V
+for the RS50 module's 19.5 mΩ at its 280 A rating, and 8.1 V for the 45 mΩ Molicel
 P45B this was first written for). `V Warn` remains display-only and its
 label now says so.
 

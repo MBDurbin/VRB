@@ -118,6 +118,7 @@ def run_scenario(sc):
 
     class FakeResistor:
         is_open = True
+        replies = b""           # what the board has printed and the host has not read
 
         def write(self, data):
             if hung.is_set():
@@ -132,6 +133,18 @@ def run_scenario(sc):
                 plant['ohms'] = cl.decode_word(line) * cl.RESISTOR_RESOLUTION
             elif line == "KILL":
                 plant['ohms'] = None
+            elif classify(data) == "rejected":
+                # As the firmware answers a line it will not act on. The host
+                # reads it and sends the setting again.
+                self.replies += b"Error: Rejected. A command is exactly 8 binary digits.\r\n"
+
+        @property
+        def in_waiting(self):
+            return len(self.replies)
+
+        def read(self, n):
+            out, self.replies = self.replies[:n], self.replies[n:]
+            return out
 
         def close(self):
             self.is_open = False
@@ -158,6 +171,9 @@ def run_scenario(sc):
     log = io.StringIO()
     t_hang = None
     with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(log):
+        # A simulated trip belongs in the scenario's folder, not the rig's own
+        # trip log in logs/.
+        cl.TRIP_LOG_PATH = os.path.join(tmp, "trip_log.csv")
         # The shipped lap's speeds, re-timed to this scenario's row spacing.
         profile = pd.read_csv(cl.CSV_FILENAME).head(sc.rows).copy()
         profile["Time (s)"] = [sc.row_dt * i for i in range(len(profile))]

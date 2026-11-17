@@ -8,6 +8,7 @@ it, the DAQ is a thread feeding packets, and the config is the built-in
 defaults rather than whatever rig_config.json holds. Each test takes about a
 second.
 """
+import csv
 import os
 import queue
 import sys
@@ -26,6 +27,7 @@ from rig_config import RigConfig
 def daq_packet(ni_daq, amps=50.0):
     """A healthy rig with the DAQ up, or what hardware_manager sends without it."""
     packet = {
+        'sampled_at': time.time(),
         'amps': amps, 'voltage': 46.0, 'cell_voltages': [3.85] * 12, 'power_kw': 2.3,
         'temperatures': [[30.0] * 8 for _ in range(6)], 'max_temp': 30.0,
         'temp_age_s': 0.05, 'temp_sensor_ages_s': [[0.05] * 8 for _ in range(6)],
@@ -47,13 +49,38 @@ class FakeResistor:
         self.is_open = True
         self.fail = False       # set to make every write raise, like a pulled cable
         self.writes = []
+        self.ohms = None        # the ladder setting in circuit; None with the contactor open
+        self.incoming = b""     # what the board has printed and the host has not read
+        self.read_fails = False
         self._lock = threading.Lock()
+
+    def say(self, line):
+        """The board prints a line, as the firmware does over serial."""
+        with self._lock:
+            self.incoming += line.encode() + b"\r\n"
+
+    @property
+    def in_waiting(self):
+        if self.read_fails:
+            raise serial.SerialException("ClearCommError failed")
+        return len(self.incoming)
+
+    def read(self, n):
+        with self._lock:
+            out, self.incoming = self.incoming[:n], self.incoming[n:]
+        return out
 
     def write(self, data):
         if self.fail:
             raise serial.SerialException("WriteFile failed")
         with self._lock:
             self.writes.append(bytes(data))
+        # What the firmware would do with it: a command closes the contactor
+        # onto that setting, KILL opens it.
+        if is_resistance_command(data):
+            self.ohms = cl.decode_word(data.decode().strip()) * cl.RESISTOR_RESOLUTION
+        elif data.strip() == b"KILL":
+            self.ohms = None
 
     def written(self):
         with self._lock:
@@ -78,7 +105,12 @@ class Rig:
         monkeypatch.setattr(RigConfig, "load", staticmethod(lambda *a, **k: self.config))
 
         self.ni_daq = True
-        self.amps = 50.0
+        # The current the DAQ reports. None follows the bank: the packet's 46 V
+        # across whatever the controller was last sent, and nothing once it is
+        # killed. A number holds the reading there whatever the ladder is doing,
+        # which is how the tests put a fault in front of the trips.
+        self.amps = None
+        self.readings = {}      # fields to overwrite in every packet the DAQ sends
         self.daq_q = queue.Queue(maxsize=5)
         self.tel_q = queue.Queue(maxsize=50)
         self.cmd_q = queue.Queue(maxsize=10)
@@ -103,7 +135,13 @@ class Rig:
                     self.daq_q.get_nowait()
                 except queue.Empty:
                     pass
-            self.daq_q.put(daq_packet(self.ni_daq, self.amps))
+            amps = self.amps
+            if amps is None:
+                ohms = self.resistor.ohms
+                amps = 46.0 / ohms if ohms else 0.0
+            packet = daq_packet(self.ni_daq, amps)
+            packet.update(self.readings)
+            self.daq_q.put(packet)
             time.sleep(0.05)
 
     def _tap(self):
@@ -142,8 +180,11 @@ class Rig:
 
 
 @pytest.fixture
-def rig(monkeypatch):
+def rig(monkeypatch, tmp_path):
+    # Trips go to this test's folder, never the rig's own logs/trip_log.csv.
+    monkeypatch.setattr(cl, "TRIP_LOG_PATH", str(tmp_path / "trip_log.csv"))
     r = Rig(monkeypatch)
+    r.trip_log = tmp_path / "trip_log.csv"
     yield r
     r.close()
 
@@ -402,6 +443,146 @@ def test_heartbeat_failure_in_idle_disconnects_without_a_fault(rig):
     assert "FAULT" not in rig.seen
 
 
+def test_only_a_running_rig_is_sent_alive(rig):
+    # Anywhere but RUNNING the keep-alive is KILL, which does not feed the
+    # Arduino's watchdog. "alive" in IDLE used to hold the watchdog off, so one
+    # lost KILL at the end of a run left the contactor closed.
+    rig.start()
+    rig.wait_for("IDLE")
+    time.sleep(1.3)
+    idle = rig.resistor.written()
+    assert idle.count(b"KILL\n") >= 2 and b"alive\n" not in idle
+
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    time.sleep(0.7)
+    assert b"alive\n" not in rig.resistor.written()
+
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
+    rig.wait_for("RUNNING")
+    since = len(rig.resistor.written())
+    time.sleep(1.3)
+    running = rig.resistor.written()[since:]
+    assert running.count(b"alive\n") >= 2 and b"KILL\n" not in running
+
+    rig.estop.set()
+    rig.wait_for("FAULT")
+    since = len(rig.resistor.written())
+    time.sleep(1.3)
+    faulted = rig.resistor.written()[since:]
+    assert faulted.count(b"KILL\n") >= 2 and b"alive\n" not in faulted
+
+
+def test_the_kill_is_repeated_after_a_run_ends(rig, tmp_path):
+    profile = tmp_path / "short.csv"
+    profile.write_text(f"Time (s),{cl.RESISTANCE_COLUMN}\n0,63.75\n0.3,63.75\n")
+    rig.amps = 0.5
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("LOAD_CSV", str(profile)))
+    arm_and_run(rig)
+    rig.wait_for("IDLE", timeout=4.0)
+
+    since = len(rig.resistor.written())
+    time.sleep(1.3)
+    after = rig.resistor.written()[since:]
+    assert after.count(b"KILL\n") >= 2 and b"alive\n" not in after
+
+
+def test_a_trip_latches_with_no_controller_connected(rig, capsys):
+    # DISCONNECTED used to swallow every trip: nothing shown and nothing logged
+    # with every cell at 95 C, because the rig was still looking for a board.
+    rig.resistor.is_open = False            # discovery never finds it
+    rig.start()
+    rig.wait_for("DISCONNECTED")
+    rig.readings = {'max_temp': 95.0, 'temperatures': [[95.0] * 8 for _ in range(6)]}
+    rig.wait_for("FAULT", timeout=1.0)
+
+    time.sleep(0.2)
+    assert rig.last['fault_reason'] == "OVERTEMP"
+    (row,) = read_trip_log(rig)
+    # No controller, so there was no KILL to send: blank, not "yes".
+    assert (row['Reason'], row['State'], row['Kill_Sent']) == ("OVERTEMP", "DISCONNECTED", "")
+    assert "OVERTEMP ALARM!" in capsys.readouterr().out
+
+    # RESET clears it once the cells are cool again.
+    rig.readings = {}
+    time.sleep(0.2)
+    rig.cmd_q.put(cl.transition_command("RESET"))
+    rig.wait_for("DISCONNECTED", timeout=1.0)
+
+
+def test_a_missing_temperature_board_does_not_fault_a_disconnected_rig(rig):
+    # Only the trips that apply in every state can fire before the rig is up.
+    rig.resistor.is_open = False
+    rig.readings = {'voltage': 0.0, 'cell_voltages': [],
+                    'hardware_status': {'temp_arduino': False, 'ni_daq': False,
+                                        'res_arduino': False}}
+    rig.start()
+    rig.wait_for("DISCONNECTED")
+    time.sleep(0.6)
+    assert set(rig.seen) == {"DISCONNECTED"}
+
+
+def test_a_profile_is_not_swapped_under_a_run(rig, tmp_path, capsys):
+    other = tmp_path / "other.csv"
+    other.write_text(f"Time (s),{cl.RESISTANCE_COLUMN}\n0,63.75\n1,63.75\n")
+    run_to_running(rig)
+    assert rig.last['profile_name'] == cl.DEFAULT_LAP_CSV
+
+    rig.cmd_q.put(("LOAD_CSV", str(other)))
+    time.sleep(0.5)
+    assert "Ignoring profile change while RUNNING" in capsys.readouterr().out
+    assert rig.last['profile_name'] == cl.DEFAULT_LAP_CSV and rig.state == "RUNNING"
+
+    rig.estop.set()
+    rig.wait_for("FAULT")
+    rig.cmd_q.put(("LOAD_CSV", str(other)))
+    deadline = time.monotonic() + 1.0
+    while rig.last['profile_name'] != "other.csv":
+        assert time.monotonic() < deadline, rig.last['profile_name']
+        time.sleep(0.02)
+    assert rig.last['profile_rows'] == 2
+
+
+def test_a_profile_that_fails_to_load_leaves_the_old_one_in_force(rig, tmp_path, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("LOAD_CSV", str(tmp_path / "missing.csv")))
+    time.sleep(0.4)
+    assert "Failed to load new CSV" in capsys.readouterr().out
+    assert rig.last['profile_name'] == cl.DEFAULT_LAP_CSV and rig.last['profile_rows'] == 68
+
+
+def test_a_run_needs_a_whole_lap_count(rig, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    for bad in (0, None, 2.5):
+        rig.cmd_q.put(cl.transition_command("RUN", bad))
+    time.sleep(0.5)
+    assert rig.state == "ARMED" and rig.crash is None
+    assert capsys.readouterr().out.count("Cannot RUN: laps must be a whole number") == 3
+
+
+def test_a_config_that_cannot_be_used_changes_nothing(rig, capsys):
+    # It used to be reported as rejected after its pack and limits were in force.
+    rig.start()
+    rig.wait_for("IDLE")
+    before = (rig.last['active_settings'], rig.last['active_limits'])
+
+    broken = RigConfig.defaults().to_dict()
+    broken['pack']['parallel_count'] = 0        # a module with no capacity
+    broken['limits']['max_temp'] = 40.0
+    rig.cmd_q.put(("SET_CONFIG", broken))
+    time.sleep(0.5)
+
+    assert "Rejected bad config, nothing changed" in capsys.readouterr().out
+    assert (rig.last['active_settings'], rig.last['active_limits']) == before
+    assert rig.crash is None and rig.threads[2].is_alive()
+
+
 def test_unexpected_error_still_kills_the_load_and_tells_the_gui(rig, monkeypatch, capsys):
     # An error in the loop used to skip the cleanup after it: no KILL, port left
     # open, and the GUI showing the last state it had been sent.
@@ -574,7 +755,12 @@ def test_queued_reset_arm_run_cannot_undo_an_estop(rig, capsys):
 
     rig.wait_for("FAULT")
     time.sleep(1.0)
-    assert set(rig.seen[fault_index:]) == {"FAULT"}
+    # RUNNING packets the loop published before it was held can still be in
+    # tel_q when fault_index is taken, so the tap appends them after it. Once
+    # FAULT is seen, nothing else may follow.
+    first_fault = rig.seen.index("FAULT", fault_index)
+    assert set(rig.seen[fault_index:first_fault]) <= {"RUNNING"}
+    assert set(rig.seen[first_fault:]) == {"FAULT"}
     after = rig.resistor.written()[before:]
     assert b"KILL\n" in after
     assert not any(is_resistance_command(w) for w in after[after.index(b"KILL\n"):])
@@ -612,3 +798,340 @@ def test_unstamped_transition_is_refused(rig, capsys):
     time.sleep(0.5)
     assert rig.state == "IDLE"
     assert "Ignoring ARM: no issue time." in capsys.readouterr().out
+
+
+# ================= TRIP LOG AND TRIP REASON =================
+
+def read_trip_log(rig):
+    with open(rig.trip_log, newline='', encoding='utf-8') as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_a_trip_mid_run_is_logged_after_the_kill(rig, monkeypatch, capsys):
+    run_to_running(rig)
+    # What the controller had been sent when the log was written.
+    sent_before_log = []
+    real_append = cl.append_trip_log
+
+    def spy(record, path=None):
+        sent_before_log.append(rig.resistor.written())
+        return real_append(record, path)
+    monkeypatch.setattr(cl, "append_trip_log", spy)
+
+    rig.amps = 400.0                        # past the 280 A trip
+    rig.wait_for("FAULT")
+    time.sleep(0.2)
+
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['State'], row['Kill_Sent']) == ("OVERCURRENT", "RUNNING", "yes")
+    assert row['Detail'] == "Current 400.0 A (trip 280.0 A)"
+    assert row['Amps'] == "400.0" and row['Module_V'] == "46.00"
+    assert 0 <= float(row['Sample_To_Kill_ms']) < 1000
+    assert b"KILL\n" in sent_before_log[0]
+    assert "[LOGIC] Current 400.0 A (trip 280.0 A)" in capsys.readouterr().out
+
+
+def test_the_trip_reason_reaches_the_gui_until_reset(rig):
+    run_to_running(rig)
+    rig.amps = 400.0
+    rig.wait_for("FAULT")
+    time.sleep(0.2)
+    assert rig.last['fault_reason'] == "OVERCURRENT"
+    assert rig.last['fault_detail'] == ["Current 400.0 A (trip 280.0 A)"]
+
+    rig.amps = 50.0
+    time.sleep(0.2)
+    rig.cmd_q.put(cl.transition_command("RESET"))
+    rig.wait_for("IDLE")
+    assert rig.last['fault_reason'] is None and rig.last['fault_detail'] == []
+
+
+def test_an_estop_is_logged_with_the_state_it_stopped(rig):
+    run_to_running(rig)
+    rig.estop.set()
+    rig.wait_for("FAULT")
+    time.sleep(0.2)
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['State'], row['Kill_Sent']) == ("E-STOP", "RUNNING", "yes")
+    assert rig.last['fault_reason'] == "E-STOP"
+
+
+def test_a_lost_controller_is_logged_as_no_kill_sent(rig):
+    run_to_running(rig)
+    rig.resistor.fail = True
+    rig.wait_for("FAULT", timeout=2.0)
+    time.sleep(0.2)
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['Kill_Sent']) == ("RESISTOR LINK LOST", "NO")
+
+
+# ================= LOAD OVERRIDE AND BENCH PROFILES =================
+
+def settings_sent(rig, since=0):
+    """Every ladder setting written since write number `since`, in steps."""
+    return [cl.decode_word(w.decode().strip()) for w in rig.resistor.written()[since:]
+            if is_resistance_command(w)]
+
+
+def wait_for_setting(rig, steps, since=0, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while steps not in settings_sent(rig, since):
+        assert time.monotonic() < deadline, \
+            f"never commanded {steps} steps; sent {settings_sent(rig, since)}"
+        time.sleep(0.01)
+
+
+def arm_and_run(rig):
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    rig.cmd_q.put(cl.transition_command("RUN", 1))
+    rig.wait_for("RUNNING")
+
+
+def test_an_override_set_before_run_holds_its_resistance(rig, monkeypatch):
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 6)    # the profile: 1.5 ohm
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("SET_OVERRIDE", "RESISTANCE", 1.0))
+    arm_and_run(rig)
+
+    wait_for_setting(rig, 4)
+    time.sleep(1.5)                         # across at least one profile row
+    assert set(settings_sent(rig)) == {4}
+    assert rig.last['load_override'] == ("RESISTANCE", 1.0)
+
+
+def test_an_override_changed_mid_run_reaches_the_bank_before_the_next_row(rig, monkeypatch):
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 6)
+    run_to_running(rig)
+    wait_for_setting(rig, 6)
+
+    since = len(rig.resistor.written())
+    sent = time.monotonic()
+    rig.cmd_q.put(("SET_OVERRIDE", "POWER", 46.0 ** 2 / 2.0))  # 2.0 ohm at 46 V
+    wait_for_setting(rig, 8, since)
+    assert time.monotonic() - sent < 0.5    # the shipped rows are 1 s apart
+
+    # Handed back: the profile's own setting at once, not at the next row.
+    since = len(rig.resistor.written())
+    rig.cmd_q.put(("SET_OVERRIDE", None))
+    wait_for_setting(rig, 6, since, timeout=0.5)
+
+
+def test_an_override_is_held_to_the_current_limit(rig):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(sidebar_limits(max_amps=40.0))          # floor 46 / 40 = 1.15 ohm
+    rig.cmd_q.put(("SET_OVERRIDE", "RESISTANCE", 0.25))
+    arm_and_run(rig)
+
+    wait_for_setting(rig, 5)                # 1.25 ohm, the first step over the floor
+    time.sleep(1.0)
+    assert min(settings_sent(rig)) == 5
+
+
+def test_a_malformed_override_changes_nothing(rig, capsys):
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("SET_OVERRIDE", "RESISTANCE", 1.0))
+    rig.cmd_q.put(("SET_OVERRIDE", "RESISTANCE", 0.0))
+    time.sleep(0.5)
+    assert rig.last['load_override'] == ("RESISTANCE", 1.0)
+    assert "Ignoring load override" in capsys.readouterr().out
+
+
+def test_a_bench_profile_sets_the_resistance_it_names(rig, tmp_path):
+    profile = tmp_path / "bench.csv"
+    profile.write_text(f"Time (s),{cl.RESISTANCE_COLUMN}\n0,63.75\n0.3,2\n0.6,63.75\n")
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(("LOAD_CSV", str(profile)))
+    arm_and_run(rig)
+
+    rig.wait_for("IDLE", timeout=4.0)       # the run ends with the profile
+    assert settings_sent(rig) == [255, 8, 255]
+
+
+# ================= LOAD CHECK =================
+
+def hold_one_ohm(rig, monkeypatch):
+    """Every profile row asks for 1 ohm: 46 A at the fake DAQ's 46 V."""
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 4)
+
+
+def test_a_bank_that_draws_what_it_should_runs_on(rig, monkeypatch):
+    hold_one_ohm(rig, monkeypatch)
+    run_to_running(rig)
+    time.sleep(cl.BANK_SETTLE_S + 1.0)
+    assert rig.state == "RUNNING"
+    assert abs(rig.last['expected_amps'] - 46.0) < 0.01
+
+
+def test_no_current_at_a_loaded_setting_faults_the_run(rig, monkeypatch, capsys):
+    # A contactor that did not close, a controller that restarted, or a current
+    # sensor that stopped reading. Nothing used to notice any of them.
+    hold_one_ohm(rig, monkeypatch)
+    rig.amps = 0.0
+    run_to_running(rig)
+    wait_for_setting(rig, 4)
+    commanded_at = time.monotonic()
+    before = len(rig.resistor.written())
+
+    rig.wait_for("FAULT", timeout=3.0)
+    # Not before the relays and the DAQ have caught up with the setting.
+    assert time.monotonic() - commanded_at >= cl.BANK_SETTLE_S - 0.1
+    assert b"KILL\n" in rig.resistor.written()[before:]
+    out = capsys.readouterr().out
+    assert "LOAD MISMATCH ALARM! Killing Load." in out
+    assert "Ladder at 1.00 ohm and 46.0 V should draw 46.0 A; measured 0.0 A" in out
+
+    time.sleep(0.2)
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['State'], row['Ladder_Ohm']) == ("LOAD MISMATCH", "RUNNING", "1.00")
+    assert rig.last['fault_reason'] == "LOAD MISMATCH"
+
+
+def test_far_more_current_than_the_setting_allows_faults_the_run(rig, monkeypatch, capsys):
+    # The reversed command word: a light setting commanded, a heavy one in circuit.
+    monkeypatch.setattr(cl, "command_steps", lambda *a, **k: 64)       # 16 ohm, 2.9 A
+    rig.amps = 40.0
+    run_to_running(rig)
+    rig.wait_for("FAULT", timeout=3.0)
+    out = capsys.readouterr().out
+    # 40 A through 16 ohm would be 25 kW in bank 7, so its own trip speaks first.
+    assert "BANK OVERPOWER ALARM!" in out or "LOAD MISMATCH ALARM!" in out
+
+
+def test_the_load_check_can_be_switched_off_for_bench_supplies(rig, monkeypatch):
+    hold_one_ohm(rig, monkeypatch)
+    rig.amps = 28.0                         # the bank on a lower supply than the taps
+    rig.start()
+    rig.wait_for("IDLE")
+    bench = RigConfig.defaults().limits
+    bench.load_check_enabled = False
+    rig.cmd_q.put(("SET_LIMITS", bench.to_command_dict()))
+    arm_and_run(rig)
+    time.sleep(cl.BANK_SETTLE_S + 1.0)
+    assert rig.state == "RUNNING"
+
+    # Switched back on mid-run, it faults.
+    bench.load_check_enabled = True
+    rig.cmd_q.put(("SET_LIMITS", bench.to_command_dict()))
+    rig.wait_for("FAULT", timeout=2.0)
+    assert rig.last['fault_reason'] == "LOAD MISMATCH"
+
+
+def test_sil_mode_runs_without_the_load_check(rig, monkeypatch):
+    # The SIL plant's current is a slider, not what the ladder would draw.
+    hold_one_ohm(rig, monkeypatch)
+    rig.amps = 0.0
+    monkeypatch.setattr(rig, "_logic", lambda: cl.run_logic_process(
+        rig.daq_q, rig.tel_q, rig.cmd_q, rig.stop, None, rig.estop, sil_mode=True))
+    run_to_running(rig)
+    time.sleep(cl.BANK_SETTLE_S + 1.0)
+    assert rig.state == "RUNNING"
+
+
+# ================= WHAT THE CONTROLLER SAYS =================
+
+BANNER = "Arduino Ready. Waiting for Binary Signal..."
+NO_SIGNAL = "No Signal: System Reset / All Off"
+
+
+def test_a_controller_restart_mid_run_faults(rig, monkeypatch, capsys):
+    # The board dropped every relay, came back, and took the next row's command
+    # as if nothing had happened. The host never read what it printed.
+    monkeypatch.setattr(cl, "CONTROLLER_BOOT_S", 0.0)
+    run_to_running(rig)
+    before = len(rig.resistor.written())
+    rig.resistor.say(BANNER)
+    rig.wait_for("FAULT", timeout=1.0)
+
+    assert b"KILL\n" in rig.resistor.written()[before:]
+    assert "CONTROLLER RESET ALARM! Killing Load." in capsys.readouterr().out
+    time.sleep(0.2)
+    (row,) = read_trip_log(rig)
+    assert (row['Reason'], row['State'], row['Kill_Sent']) == ("CONTROLLER RESET", "RUNNING", "yes")
+    assert rig.last['fault_reason'] == "CONTROLLER RESET"
+
+
+def test_the_banner_from_opening_the_port_is_not_a_restart(rig, capsys):
+    # Opening the port restarts the board; its banner can land after the handshake.
+    rig.resistor.say(BANNER)
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    time.sleep(0.3)
+    assert rig.state == "ARMED" and "FAULT" not in rig.seen
+    assert "restarted" not in capsys.readouterr().out
+
+
+def test_a_restart_while_idle_is_reported_without_a_fault(rig, monkeypatch, capsys):
+    monkeypatch.setattr(cl, "CONTROLLER_BOOT_S", 0.0)
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.resistor.say(BANNER)
+    time.sleep(0.4)
+    assert rig.state == "IDLE" and "FAULT" not in rig.seen
+    assert "The resistor controller restarted." in capsys.readouterr().out
+
+
+def test_the_controllers_own_watchdog_firing_mid_run_faults(rig, capsys):
+    run_to_running(rig)
+    wait_for_setting(rig, 255)              # the first row has gone out
+    rig.resistor.say(NO_SIGNAL)
+    rig.wait_for("FAULT", timeout=1.0)
+    assert "CONTROLLER SHED LOAD ALARM!" in capsys.readouterr().out
+
+
+def test_the_shed_notice_after_a_kill_is_not_a_fault(rig):
+    # The firmware prints the same line when the host's own KILL sheds the load.
+    rig.start()
+    rig.wait_for("IDLE")
+    rig.resistor.say(NO_SIGNAL)
+    rig.cmd_q.put(cl.transition_command("ARM"))
+    rig.wait_for("ARMED")
+    rig.resistor.say(NO_SIGNAL)
+    time.sleep(0.4)
+    assert rig.state == "ARMED" and "FAULT" not in rig.seen
+
+
+REJECTED = "Error: Rejected. A command is exactly 8 binary digits."
+
+
+def test_a_rejected_command_is_sent_again_and_the_run_goes_on(rig, monkeypatch, capsys):
+    # One row's command mangled on the wire left the bank at the row before.
+    hold_one_ohm(rig, monkeypatch)
+    run_to_running(rig)
+    wait_for_setting(rig, 4)
+    time.sleep(0.15)                        # between rows: nothing else is due
+    since = len(rig.resistor.written())
+    rig.resistor.say(REJECTED)
+    wait_for_setting(rig, 4, since, timeout=0.4)
+
+    time.sleep(cl.BANK_SETTLE_S + 0.6)
+    assert rig.state == "RUNNING"
+    assert "rejected a line (1 so far)" in capsys.readouterr().out
+
+
+def test_a_setting_is_sent_again_only_once(rig, monkeypatch):
+    # A board that refuses everything must not be answered in a loop. The row's
+    # own command still goes out each second; the load check judges the result.
+    hold_one_ohm(rig, monkeypatch)
+    run_to_running(rig)
+    wait_for_setting(rig, 4)
+    time.sleep(0.15)
+    since = len(rig.resistor.written())
+    for _ in range(5):
+        rig.resistor.say(REJECTED)
+    time.sleep(0.5)
+    assert settings_sent(rig, since) == [4]
+
+
+def test_a_port_that_cannot_be_read_is_a_lost_link(rig, capsys):
+    run_to_running(rig)
+    rig.resistor.read_fails = True
+    rig.wait_for("FAULT", timeout=1.0)
+    assert "link lost (read)" in capsys.readouterr().out
+    assert rig.last['fault_reason'] == "RESISTOR LINK LOST"

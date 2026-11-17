@@ -144,7 +144,9 @@ _CP_T = np.array([300.0, 400.0, 600.0, 800.0, 1000.0])
 _CP_V = np.array([765.0, 940.0, 1110.0, 1180.0, 1225.0])
 
 # Resting (open-circuit) voltage of one NMC cell against state of charge. A
-# generic 21700 NMC curve -- the RS50 datasheet's own curve should replace it.
+# generic 21700 NMC curve. The RS50 as Mooch measured it (Oct 2025) sits lower
+# through the middle of the charge (about 3.62 V at 50%), so this curve draws
+# slightly more current through the bank: the conservative side for bank heat.
 OCV_SOC = np.array([0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00])
 OCV_V = np.array([3.00, 3.30, 3.42, 3.52, 3.59, 3.65, 3.72, 3.80, 3.89, 3.98, 4.07, 4.20])
 

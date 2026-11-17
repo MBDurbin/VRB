@@ -18,8 +18,8 @@ class SILSimulatorWindow(QtWidgets.QWidget):
         # The pack and wiring the rig is configured for, so desk tests of the
         # current, sag and bank-power trips run against the installed cells. These
         # were hardcoded for the Molicel P45B (45 mOhm pack) and stayed that way
-        # after the move to the RS50 (12 mOhm), so every sag figure was 3-4x the
-        # real one. Read once at startup; restart to pick up a new pack.
+        # after the move to the RS50 (19.5 mOhm), so every sag figure was 2-3x
+        # the real one. Read once at startup; restart to pick up a new pack.
         config = config if config is not None else RigConfig.load()
         pack, daq = config.pack, config.daq
         self.series_count = pack.series_count
@@ -32,6 +32,7 @@ class SILSimulatorWindow(QtWidgets.QWidget):
         self.temp_buses = daq.temp_bus_count
         self.sensors_per_bus = daq.sensors_per_bus
         self.n_banks = len(daq.resistor_tc_channels)
+        self.n_busbars = max(0, daq.busbar_sensor_count)
 
         self.init_ui()
 
@@ -98,7 +99,7 @@ class SILSimulatorWindow(QtWidgets.QWidget):
 
         # Pack OCV Slider -- lets the operator walk the pack down to exercise the
         # UNDERVOLTAGE trip. Sag alone cannot reach it from a full pack: at the
-        # slider's 250 A a 12 mOhm module drops only 3 V. Cutoff to full charge.
+        # slider's 250 A a 19.5 mOhm module drops under 5 V. Cutoff to full charge.
         top = int(round(self.cell_max_v * 100))
         self.lbl_ocv = self._slider_label(
             f"Pack OCV        {self.cell_max_v:.2f} V/cell  ·  "
@@ -141,6 +142,7 @@ class SILSimulatorWindow(QtWidgets.QWidget):
         hw_fault = self.chk_fault.isChecked()
 
         fake_data = {
+            'sampled_at': time.time(),
             'voltage': sim_voltage,
             'amps': sim_amps,
             'max_temp': sim_temp,
@@ -153,6 +155,10 @@ class SILSimulatorWindow(QtWidgets.QWidget):
             'temp_sensor_ages_s': [[0.0] * len(bus) for bus in fake_temps],
             'resistor_temps': bank_temps,
             'resistor_temp_ages_s': [0.0] * len(bank_temps),
+            # The bus bars follow the cell slider: they are welded to the
+            # cells. None when no bus-bar sensors are configured.
+            'busbar_temps': [sim_temp] * self.n_busbars,
+            'busbar_temp_ages_s': [0.0] * self.n_busbars,
             'hardware_status': {
                 'ni_daq': not hw_fault,
                 'temp_arduino': not hw_fault,

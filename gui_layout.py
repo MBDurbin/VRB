@@ -12,7 +12,8 @@ from rig_config import (
     VEHICLE_FIELD_LABELS, PACK_FIELD_LABELS, DAQ_FIELD_LABELS, field_label,
 )
 from control_logic import (DEFAULT_LAP_CSV, PROFILES_DIR, PROJECT_DIR, VRB_MAX_POWER_W,
-                           BANK_OVERLOAD_FACTOR, transition_command)
+                           BANK_OVERLOAD_FACTOR, MAX_RESISTANCE, RESISTOR_RESOLUTION,
+                           transition_command)
 import theme
 from PyQt6 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
@@ -148,11 +149,107 @@ LIMIT_LABELS = {
     'temp_stale_timeout': "Temp stale timeout", 'daq_stale_timeout': "DAQ stale timeout",
     'derate_en': "Thermal derate", 'derate_start': "Derate start",
     'resistor_max_temp': "Resistor trips", 'bank_rated_only': "Bank at rated power only",
+    'load_check': "Check load against ladder", 'busbar_max_temp': "Bus-bar trip",
 }
 
 # How long the controller may take to acknowledge a settings change before the
 # window says it is not in force. A command normally lands within ~0.2 s.
 SETTINGS_ACK_GRACE_S = 1.0
+
+# With no packet from the logic process for this long, the window says so. It
+# used to go on showing the last state and readings it was sent, RUNNING and
+# all, with nothing to tell a hung or dead controller from a steady one. The
+# logic process publishes ten times a second. The longer figure is for
+# start-up, before the first packet: the process takes a few seconds to load.
+TELEMETRY_STALE_S = 1.5
+TELEMETRY_STARTUP_S = 10.0
+
+# How long a passing notice stays up, and how long the controller has to report
+# a profile the operator picked before the window says it was not loaded.
+NOTICE_SHOW_S = 8.0
+PROFILE_ACK_S = 2.0
+
+
+def telemetry_lost_for(now, opened_at, last_packet_at):
+    """Seconds without telemetry once that is too long, else None."""
+    if last_packet_at is None:
+        waited = now - opened_at
+        return waited if waited > TELEMETRY_STARTUP_S else None
+    waited = now - last_packet_at
+    return waited if waited > TELEMETRY_STALE_S else None
+
+
+# Recording columns, in order. The first eight, the cells and the cell
+# temperatures are as they have always been, so older recordings and
+# tools/dcir_from_log.py read the same; everything newer follows them.
+RECORD_LEAD = ["Timestamp", "Pack_V", "Amps", "Power_kW", "Max_Temp", "SOC_Est",
+               "FSM_State", "Target_Res"]
+RECORD_RUN = ["Lap", "Row", "Asked_Res", "Expected_A", "Remaining_Ah", "DAQ_Age_s"]
+
+
+def record_headers(series, parallel, bank_count, busbar_count=0):
+    """The recording's header row for this pack and wiring.
+
+    BusBar_1_T is the bar between S1 and S2. There are no bus-bar columns while
+    no bus-bar sensors are configured.
+    """
+    headers = list(RECORD_LEAD)
+    headers += [f"Cell_{i + 1}_V" for i in range(series)]
+    headers += [f"S{s}_T{p}" for s in range(1, series + 1) for p in range(1, parallel + 1)]
+    headers += RECORD_RUN
+    headers += [f"Bank_{b + 1}_T" for b in range(bank_count)]
+    headers += [f"BusBar_{b + 1}_T" for b in range(busbar_count)]
+    return headers
+
+
+def _cell(value, digits):
+    """A number for the CSV, or an empty field for anything that is not one.
+
+    Empty, not 0.0: a reading that is missing and one that is zero are different
+    events, and an empty field reads back as NaN in pandas and plots as a gap.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return ''
+    return round(value, digits)
+
+
+def _padded(values, count, digits):
+    """`count` fields from a list of readings, empty where there is none."""
+    row = [_cell(v, digits) for v in list(values)[:count]]
+    return row + [''] * (count - len(row))
+
+
+def record_row(packet, started_at, series, parallel, bank_count, busbar_count=0,
+               received_at=None):
+    """One recording row for one telemetry packet, matching record_headers().
+
+    Timestamp is when the DAQ took the sample, in seconds from `started_at`,
+    not when this window got round to drawing it: the window redraws on a 50 ms
+    timer, so its own clock put up to that much jitter on every row, and on a
+    step into load that is most of the first sample. `received_at` stands in
+    for a packet with no sample time (the SIL plant before it had one).
+    """
+    sampled_at = packet.get('sampled_at')
+    if not (isinstance(sampled_at, (int, float)) and math.isfinite(sampled_at)):
+        sampled_at = received_at if received_at is not None else time.time()
+
+    row = [
+        round(sampled_at - started_at, 3), _cell(packet.get('voltage'), 3),
+        _cell(packet.get('amps'), 2), _cell(packet.get('power_kw'), 3),
+        _cell(packet.get('max_temp'), 2), _cell(packet.get('true_soc'), 2),
+        packet.get('fsm_state', ''), _cell(packet.get('target_resistance'), 2),
+    ]
+    row += _padded(packet.get('cell_voltages', []), series, 3)
+    flat_temps = [t for bus in packet.get('temperatures', []) for t in bus]
+    row += _padded(flat_temps, series * parallel, 1)
+    row += [
+        packet.get('current_lap', ''), packet.get('profile_row', ''),
+        _cell(packet.get('requested_resistance'), 3), _cell(packet.get('expected_amps'), 2),
+        _cell(packet.get('remaining_ah'), 3), _cell(packet.get('daq_age_s'), 3),
+    ]
+    row += _padded(packet.get('resistor_temps', []), bank_count, 1)
+    row += _padded(packet.get('busbar_temps', []), busbar_count, 1)
+    return row
 
 
 def _same_setting(a, b):
@@ -189,12 +286,95 @@ def settings_mismatch(config, data):
     return lines
 
 
+def setup_notices(config):
+    """Settings that are right for a bench session and wrong to forget, as (short, full).
+
+    Neither stops the rig, so neither is an ARM blocker. Both are saved with the
+    config when the window closes, which is how a session on bench supplies left
+    a 60 A limit and a per-cell trip on the cutoff waiting for the first module.
+    """
+    limits, pack = config.limits, config.pack
+    notices = []
+    if not limits.derive_from_pack:
+        derived = replace(limits, derive_from_pack=True).apply_pack_derivation(pack)
+        notices.append((
+            "LIMITS HAND-SET",
+            f"The limits are hand-set, not derived from the pack: "
+            f"{limits.max_amps:.0f} A (+{limits.amp_buffer:.0f}), {limits.max_temp:.0f} C, "
+            f"{limits.min_volts:.1f} V, {limits.min_cell_volts:.2f} V/cell. The pack gives "
+            f"{derived.max_amps:.0f} A (+{derived.amp_buffer:.0f}), {derived.max_temp:.0f} C, "
+            f"{derived.min_volts:.1f} V, {derived.min_cell_volts:.2f} V/cell. Tick "
+            f"\"Derive limits from pack\" in the sidebar to go back to those."))
+    if not limits.load_check_enabled:
+        notices.append((
+            "LOAD CHECK OFF",
+            "The load check is off, for bench supplies. With a module on, tick "
+            "\"Check load against ladder\" in the sidebar: nothing else notices a bank "
+            "that is not at the resistance commanded."))
+    return notices
+
+
 def arm_refusal_summary(refusals):
     """One line for the main window: the first reason ARM is refused, and a count."""
     if not refusals:
         return ""
     more = f"  (+{len(refusals) - 1} more)" if len(refusals) > 1 else ""
     return f"WILL NOT ARM: {refusals[0]}{more}"
+
+
+# The sidebar's load override: the choices, in order, as (label, mode), and how
+# the value box reads for each mode. `scale` turns the box's unit into the SI
+# value the controller takes (control_logic.parse_override). Every mode starts
+# at a light load, and nothing here is saved: each session starts on the profile.
+OVERRIDE_CHOICES = (("Lap profile", None),
+                    ("Fixed resistance", "RESISTANCE"),
+                    ("Fixed power", "POWER"))
+OVERRIDE_SPINS = {
+    "RESISTANCE": dict(unit="Ω", low=RESISTOR_RESOLUTION, high=MAX_RESISTANCE,
+                       step=RESISTOR_RESOLUTION, start=MAX_RESISTANCE, scale=1.0),
+    "POWER": dict(unit="kW", low=0.01, high=20.0, step=0.1, start=0.5, scale=1000.0),
+}
+
+
+# Range of the Configure dialog's whole-number boxes. The default suits counts:
+# cells in series or parallel, modules, buses, sensors per bus. The baud rate
+# needs more: it used to share 1-999, so opening Configure and pressing Save
+# turned the temperature board's 115200 into 999, and the rig never found it.
+DEFAULT_INT_RANGE = (1, 999)
+INT_FIELD_RANGES = {
+    'temp_baud_rate': (300, 2_000_000),
+    # From 0: none fitted is a setting, and the box must be able to go back to it.
+    'busbar_sensor_count': (0, 64),
+}
+
+# Configure-dialog list fields that hold numbers, not channel names.
+NUMBER_LIST_FIELDS = {'voltage_tap_gains'}
+
+
+def override_command(mode, shown_value):
+    """The SET_OVERRIDE command for a sidebar choice; mode None hands back to the profile."""
+    if mode is None:
+        return ("SET_OVERRIDE", None)
+    return ("SET_OVERRIDE", mode, shown_value * OVERRIDE_SPINS[mode]['scale'])
+
+
+def override_status(override, fsm_state, target_res):
+    """The line under the override controls: what the controller is holding."""
+    if not override:
+        return "Profile sets the load"
+    mode, value = override
+    asked = f"{value:.2f} Ω" if mode == "RESISTANCE" else f"{value / 1000.0:.2f} kW"
+    if fsm_state == "RUNNING":
+        return f"Holding {asked}, ladder at {target_res:.2f} Ω"
+    return f"Holds {asked} from RUN"
+
+
+def fault_summary(reason, detail):
+    """One line for the main window: why the rig faulted, and the first detail."""
+    if not reason:
+        return ""
+    first = next((line.strip().removeprefix("- ") for line in detail if line.strip()), "")
+    return f"TRIPPED: {reason}" + (f". {first}" if first else "")
 
 
 # ================= CONFIGURATION DIALOG =================
@@ -284,13 +464,20 @@ class ConfigDialog(QtWidgets.QDialog):
 
     # --- tab construction -------------------------------------------------
 
-    def _make_editor(self, value):
-        """Build an input widget appropriate to the value's type."""
+    def _make_editor(self, value, name=None):
+        """Build an input widget appropriate to the value's type.
+
+        `name` is the field's name, for the ranges in INT_FIELD_RANGES.
+        """
         if isinstance(value, list):
             # Channel lists edit as comma-separated text; order is meaningful
             # (channel i reads the cumulative tap for series group i).
-            w = QtWidgets.QLineEdit(", ".join(str(v) for v in value))
+            w = QtWidgets.QLineEdit(", ".join(f"{v:g}" if isinstance(v, float) else str(v)
+                                              for v in value))
             w.setProperty('is_list', True)
+            # A list of numbers has to come back as numbers. Its type cannot be
+            # read off the value: an empty list says nothing.
+            w.setProperty('of_numbers', name in NUMBER_LIST_FIELDS)
             w.editingFinished.connect(self.refresh_derived)
             return w
 
@@ -300,7 +487,10 @@ class ConfigDialog(QtWidgets.QDialog):
             w.stateChanged.connect(self.refresh_derived)
         elif isinstance(value, int):
             w = QtWidgets.QSpinBox()
-            w.setRange(1, 999)
+            low, high = INT_FIELD_RANGES.get(name, DEFAULT_INT_RANGE)
+            # Never narrower than the value loaded: a spinbox clamps silently,
+            # and Save would then write the clamped number back to the file.
+            w.setRange(min(low, value), max(high, value))
             w.setValue(value)
             w.setKeyboardTracking(False)
             w.valueChanged.connect(self.refresh_derived)
@@ -338,7 +528,7 @@ class ConfigDialog(QtWidgets.QDialog):
             )
             label.setStyleSheet(f"color: {theme.TEXT_DIM}; font-size: {theme.SIZE_SMALL}px;")
 
-            editor = self._make_editor(value)
+            editor = self._make_editor(value, f.name)
             widget_store[f.name] = editor
             form.addRow(label, editor)
 
@@ -364,7 +554,10 @@ class ConfigDialog(QtWidgets.QDialog):
         if isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
             return widget.value()
         if widget.property('is_list'):
-            return [part.strip() for part in widget.text().split(',') if part.strip()]
+            parts = [part.strip() for part in widget.text().split(',') if part.strip()]
+            # float() raises on text that is not a number; collect()'s callers
+            # show that as an invalid configuration rather than saving it.
+            return [float(p) for p in parts] if widget.property('of_numbers') else parts
         return widget.text()
 
     def collect(self) -> RigConfig:
@@ -433,7 +626,13 @@ class ConfigDialog(QtWidgets.QDialog):
             f"RESISTOR TRIPS    "
             + "  |  ".join(f"B{i + 1} {t:.0f} C"
                            for i, t in enumerate(candidate.limits.resistor_max_temp_c))
-            + "   (edit in rig_config.json)"
+            + "   (edit in rig_config.json)\n"
+            f"BUS BARS          "
+            + (f"{candidate.daq.busbar_sensor_count} sensors, trip "
+               f"{candidate.limits.busbar_max_temp_c:.0f} C (edit in rig_config.json)"
+               if candidate.daq.busbar_sensor_count > 0 else
+               f"no sensors fitted; a {pack.series_count}S module has "
+               f"{pack.bus_bar_count} between its series groups")
         )
 
         text = config_problem_text(candidate)
@@ -466,22 +665,39 @@ class ConfigDialog(QtWidgets.QDialog):
         elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
             widget.setValue(value)
         elif widget.property('is_list'):
-            widget.setText(", ".join(str(v) for v in value))
+            widget.setText(", ".join(f"{v:g}" if isinstance(v, float) else str(v)
+                                     for v in value))
         else:
             widget.setText(str(value))
 
 
 # ================= HEATMAP WINDOW =================
+def busbar_places(series_count, busbar_count):
+    """(how many bus-bar tiles the thermal map draws, whether they sit between columns).
+
+    One sensor per bus bar, a series count less one, is drawn where the bars
+    are: each tile between the two series groups its bar joins. With none
+    fitted the same places are drawn, empty, so the map shows where they go.
+    Any other count cannot be placed, and is drawn as a plain row.
+    """
+    between_groups = max(0, series_count - 1)
+    if busbar_count <= 0 or busbar_count == between_groups:
+        return between_groups, True
+    return busbar_count, False
+
+
 class HeatmapWindow(QtWidgets.QWidget):
-    def __init__(self, series_count=12, parallel_count=4):
+    def __init__(self, series_count=12, parallel_count=4, busbar_count=0):
         super().__init__()
         # Grid follows the configured pack topology rather than a hardcoded
         # 12S4P, so a future team's pack draws correctly.
         self.series_count = series_count
         self.parallel_count = parallel_count
+        # Bus-bar sensors configured: 0 while none are fitted.
+        self.busbar_count = max(0, busbar_count)
 
         self.setWindowTitle(f"{series_count}S{parallel_count}P Thermal Map")
-        self.resize(min(1600, 62 * series_count + 80), 82 * parallel_count + 80)
+        self.resize(min(1600, 62 * series_count + 80), 82 * parallel_count + 170)
 
         main_layout = QtWidgets.QVBoxLayout(self)
         main_layout.setContentsMargins(theme.GAP_LG, theme.GAP_MD, theme.GAP_LG, theme.GAP_LG)
@@ -530,19 +746,75 @@ class HeatmapWindow(QtWidgets.QWidget):
 
             main_layout.addLayout(row_layout)
 
+        # --- Bus bars ---
+        # One tile per bus bar, under the cells and half a column across, so
+        # each sits between the two series groups its bar joins.
+        places, between = busbar_places(series_count, self.busbar_count)
+        main_layout.addSpacing(theme.GAP_MD)
+        self.lbl_busbar_caption = QtWidgets.QLabel()
+        self.lbl_busbar_caption.setProperty("variant", "section")
+        main_layout.addWidget(self.lbl_busbar_caption)
+
+        busbar_layout = QtWidgets.QHBoxLayout()
+        busbar_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        busbar_layout.setContentsMargins((self.CELL_SIZE + 3) // 2 if between else 0, 0, 0, 0)
+        busbar_layout.setSpacing(3)
+        self.busbar_labels = []
+        for i in range(places):
+            lbl = QtWidgets.QLabel("--")
+            lbl.setFixedSize(self.CELL_SIZE, 34)
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet(self._cell_style(theme.SURFACE_HIGH, theme.TEXT_MUTED))
+            lbl.setToolTip(f"Bus bar {i + 1}, between S{i + 1} and S{i + 2}" if between
+                           else f"Bus-bar sensor {i + 1}")
+            busbar_layout.addWidget(lbl)
+            self.busbar_labels.append(lbl)
+        main_layout.addLayout(busbar_layout)
+        self.show_busbar_caption(None)
+
         swatches = "".join(
             f"<span style='color:{hexcode}'>■</span>" for _, hexcode in theme.HEAT_STOPS)
-        legend = QtWidgets.QLabel(f"cool &nbsp;{swatches}&nbsp; at limit")
+        legend = QtWidgets.QLabel(f"cool &nbsp;{swatches}&nbsp; at limit &nbsp;·&nbsp; "
+                                  f"dashed red: a bus-bar reading gone stale")
         legend.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         main_layout.addSpacing(theme.GAP_SM)
         main_layout.addWidget(legend)
 
-    def _cell_style(self, bg, fg):
+    def _cell_style(self, bg, fg, border=None):
         return (
             f"background-color: {bg}; color: {fg}; font-family: {theme.FONT_MONO}; "
             f"font-weight: 700; font-size: 12px; border-radius: {theme.RADIUS_SM}px; "
-            f"border: 1px solid {theme.BORDER_SUBTLE};"
+            f"border: {border or f'1px solid {theme.BORDER_SUBTLE}'};"
         )
+
+    def show_busbar_caption(self, limit):
+        if not self.busbar_count:
+            text = (f"BUS BARS · {len(self.busbar_labels)} PLACES · NO SENSORS FITTED "
+                    f"(busbar_sensor_count is 0)")
+        else:
+            text = f"BUS-BAR TEMPERATURES · {self.busbar_count} SENSORS"
+            if limit is not None:
+                text += f" · TRIP {limit:.0f} °C"
+        self.lbl_busbar_caption.setText(text)
+
+    def update_busbars(self, temps, ages, limit, stale_timeout_s):
+        """temps/ages: per bus-bar sensor, bus bar 1 first. limit: the trip, C."""
+        self.show_busbar_caption(limit)
+        for i, lbl in enumerate(self.busbar_labels):
+            fitted = i < self.busbar_count
+            temp = temps[i] if fitted and i < len(temps) else None
+            age = ages[i] if i < len(ages) else float('inf')
+            # The same rule as a resistor bank's tile: no trip means no sensor.
+            fill, status = bank_tile(temp, age, limit if fitted else None, stale_timeout_s)
+            if temp is None:
+                lbl.setText("--")
+                lbl.setStyleSheet(self._cell_style(theme.SURFACE_HIGH, theme.TEXT_MUTED))
+                continue
+            _, ratio = theme.heat_colour(temp, limit)
+            text_colour = "#ffffff" if (ratio < 0.35 or ratio > 0.75) else "#14171c"
+            border = f"2px dashed {theme.DANGER}" if status == "STALE" else None
+            lbl.setText(f"{temp:.0f}")
+            lbl.setStyleSheet(self._cell_style(fill, text_colour, border))
 
     def update_temps(self, temp_array, current_max_safe_temp):
         flat_temps = []
@@ -799,8 +1071,21 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.is_logging = False
         self.csv_file = None
         self.csv_writer = None
+        # The sample time of the last row recorded, so a packet the logic
+        # process carried forward is not written a second time.
+        self.last_logged_sample = None
         self.heatmap_window = None
         self.resistor_map_window = None
+
+        # When the last packet arrived, for the NO TELEMETRY banner. None until
+        # the first. See telemetry_lost_for().
+        self.opened_at = time.time()
+        self.last_packet_at = None
+        self.telemetry_lost = False
+
+        # A profile the operator picked that the controller has not reported
+        # yet, as (file name, when it was sent).
+        self.profile_wanted = None
 
         # Vehicle, pack and safety limits all come from rig_config.json, falling
         # back to the RS50 12S4P defaults. Editable from the Configure dialog so
@@ -876,10 +1161,18 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.card_temp = MetricCard("Max Temp", "--- °C", theme.TEXT)
         self.card_soc = MetricCard("Charge", "--- %", theme.SUCCESS)
         self.card_lap = MetricCard("Lap", "-- / --", theme.TEXT_DIM)
+        # The hottest bus bar, beside the hottest cell. Only once bus-bar
+        # sensors are configured, so a module without them shows no dead card.
+        self.card_busbar = None
+        if self.config.daq.busbar_sensor_count > 0:
+            self.card_busbar = MetricCard("Max Bus Bar", "--- °C", theme.TEXT)
 
         status_row.addWidget(self.lbl_fsm_state, stretch=3)
-        for card in (self.card_voltage, self.card_current, self.card_power,
-                     self.card_temp, self.card_soc, self.card_lap):
+        cards = [self.card_voltage, self.card_current, self.card_power, self.card_temp,
+                 self.card_soc, self.card_lap]
+        if self.card_busbar is not None:
+            cards.insert(4, self.card_busbar)
+        for card in cards:
             status_row.addWidget(card, stretch=2)
         main_layout.addLayout(status_row)
 
@@ -913,10 +1206,20 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.btn_run.clicked.connect(lambda: self.send_command(
             transition_command("RUN", self.spin_laps.value())))
 
-        self.btn_stop = QtWidgets.QPushButton("E-STOP")
+        self.btn_stop = QtWidgets.QPushButton("E-STOP  (Esc)")
         self.btn_stop.setProperty("variant", "danger")
-        self.btn_stop.setToolTip("Immediately shed all load and latch a fault")
+        self.btn_stop.setToolTip("Immediately shed all load and latch a fault.\n"
+                                 "Esc does the same from any of the rig's windows.")
         self.btn_stop.clicked.connect(
+            lambda: request_estop(self.estop_event, self.gui_cmd_queue))
+        # The button was the only way to stop from this window, and it cannot
+        # be clicked from the thermal or resistor map. Application-wide, so it
+        # works with any of them in front. Qt holds shortcuts back while a
+        # modal dialog is open, which is why nothing modal opens during a run:
+        # see refuse_while_running().
+        self.estop_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), self)
+        self.estop_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        self.estop_shortcut.activated.connect(
             lambda: request_estop(self.estop_event, self.gui_cmd_queue))
 
         self.btn_reset = QtWidgets.QPushButton("Reset")
@@ -979,10 +1282,20 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.mismatch_since = None
         self.shown_mismatch = []
 
+        # Settings that suit the bench supplies and not a module, in amber for
+        # as long as they stand. The config is saved on exit, so without this a
+        # bench session's hand-set limits carried over to the next run unseen.
+        self.lbl_setup_notices = QtWidgets.QLabel()
+        self.lbl_setup_notices.setStyleSheet(
+            f"color: {theme.WARNING}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+        self.lbl_setup_notices.setVisible(False)
+        self.refresh_setup_notices()
+
         sub_top_layout.addWidget(self.lbl_active_csv)
         sub_top_layout.addWidget(self._divider())
         sub_top_layout.addWidget(self.lbl_active_config)
         sub_top_layout.addSpacing(theme.GAP_MD)
+        sub_top_layout.addWidget(self.lbl_setup_notices)
         sub_top_layout.addWidget(self.lbl_settings_mismatch, 1)
         main_layout.addLayout(sub_top_layout)
 
@@ -1014,8 +1327,35 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.lbl_arm_refused.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
                                            QtWidgets.QSizePolicy.Policy.Preferred)
         self.shown_arm_refusals = []
+
+        # Why the rig faulted, from the logic process: the trip, and the reading
+        # and limit it crossed. The banner only says FAULT. Full detail in the
+        # tooltip; every trip is also written to logs/trip_log.csv.
+        self.lbl_fault_reason = QtWidgets.QLabel()
+        self.lbl_fault_reason.setStyleSheet(
+            f"color: {theme.DANGER}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+        self.lbl_fault_reason.setVisible(False)
+        self.lbl_fault_reason.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                            QtWidgets.QSizePolicy.Policy.Preferred)
+        self.shown_fault = ("", [])
+
+        # A passing notice: something the operator asked for that was not done,
+        # and why. In the window, not in a dialog box: a box has to be clicked
+        # away before anything else in the window can be, E-STOP included.
+        self.lbl_notice = QtWidgets.QLabel()
+        self.lbl_notice.setStyleSheet(
+            f"color: {theme.WARNING}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+        self.lbl_notice.setVisible(False)
+        self.lbl_notice.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                      QtWidgets.QSizePolicy.Policy.Preferred)
+        # When the notice comes down, checked on the window's own 50 ms tick.
+        # A timer of its own could fire after the window had gone.
+        self.notice_until = None
+
         hw_layout.addSpacing(theme.GAP_MD)
+        hw_layout.addWidget(self.lbl_fault_reason, 1)
         hw_layout.addWidget(self.lbl_arm_refused, 1)
+        hw_layout.addWidget(self.lbl_notice, 1)
         main_layout.addLayout(hw_layout)
 
         # 3. MIDDLE (Graphs & Cells Sidebar)
@@ -1157,9 +1497,32 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         form_layout.addRow(self._field_label("Derate start", "°C"), self.sb_t_derate)
         form_layout.addRow(self._field_label("Max temp", "°C"), self.sb_t_crit)
 
+        # Whether the measured current is checked against the ladder setting.
+        # Off only for the bench supplies, which do not agree with each other.
+        self.chk_load_check = QtWidgets.QCheckBox("Check load against ladder")
+        self.chk_load_check.setChecked(self.config.limits.load_check_enabled)
+        self.chk_load_check.setToolTip(
+            "Ticked: a run faults as LOAD MISMATCH when the measured current does not fit\n"
+            "the resistance commanded: a wrong bank, a relay or contactor that did not\n"
+            "move, a controller restart, a dead current sensor.\n"
+            "Untick only for bench supplies, where the taps and the bank are on\n"
+            "different supplies. Saved with the config, so tick it again for a module.")
+
+        # Pack derivation, on or off. A threshold edit above switches it off;
+        # this is the way back, which used to mean editing rig_config.json.
+        self.chk_derive = QtWidgets.QCheckBox("Derive limits from pack")
+        self.chk_derive.setChecked(self.config.limits.derive_from_pack)
+        self.chk_derive.setToolTip(
+            "Ticked: V crit, cell min, max current, max temp and derate start are worked\n"
+            "out from the cell and pack in Configure, and follow them.\n"
+            "Editing one of those boxes unticks this and keeps your value.\n"
+            "Ticking it again puts the derived values back.")
+
         limits_inner.addLayout(form_layout)
         limits_inner.addWidget(self.chk_derate)
         limits_inner.addWidget(self.chk_bank_rated)
+        limits_inner.addWidget(self.chk_load_check)
+        limits_inner.addWidget(self.chk_derive)
         cell_layout.addWidget(limits_card)
 
         self.sb_v_warn.valueChanged.connect(self.handle_warn_change)
@@ -1171,9 +1534,77 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.sb_t_derate.valueChanged.connect(self.handle_limit_change)
         self.chk_derate.stateChanged.connect(self.handle_limit_change)
         self.chk_bank_rated.stateChanged.connect(self.handle_bank_rating_change)
+        self.chk_load_check.stateChanged.connect(self.handle_load_check_change)
+        self.chk_derive.stateChanged.connect(self.handle_derive_change)
+
+        # --- LOAD OVERRIDE ---
+        # Takes the load off the profile: a resistance, or a power at the bank,
+        # chosen here, before or during a run. The run keeps the profile's
+        # timing and laps, and the controller holds the override to every floor
+        # and rating a lap row is held to.
+        override_card = QtWidgets.QFrame()
+        override_card.setProperty("variant", "card")
+        override_inner = QtWidgets.QVBoxLayout(override_card)
+        override_inner.setContentsMargins(theme.GAP_MD, theme.GAP_MD, theme.GAP_MD, theme.GAP_MD)
+        override_inner.setSpacing(theme.GAP_SM)
+
+        override_label = QtWidgets.QLabel("LOAD OVERRIDE")
+        override_label.setProperty("variant", "section")
+        override_inner.addWidget(override_label)
+
+        self.cmb_override = QtWidgets.QComboBox()
+        for text, mode in OVERRIDE_CHOICES:
+            self.cmb_override.addItem(text, mode)
+        self.cmb_override.setToolTip(
+            "Fixed resistance: hold the ladder at this resistance.\n"
+            "Fixed power: hold this power at the bank (module V x I, as the Power card shows),\n"
+            "re-solved as the module voltage falls.\n"
+            "Both are still held to the current limit, the bank's ratings and the derate.")
+
+        # Keyboard tracking off, as for the thresholds: typing 0.5 must not send
+        # the 0 and the 0. on the way, mid-run.
+        self.sb_override = QtWidgets.QDoubleSpinBox()
+        self.sb_override.setKeyboardTracking(False)
+        self.sb_override.setDecimals(2)
+        self.sb_override.setFixedWidth(104)
+        self.override_values = {mode: spec['start'] for mode, spec in OVERRIDE_SPINS.items()}
+
+        override_row = QtWidgets.QHBoxLayout()
+        override_row.setSpacing(theme.GAP_SM)
+        override_row.addWidget(self.cmb_override, 1)
+        override_row.addWidget(self.sb_override)
+        override_inner.addLayout(override_row)
+
+        self.lbl_override_status = QtWidgets.QLabel()
+        self.lbl_override_status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                               QtWidgets.QSizePolicy.Policy.Preferred)
+        override_inner.addWidget(self.lbl_override_status)
+        cell_layout.addWidget(override_card)
+
+        # What this window last asked for, and when, to check the controller took it.
+        self.override_wanted = None
+        self.override_sent_at = 0.0
+        self.shown_override_status = None
+        self.configure_override_box(None)
+        self.show_override_status(override_status(None, "", 0.0), theme.TEXT_DIM)
+
+        self.cmb_override.currentIndexChanged.connect(self.handle_override_mode)
+        self.sb_override.valueChanged.connect(self.handle_override_value)
 
         cell_layout.addStretch()
-        mid_layout.addWidget(sidebar)
+
+        # Scrolls when the window is shorter than the sidebar. Without it, a
+        # maximized window on a laptop screen at 125% scaling squeezed the
+        # sidebar below its own height and crushed the threshold boxes to 8 px,
+        # too small to read or edit. The extra width is for the scrollbar.
+        self.sidebar_scroll = QtWidgets.QScrollArea()
+        self.sidebar_scroll.setWidget(sidebar)
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setFixedWidth(sidebar.width() + 14)
+        self.sidebar_scroll.viewport().setAutoFillBackground(False)
+        mid_layout.addWidget(self.sidebar_scroll)
         main_layout.addLayout(mid_layout)
 
     def send_command(self, cmd):
@@ -1217,7 +1648,30 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         lbl.setText(f"{'●' if is_connected else '○'}  {name}")
         lbl.setStyleSheet(theme.pill_style(is_connected))
 
+    def show_notice(self, text):
+        """Say something in the window for NOTICE_SHOW_S, without a dialog box."""
+        self.lbl_notice.setText(text)
+        self.lbl_notice.setToolTip(text)
+        self.lbl_notice.setVisible(True)
+        self.notice_until = time.time() + NOTICE_SHOW_S
+
+    def refuse_while_running(self, what):
+        """True, after saying so in the window, if a run is in progress.
+
+        The file dialog and the Configure dialog are both modal: while one is
+        open nothing else in the window takes a click, E-STOP included, and Qt
+        holds the Esc shortcut back too. So neither opens during a run, and the
+        refusal is a line in the window rather than another box to click away.
+        """
+        if self.last_fsm_state != "RUNNING":
+            return False
+        self.show_notice(f"Run in progress: stop it before {what}.")
+        return True
+
     def load_csv_dialog(self):
+        # The controller does not swap a profile under a run either.
+        if self.refuse_while_running("loading a profile"):
+            return
         filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Select Lap Telemetry CSV",
@@ -1226,8 +1680,28 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         )
         if filepath:
             self.send_command(("LOAD_CSV", filepath))
-            filename = os.path.basename(filepath)
-            self.lbl_active_csv.setText(f"Profile: {filename}")
+            # The label follows what the controller reports it holds, not what
+            # was picked here: a file it could not read used to be shown as
+            # the profile while the rig went on with the old one.
+            self.profile_wanted = (os.path.basename(filepath), time.time())
+
+    def update_profile_label(self, latest_data):
+        """Show the profile the controller holds, and say if a picked one never took."""
+        if 'profile_name' in latest_data:
+            name = latest_data['profile_name']
+            rows = latest_data.get('profile_rows', 0)
+            self.lbl_active_csv.setText(
+                f"Profile: {name}  ({rows} rows)" if name else "Profile: none loaded")
+        else:
+            name = None
+        if self.profile_wanted:
+            wanted, sent_at = self.profile_wanted
+            if name == wanted:
+                self.profile_wanted = None
+            elif time.time() - sent_at >= PROFILE_ACK_S:
+                self.profile_wanted = None
+                self.show_notice(f"{wanted} was not loaded: the console says why. "
+                                 f"The profile in force is unchanged.")
 
     def refresh_config_label(self):
         pack = self.config.pack
@@ -1267,14 +1741,7 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         apply and save it anyway, so it showed limits that were not protecting
         the rig -- a lowered max temp that was not in force, say.
         """
-        if self.last_fsm_state != "RUNNING":
-            return False
-        QtWidgets.QMessageBox.information(
-            self, "Run in progress",
-            "Stop the run before changing the configuration.\n\n"
-            "The controller does not take a new configuration mid-run, so only "
-            "this window would change.")
-        return True
+        return self.refuse_while_running("changing the configuration")
 
     def open_config_dialog(self):
         if self.refuse_config_while_running():
@@ -1361,9 +1828,13 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.chk_derate.setChecked(limits.derate_enabled)
         self.chk_derate.blockSignals(False)
 
-        self.chk_bank_rated.blockSignals(True)
-        self.chk_bank_rated.setChecked(limits.bank_rated_power_only)
-        self.chk_bank_rated.blockSignals(False)
+        for box, ticked in ((self.chk_bank_rated, limits.bank_rated_power_only),
+                            (self.chk_load_check, limits.load_check_enabled),
+                            (self.chk_derive, limits.derive_from_pack)):
+            box.blockSignals(True)
+            box.setChecked(ticked)
+            box.blockSignals(False)
+        self.refresh_setup_notices()
 
         self.lim_v_warn = limits.warn_volts
         self.lim_v_crit = limits.min_volts
@@ -1428,10 +1899,91 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.config.limits.bank_rated_power_only = self.chk_bank_rated.isChecked()
         self.send_command(("SET_LIMITS", self.config.limits.to_command_dict()))
 
+    def handle_load_check_change(self):
+        # Not derived from the pack either, so it leaves derivation alone.
+        self.config.limits.load_check_enabled = self.chk_load_check.isChecked()
+        self.refresh_setup_notices()
+        self.send_command(("SET_LIMITS", self.config.limits.to_command_dict()))
+
+    def handle_derive_change(self):
+        """Pack derivation switched on or off from the sidebar.
+
+        On: the derived values replace whatever the boxes held, are shown, and
+        go to the controller. Off: the values stay as they are, and now survive
+        the next load. A threshold edit switches it off by the same route.
+        """
+        limits = self.config.limits
+        limits.derive_from_pack = self.chk_derive.isChecked()
+        if limits.derive_from_pack:
+            limits.apply_pack_derivation(self.config.pack)
+        self.apply_config_to_widgets()
+        self.send_command(("SET_LIMITS", limits.to_command_dict()))
+
+    def refresh_setup_notices(self):
+        """Show, in amber, the settings that are fine on a bench and not on a module."""
+        notices = setup_notices(self.config)
+        self.lbl_setup_notices.setText("  ·  ".join(short for short, _ in notices))
+        self.lbl_setup_notices.setToolTip("\n".join(f"- {full}" for _, full in notices))
+        self.lbl_setup_notices.setVisible(bool(notices))
+
+    def configure_override_box(self, mode):
+        """Set the value box's unit and range for `mode`, showing that mode's last value.
+
+        Signals blocked: changing the range can move the value, and that must
+        not send an override the operator never chose.
+        """
+        spec = OVERRIDE_SPINS[mode or "RESISTANCE"]
+        box = self.sb_override
+        box.blockSignals(True)
+        box.setSuffix(f" {spec['unit']}")
+        box.setRange(spec['low'], spec['high'])
+        box.setSingleStep(spec['step'])
+        box.setValue(self.override_values[mode or "RESISTANCE"])
+        box.setEnabled(mode is not None)
+        box.blockSignals(False)
+
+    def handle_override_mode(self):
+        mode = self.cmb_override.currentData()
+        self.configure_override_box(mode)
+        self.send_override()
+
+    def handle_override_value(self):
+        mode = self.cmb_override.currentData()
+        if mode is not None:
+            self.override_values[mode] = self.sb_override.value()
+            self.send_override()
+
+    def send_override(self):
+        cmd = override_command(self.cmb_override.currentData(), self.sb_override.value())
+        self.override_wanted = cmd[1:] if cmd[1] is not None else None
+        self.override_sent_at = time.time()
+        self.send_command(cmd)
+
+    def show_override_status(self, text, colour):
+        if (text, colour) != self.shown_override_status:
+            self.shown_override_status = (text, colour)
+            self.lbl_override_status.setText(text)
+            self.lbl_override_status.setStyleSheet(
+                f"color: {colour}; font-size: {theme.SIZE_SMALL}px; font-weight: 600;")
+
+    def update_override_status(self, latest_data):
+        """What the controller is holding, in amber while an override is in force,
+        or in red once it has not taken this window's choice within the grace."""
+        in_force = latest_data.get('load_override')
+        in_force = tuple(in_force) if in_force else None
+        status = override_status(in_force, latest_data.get('fsm_state', ''),
+                                 latest_data.get('target_resistance', 0.0))
+        if (in_force != self.override_wanted
+                and time.time() - self.override_sent_at >= SETTINGS_ACK_GRACE_S):
+            self.show_override_status(f"NOT IN FORCE. Controller: {status}", theme.DANGER)
+        else:
+            self.show_override_status(status, theme.WARNING if in_force else theme.TEXT_DIM)
+
     def toggle_heatmap(self):
         if self.heatmap_window is None:
             self.heatmap_window = HeatmapWindow(
-                self.config.pack.series_count, self.config.pack.parallel_count)
+                self.config.pack.series_count, self.config.pack.parallel_count,
+                self.config.daq.busbar_sensor_count)
 
         if self.heatmap_window.isVisible():
             self.heatmap_window.hide()
@@ -1465,19 +2017,12 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             log_dir = os.path.join(PROJECT_DIR, "logs")
             os.makedirs(log_dir, exist_ok=True)
             filename = os.path.join(log_dir, f"telemetry_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-            self.csv_file = open(filename, 'w', newline='')
+            # Line buffered: every row reaches the disk as it is written, so a
+            # crash or a pulled plug loses nothing already recorded.
+            self.csv_file = open(filename, 'w', newline='', buffering=1)
             self.csv_writer = csv.writer(self.csv_file)
-
-            series = self.config.pack.series_count
-            parallel = self.config.pack.parallel_count
-
-            headers = ["Timestamp", "Pack_V", "Amps", "Power_kW", "Max_Temp", "SOC_Est", "FSM_State", "Target_Res"]
-            headers.extend([f"Cell_{i + 1}_V" for i in range(series)])
-            for s in range(1, series + 1):
-                for p in range(1, parallel + 1):
-                    headers.append(f"S{s}_T{p}")
-
-            self.csv_writer.writerow(headers)
+            self.last_logged_sample = None
+            self.csv_writer.writerow(record_headers(*self.record_shape()))
         else:
             self.is_logging = False
             self.btn_record.setText("Record")
@@ -1489,12 +2034,27 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.close()
             return
 
-        latest_data = None
+        # Every packet waiting, oldest first. The window draws the newest; the
+        # recording takes them all. It used to keep only the newest, so two
+        # samples arriving inside one 50 ms tick left one out of the file.
+        packets = []
         while not self.queue.empty():
             try:
-                latest_data = self.queue.get_nowait()
+                packets.append(self.queue.get_nowait())
             except Empty:
                 break
+        latest_data = packets[-1] if packets else None
+
+        now = time.time()
+        if self.notice_until is not None and now >= self.notice_until:
+            self.notice_until = None
+            self.lbl_notice.setVisible(False)
+        if packets:
+            self.last_packet_at = now
+            if self.is_logging and self.csv_writer:
+                for packet in packets:
+                    self.record_packet(packet, now)
+        self.update_telemetry_banner(now)
 
         if latest_data:
             volts = latest_data['voltage']
@@ -1520,11 +2080,21 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 self.lbl_arm_refused.setVisible(bool(refusals))
 
             self.update_settings_mismatch(latest_data)
+            self.update_override_status(latest_data)
+            self.update_profile_label(latest_data)
 
             fsm_state = latest_data.get('fsm_state', 'DISCONNECTED')
             self.last_fsm_state = fsm_state
             self.lbl_fsm_state.setStyleSheet(theme.fsm_style(fsm_state))
             self.lbl_fsm_state.setText(fsm_state)
+
+            fault = (latest_data.get('fault_reason') or "", latest_data.get('fault_detail', []))
+            if fault != self.shown_fault:
+                self.shown_fault = fault
+                self.lbl_fault_reason.setText(fault_summary(*fault))
+                self.lbl_fault_reason.setToolTip("\n".join(
+                    line.strip() for line in [fault[0]] + list(fault[1]) if line.strip()))
+                self.lbl_fault_reason.setVisible(bool(fault[0]))
 
             cur_lap = latest_data.get('current_lap', 0)
             tot_laps = latest_data.get('total_laps', 0)
@@ -1565,8 +2135,27 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.lbl_delta_v.setText(f"ΔV   {delta_v:.3f} V")
             self.lbl_delta_v.setStyleSheet(theme.delta_v_style(delta_v))
 
-            if self.heatmap_window and self.heatmap_window.isVisible() and temps:
-                self.heatmap_window.update_temps(temps, self.lim_t_crit)
+            busbar_temps = latest_data.get('busbar_temps', [])
+            busbar_limit = self.config.limits.busbar_max_temp_c
+            if self.card_busbar is not None:
+                read = [t for t in busbar_temps if t is not None]
+                if read:
+                    hottest = max(read)
+                    colour = theme.TEXT
+                    if hottest >= busbar_limit:
+                        colour = theme.DANGER
+                    elif hottest >= busbar_limit - 10.0:
+                        colour = theme.WARNING
+                    self.card_busbar.set_value(f"{hottest:.1f} °C", colour)
+                else:
+                    self.card_busbar.set_value("--- °C", theme.TEXT_MUTED)
+
+            if self.heatmap_window and self.heatmap_window.isVisible():
+                if temps:
+                    self.heatmap_window.update_temps(temps, self.lim_t_crit)
+                self.heatmap_window.update_busbars(
+                    busbar_temps, latest_data.get('busbar_temp_ages_s', []),
+                    busbar_limit, self.config.limits.temp_stale_timeout_s)
 
             if self.resistor_map_window and self.resistor_map_window.isVisible():
                 self.resistor_map_window.update_banks(
@@ -1592,36 +2181,53 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 self.p_voltage.setXRange(self.time_data[0], self.time_data[-1], padding=0)
                 self.p_current.setXRange(self.time_data[0], self.time_data[-1], padding=0)
 
-            if self.is_logging and self.csv_writer:
-                row_data = [
-                    round(current_time, 3), round(volts, 2), round(amps, 2),
-                    round(latest_data.get('power_kw', 0), 2), round(max_t, 2),
-                    round(true_soc, 1), fsm_state, round(latest_data.get('target_resistance', 0.0), 2)
-                ]
+    def record_shape(self):
+        """(series, parallel, banks, bus bars) the recording's columns are laid out for."""
+        return (self.config.pack.series_count, self.config.pack.parallel_count,
+                len(self.config.daq.resistor_tc_channels),
+                max(0, self.config.daq.busbar_sensor_count))
 
-                # Pad/truncate to the configured pack size so every row matches
-                # the header width even if the hardware reports a different count.
-                series = self.config.pack.series_count
-                sensor_count = series * self.config.pack.parallel_count
+    def record_packet(self, packet, received_at):
+        """Write one packet to the recording, unless it is a sample already written.
 
-                # Pad short rows with EMPTY fields, not 0.0. A missing sensor and
-                # a sensor genuinely reading 0.0 are different events -- one is a
-                # wiring fault, the other a dead cell -- and writing 0.0 for both
-                # makes them indistinguishable in the log forever after. An empty
-                # CSV field reads back as NaN in pandas and plots as a gap.
-                cell_row = [round(v, 3) for v in cells][:series]
-                cell_row += [''] * (series - len(cell_row))
-                row_data.extend(cell_row)
+        When the DAQ goes quiet the logic process sends its last packet again
+        with a greater age, so the same reading used to be recorded several
+        times over, each with a new time.
+        """
+        sampled_at = packet.get('sampled_at')
+        if sampled_at is not None and sampled_at == self.last_logged_sample:
+            return
+        self.last_logged_sample = sampled_at
+        try:
+            self.csv_writer.writerow(
+                record_row(packet, self.start_time, *self.record_shape(),
+                           received_at=received_at))
+        except (OSError, ValueError) as exc:
+            # A full disk or a file closed under us must not stop the window:
+            # E-STOP runs through the same timer.
+            self.is_logging = False
+            self.btn_record.setChecked(False)
+            self.btn_record.setText("Record")
+            self.show_notice(f"Recording stopped: {exc}")
 
-                flat_temps = []
-                for bus in temps:
-                    flat_temps.extend(bus)
-
-                temp_row = [round(t, 1) for t in flat_temps][:sensor_count]
-                temp_row += [''] * (sensor_count - len(temp_row))
-                row_data.extend(temp_row)
-
-                self.csv_writer.writerow(row_data)
+    def update_telemetry_banner(self, now):
+        """Say so, over the state banner, when the logic process has gone quiet."""
+        lost = telemetry_lost_for(now, self.opened_at, self.last_packet_at)
+        if lost is not None:
+            self.telemetry_lost = True
+            self.lbl_fsm_state.setStyleSheet(theme.fsm_style("FAULT"))
+            self.lbl_fsm_state.setText(f"NO TELEMETRY  {lost:.0f} s")
+            self.lbl_fsm_state.setToolTip(
+                "Nothing has arrived from the logic process. Every reading in this "
+                "window is the last one it sent, not a live one.\n"
+                "The resistor controller opens the contactor by itself 2 s after the "
+                "logic process stops talking to it.\n"
+                "Check the console, then close and restart the rig.")
+        elif self.telemetry_lost:
+            self.telemetry_lost = False
+            self.lbl_fsm_state.setToolTip("")
+            self.lbl_fsm_state.setStyleSheet(theme.fsm_style(self.last_fsm_state))
+            self.lbl_fsm_state.setText(self.last_fsm_state)
 
     def closeEvent(self, event):
         self.stop_event.set()

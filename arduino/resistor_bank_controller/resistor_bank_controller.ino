@@ -13,7 +13,12 @@ bool noSignalAnnounced = false;
 // ================= HARDWARE CONFIGURATION =================
 const int RELAY_MAIN_PIN = 4;       // Main relay d4
 const int BANK_1_RELAY   = 5;        // Bank 1, 0.25 ohm: the LAST character
-const int otherRelayPins[] = {12, 11, 10, 9, 8, 7, 6}; // Banks 8 (32 ohm) down to 2 (0.5 ohm)
+// Banks 8 (32 ohm) down to 2 (0.5 ohm). Pins 10 and 11 are not in order: on the
+// bench in October 2026 the relay on pin 11 bypassed the 8 ohm bank and the one
+// on pin 10 the 16 ohm bank, so 16 ohm (the 2nd character) drives pin 10 and
+// 8 ohm (the 3rd) pin 11. Meter with tools/bench_relay_check.py `walk` after
+// any rewiring.
+const int otherRelayPins[] = {12, 10, 11, 9, 8, 7, 6};
 const int numOtherRelays = sizeof(otherRelayPins) / sizeof(otherRelayPins[0]);
 
 // One character per ladder relay: otherRelayPins in order, then BANK_1_RELAY.
@@ -30,8 +35,41 @@ const int RELAY_OPEN  = LOW;  // LED OFF
 const int RELAY_CLOSE = HIGH;  // LED ON
 
 // ================= CLOCK VARIABLES =================
-unsigned long lastConnectionTime = 0;  
-const long TIMEOUT_LIMIT = 2000;        
+unsigned long lastConnectionTime = 0;
+const long TIMEOUT_LIMIT = 2000;
+
+// ================= HARDWARE WATCHDOG =================
+// The serial watchdog above is checked by loop(), so it only works while
+// loop() is running. If the sketch itself hangs, nothing in it would ever
+// open the contactor again, and the host cannot tell: its writes still succeed.
+// The chip's own watchdog timer is a separate circuit. loop() resets it every
+// pass; if a pass ever takes more than 2 s the chip restarts, setup() opens
+// every relay and prints the start-up banner, and the host reads that as
+// CONTROLLER RESET.
+//
+// A pass never takes that long in health: the slowest is a part-line that
+// readStringUntil() waits 1 s for, plus 100 ms of relay sequencing.
+//
+// Only on the classic AVR boards (Uno, Nano, Mega), which is what the guard
+// below tests for. Elsewhere the sketch builds without it, as it does for the
+// PC test harness. One caution: a Nano still on its OLD bootloader does not
+// switch the watchdog off after a watchdog restart, so the board then restarts
+// over and over until its power is cycled. The relays stay released
+// throughout, so the load stays off, but the board must be power-cycled.
+#if defined(__AVR__)
+#include <avr/io.h>
+#include <avr/wdt.h>
+#endif
+#if defined(__AVR__) && defined(MCUSR) && defined(WDTO_2S)
+#define HARDWARE_WATCHDOG 1
+// Runs before setup(), straight after any restart: the watchdog stays armed
+// across one, and must be switched off before the slow part of start-up.
+void stopWatchdogAtBoot(void) __attribute__((naked, used, section(".init3")));
+void stopWatchdogAtBoot(void) {
+  MCUSR = 0;
+  wdt_disable();
+}
+#endif
 
 // ================= SETUP =================
 void setup() {
@@ -48,11 +86,21 @@ void setup() {
   }
 
   Serial.begin(9600);
+  // The host reads this line. After the port has settled it means the board
+  // restarted (CONTROLLER_LINES in control_logic.py). Keep its first words.
   Serial.println("Arduino Ready. Waiting for Binary Signal...");
+
+#ifdef HARDWARE_WATCHDOG
+  wdt_enable(WDTO_2S);
+#endif
 }
 
 // ================= MAIN LOOP =================
 void loop() {
+
+#ifdef HARDWARE_WATCHDOG
+  wdt_reset();
+#endif
 
   // 1. WATCHDOG CHECK
   if (millis() - lastConnectionTime > TIMEOUT_LIMIT) {
@@ -102,13 +150,19 @@ void loop() {
       return;
     }
 
-    feedWatchdog();
-
     // SAFETY INTERLOCK
+    // All zeros would bypass every bank at once: a dead short across the
+    // module. It used to be turned into 00000001, bank 1 alone, which is the
+    // heaviest load the ladder has: about 200 A from a full module, applied in
+    // answer to a line that should never have arrived. It is now refused like
+    // any other line that is not a command: no relay moves and the watchdog is
+    // not fed. The host never sends it (encode_steps in control_logic.py).
     if (isAllZeros(incomingData)) {
-       Serial.println("SAFETY ACTION: All-Zero detected. Adjusting...");
-       incomingData.setCharAt(incomingData.length() - 1, '1');
+       Serial.println("Error: Rejected. All zeros would short the bank.");
+       return;
     }
+
+    feedWatchdog();
 
     // Only now, holding a complete and valid resistance command, connect the
     // bank. When the main relay is open every ladder relay is open too

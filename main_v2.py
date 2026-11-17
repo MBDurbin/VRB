@@ -50,12 +50,19 @@ if __name__ == '__main__':
     # process's device.
     discovery_lock = Lock()
 
-    # 1. Start the FSM Control Logic Process
-    logic_process = Process(target=run_logic_process, args=(daq_queue, telemetry_queue, gui_cmd_queue, stop_event, discovery_lock, estop_event)) #pakage queues and send to logic in seperate CPU
-    logic_process.start() #initialize ^
-
-    # 2. Check for the Developer Dongle
+    # 1. Check for the Developer Dongle, before anything else is started.
+    #
+    # This sweep used to run while the logic process, already started, swept the
+    # same ports for the resistor controller, and it never took discovery_lock.
+    # Whichever opened a port second was refused, so the dongle could be missed
+    # or the controller found late, and each open reset the board on that port.
+    # Nothing else is probing yet, so here it has the ports to itself. The logic
+    # process is also told the answer: see sil_mode in run_logic_process.
     is_sil_mode = detect_sil_key() # are we in SIL mode?
+
+    # 2. Start the FSM Control Logic Process
+    logic_process = Process(target=run_logic_process, args=(daq_queue, telemetry_queue, gui_cmd_queue, stop_event, discovery_lock, estop_event, is_sil_mode)) #pakage queues and send to logic in seperate CPU
+    logic_process.start() #initialize ^
 
     if is_sil_mode:
         # --- DESKTOP SIL MODE ---

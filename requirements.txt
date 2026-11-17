@@ -1,0 +1,23 @@
+# What the rig, its tools and its tests import. Python 3.10 or newer: the rig
+# compares time.perf_counter() between processes, which is one system-wide clock
+# on Windows only from 3.10.
+#
+#     python -m pip install -r requirements.txt
+#
+# The lower bounds are the versions the rig was developed and tested on in
+# November 2026 (Python 3.12, Windows 11).
+
+# The rig: main_v2.py and the modules beside it
+PyQt6>=6.11
+pyqtgraph>=0.14
+pyserial>=3.5
+nidaqmx>=1.4        # also needs NI-DAQmx itself, installed from ni.com
+pandas>=2.2
+numpy>=2.1
+
+# The unit tests
+pytest>=7.4
+
+# analysis/ only: the cooling and thermal studies, not the running rig
+matplotlib>=3.9
+scipy>=1.15

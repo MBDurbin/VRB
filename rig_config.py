@@ -105,13 +105,15 @@ class VehicleParams:
     # Dry mass of the car itself: chassis, battery, motor, bodywork, fluids.
     # Feeds BOTH the inertia term (F = ma) and the rolling-resistance term (via
     # weight pressing the tyres down), so an error here shifts the whole power
-    # curve, not just acceleration.
-    mass_car_kg: float = 260.0 #kg
+    # curve, not just acceleration. 233 kg is the 2026 car as weighed, with
+    # today's nine-module pack; a different pack changes it by the pack's mass.
+    mass_car_kg: float = 233.0 #kg
 
     # Driver mass, kept separate from the car so it can be changed per driver
     # without touching the chassis figure. Summed with the above in
-    # total_mass_kg; the physics never uses either one alone.
-    mass_driver_kg: float = 70.0 #kg
+    # total_mass_kg; the physics never uses either one alone. 95.3 kg is the
+    # team's heaviest driver (210 lb): the worst case for energy and current.
+    mass_driver_kg: float = 95.3 #kg
 
     # Rotational inertia of wheels, brake rotors, axles and drivetrain, modelled
     # as extra "virtual" mass. Applies to acceleration ONLY: spinning components
@@ -223,9 +225,11 @@ class PackConfig:
 
     Defaults describe the Reliance RS50 (21700, 5000 mAh, 70 A) in 12S4P, the
     cell installed since it replaced the Molicel P45B. The capacity, voltage,
-    current and temperature figures are the supplier's listing (see
-    datasheets/README.md); the 2.5 V cutoff and 4.0 mOhm impedance are not on
-    it and still want a datasheet. Replace with your own cell's numbers.
+    current and temperature figures are the supplier's listing; the 6.5 mOhm
+    impedance is Mooch's independent test (October 2025), which also confirms
+    the 4950 mAh and the 70 A-to-80 C rating. There is still no manufacturer
+    datasheet, so the 2.5 V cutoff is the usual figure for the class (see
+    datasheets/README.md). Replace with your own cell's numbers.
 
     THE RULE FOR THIS CLASS: every field is a number you can read directly off a
     cell datasheet or count off the physical pack. Nothing here is calculated by
@@ -277,7 +281,16 @@ class PackConfig:
     # safety-critical number in this file: it sets the over-current trip for the
     # whole rig via max_current_a below. Check the datasheet carefully -- many
     # cells quote a higher "pulse" rating that must NOT be used here.
-    cell_max_continuous_a: float = 70
+    #
+    # The RS50's 70 A is a temperature-limited rating: Mooch's test (Oct 2025)
+    # holds 70 A only until the cell reaches 80 C, and puts its true continuous
+    # rating at 40 A. 70 A stands here because the rig enforces the condition:
+    # every cell has a temperature sensor and the over-temp trip sits at or
+    # below 80 C. The sensors sit on the cell tops, which read cooler than the
+    # side wall a cell test measures, so keep the trip under 80 (rig_config.json
+    # ships 65). A run held above 40 A/cell (160 A for 4P) for long ends on the
+    # temperature trip, not the current one.
+    cell_max_continuous_a: float = 70.0
 
     # Fully-charged resting voltage of one cell. Sets the top of the pack's
     # voltage range. Not a trip threshold; it is a reference for the GUI's plot
@@ -300,16 +313,18 @@ class PackConfig:
     # can be lower than the cut-off quoted beside a current rating. The old P45B
     # listed 60 C operating but an 80 C cut-off for its 45 A test, and 60 was the
     # right figure. The RS50 listing gives only its 70 A rating "with 80 C
-    # temperature cut-off", so 80 it is -- lower it if a datasheet gives a
-    # narrower discharge range.
+    # temperature cut-off", and Mooch's test rates it the same way, so 80 it is
+    # -- lower it if a datasheet gives a narrower discharge range.
     cell_max_temp_c: float = 80.0           # discharge ceiling
 
     # DC internal resistance of one cell, in milliohms, measured at 50% state of
     # charge. Drives the sag calculations: series adds and parallel divides, so
-    # 4 mOhm in 12S4P gives a 12 mOhm module, sagging 3.4 V at the 280 A rating.
-    # Not on the RS50 listing: an estimate until a datasheet or a bench
-    # measurement replaces it.
-    cell_dc_milliohm: float = 4.0         # DC impedance at 50% SOC
+    # 6.5 mOhm in 12S4P gives a 19.5 mOhm module, sagging 5.5 V at the 280 A
+    # rating. Not on the RS50 listing: 6.5 is Mooch's DC measurement (Oct 2025).
+    # Over a sustained discharge the cell sags more, about 8 mOhm effective, as
+    # polarisation builds. tools/dcir_from_log.py measures this module's own
+    # cells at 1 s and 10 s.
+    cell_dc_milliohm: float = 6.5         # DC impedance at 50% SOC
 
     # Use minimum rather than typical capacity for SOC. Conservative: a worst-case
     # pack really does hold less, and overstating SOC is the dangerous direction.
@@ -385,6 +400,15 @@ class PackConfig:
     # current figures above already apply to the whole battery unchanged.
 
     @property
+    def bus_bar_count(self) -> int:
+        """Bus bars joining one series group to the next within the module: S - 1.
+
+        Eleven for 12S. The two end terminals are not counted: they join the
+        module to the bank, not one group of cells to another.
+        """
+        return max(0, self.series_count - 1)
+
+    @property
     def battery_cell_count(self) -> int:
         """Every cell in the car: 48 per module x 9 modules = 432."""
         return self.cell_count * self.modules_in_series
@@ -426,8 +450,8 @@ class PackConfig:
 
     def sag_volts(self, current_a: float) -> float:
         """Voltage drop across pack internal resistance at a given current."""
-        # Ohm's law. At the RS50 module's 280 A rating with 12 mOhm this is
-        # 3.4 V (the old P45B's 45 mOhm sagged 8.1 V at its 180 A), which is why
+        # Ohm's law. At the RS50 module's 280 A rating with 19.5 mOhm this is
+        # 5.5 V (the old P45B's 45 mOhm sagged 8.1 V at its 180 A), which is why
         # the undervoltage trip cannot sit at the cells' absolute cutoff.
         return current_a * self.resistance_ohm
 
@@ -481,19 +505,33 @@ PACK_FIELD_LABELS = {
 # error, so double-check against the physical wiring.
 #
 # The "cDAQ1ModN/aiM" form is National Instruments' addressing: chassis 1,
-# module N, analog input M. Each module here carries 4 inputs, so 12 taps plus
-# one current channel spans four modules.
+# module N, analog input M.
+#
+# The taps are on an NI 9205 in slot 8, read single-ended against its COM
+# (voltage_terminal_config), through an NI 9923 screw-terminal block. The 9923's
+# terminal numbers are the D-SUB pin numbers, and the 9205's D-SUB does NOT run
+# in channel order: pins 1-8 are AI0-AI7, pin 9 is a digital output (DO0), pin
+# 10 is COM, pins 11-18 are AI16-AI23, and pins 20-27 are AI8-AI15 (NI 9205
+# Getting Started Guide, Figure 1). So taps 1-9 are on terminals 2-8, 20 and 21
+# (AI1-AI9), taps 10-12 on terminals 11-13 (AI16-AI18), and the tap ground on
+# terminal 10 (COM). tools/tap_map_check.py reads every input to confirm it.
 DEFAULT_VOLTAGE_CHANNELS = [
-    "cDAQ1Mod8/ai1", "cDAQ1Mod8/ai2", "cDAQ1Mod8/ai3",
-    "cDAQ1Mod7/ai0", "cDAQ1Mod7/ai1", "cDAQ1Mod7/ai2", "cDAQ1Mod7/ai3",
-    "cDAQ1Mod6/ai0", "cDAQ1Mod6/ai1", "cDAQ1Mod6/ai2", "cDAQ1Mod6/ai3",
-    "cDAQ1Mod5/ai0",
+    "cDAQ1Mod8/ai1", "cDAQ1Mod8/ai2", "cDAQ1Mod8/ai3", "cDAQ1Mod8/ai4",
+    "cDAQ1Mod8/ai5", "cDAQ1Mod8/ai6", "cDAQ1Mod8/ai7", "cDAQ1Mod8/ai8",
+    "cDAQ1Mod8/ai9", "cDAQ1Mod8/ai16", "cDAQ1Mod8/ai17", "cDAQ1Mod8/ai18",
 ]
 
 # Thermocouple inputs for resistor banks 1-4, in bank order. See DaqConfig.
+# Every other jack of the NI 9212's TB-9212 mini-TC block: TC0, TC2, TC4, TC6.
 DEFAULT_RESISTOR_TC_CHANNELS = [
-    "cDAQ1Mod3/ai0", "cDAQ1Mod3/ai1", "cDAQ1Mod3/ai2", "cDAQ1Mod3/ai3",
+    "cDAQ1Mod6/ai0", "cDAQ1Mod6/ai2", "cDAQ1Mod6/ai4", "cDAQ1Mod6/ai6",
 ]
+
+# How each voltage tap is measured, as nidaqmx's TerminalConfiguration names it.
+# RSE is single-ended against the module's COM, which is how the 9205 is wired.
+# DEFAULT leaves it to the driver, which on a 9205 can pair channels as
+# differential inputs (AI1 against AI9): two taps read as one meaningless value.
+TERMINAL_CONFIGS = ("RSE", "NRSE", "DIFF", "DEFAULT")
 
 # Accepted values for the thermocouple settings, kept here so rig_config does
 # not have to import nidaqmx. They are the member names of nidaqmx's
@@ -501,11 +539,24 @@ DEFAULT_RESISTOR_TC_CHANNELS = [
 # separate CJC channel this config has no field for.
 THERMOCOUPLE_TYPES = ("B", "E", "J", "K", "N", "R", "S", "T")
 CJC_SOURCES = ("BUILT_IN", "CONSTANT_USER_VALUE")
+# nidaqmx ADCTimingMode names for the thermocouple module. DEFAULT leaves the
+# module's own; a module without the setting (an NI 9211) needs DEFAULT.
+TC_ADC_MODES = ("HIGH_SPEED", "HIGH_RESOLUTION", "DEFAULT")
+
+# What a DS18B20 can measure. A reading outside it is a sensor fault, not a
+# temperature, and a trip set above the top of it could never fire.
+DS18B20_MIN_C = -55.0
+DS18B20_MAX_C = 125.0
+
+# The range a per-tap gain may take (DaqConfig.voltage_tap_gains). A divider of
+# 1% resistors is within about 2% of its nominal ratio; 10% is a wrong part.
+# NaN falls outside it, as every comparison with NaN is False.
+TAP_GAIN_MIN = 0.90
+TAP_GAIN_MAX = 1.10
 
 
 @dataclass
 class DaqConfig:
-    #NOTE: NEED TO VERIFY WHEN BACK IN UTAH
     """NI-DAQ channel mapping, scaling, and temperature bus layout.
 
     Channel names and sensor counts describe physical wiring, so they cannot be
@@ -528,7 +579,11 @@ class DaqConfig:
     # also appear in voltage_channels; validate() checks for that collision
     # because miswiring it would silently turn a current reading into a cell
     # voltage.
-    current_channel: str = "cDAQ1Mod8/ai0"
+    #
+    # The LEM sensor is on the NI 9215 in slot 7, channel ai0: signal on screw
+    # terminal 0 (AI0+), its 0 V on terminal 1 (AI0-) and on terminal 9 (COM).
+    # The 9215 is differential only, which is what the driver's default gives.
+    current_channel: str = "cDAQ1Mod7/ai0"
 
     # Ordered list of cumulative voltage taps, one per series group.
     #
@@ -539,6 +594,12 @@ class DaqConfig:
     voltage_channels: List[str] = field(
         default_factory=lambda: list(DEFAULT_VOLTAGE_CHANNELS))
 
+    # How the voltage taps are measured: one of TERMINAL_CONFIGS. RSE for taps
+    # wired to a 9205 against its COM. A module that cannot measure that way
+    # (a 9215 is differential only) stops the DAQ task starting, so the rig
+    # refuses ARM rather than reading the taps some other way.
+    voltage_terminal_config: str = "RSE"
+
     # --- Scaling ---
     # Resistor divider on each tap: a 10:1 divider means multiply by 11.
     #
@@ -547,6 +608,23 @@ class DaqConfig:
     # a 10:1 divider drops to 1/11th, hence 11.0. Get this wrong and every
     # voltage reading -- and therefore every voltage trip -- is off by the ratio.
     voltage_multiplier: float = 11.0
+
+    # One correction per tap, tap 1 first, multiplied in after the divider
+    # multiplier above. Empty means none: every tap takes the multiplier alone.
+    #
+    # Each tap has its own divider, and no two dividers are exactly 10:1. A cell
+    # voltage is the difference of two taps, so the dividers' errors do not
+    # cancel, they grow up the stack: taps 11 and 12 sit near 46 V and 50 V, and
+    # 1% on each can put cell 12 almost a volt out, on a per-cell trip set 0.2 V
+    # above the cutoff. The same mismatch scales cell 12's measured resistance
+    # by up to a fifth, and a bigger current pulse does not shrink it.
+    #
+    # tools/tap_calibrate.py reads every tap and takes a multimeter reading for
+    # each, and prints this list. A value is meter volts over the rig's reading,
+    # so 1.004 means that tap read 0.4% low. Anything outside 0.90 to 1.10 is
+    # not a divider's tolerance but a wrong part or a wrong multiplier, and
+    # blocks ARM, as does a list of the wrong length.
+    voltage_tap_gains: List[float] = field(default_factory=list)
 
     # Current transducer output, amps per volt at the DAQ input.
     # The sensor emits a small voltage proportional to current; this converts it
@@ -560,7 +638,6 @@ class DaqConfig:
     # for a bidirectional current sensor reading below zero during regen.
     ai_min_volts: float = -10.0
     ai_max_volts: float = 10.0
-    #NOTE THIS WILL NEED EDITING WHEN WE ADD THE INBETWEEN TEMPS
     # --- Temperature sensor layout ---
     # DS18B20s on OneWire buses. The Arduino emits one CSV line per bus:
     # "<bus number>,<t1>,...,<tN>", so a line carries sensors_per_bus + 1 fields.
@@ -583,14 +660,35 @@ class DaqConfig:
     # never identified. High because 48 readings per sweep is a lot of text.
     temp_baud_rate: int = 115200
 
+    # --- Bus-bar temperature sensors ---
+    # One DS18B20 on each bus bar that joins one group of parallel cells to the
+    # next: a 12S module has eleven, between S1 and S2 up to between S11 and
+    # S12. Entry 1 is the bar between S1 and S2. See bus_bar_count on PackConfig.
+    #
+    # The cell sensors sit on the cell tops. The bus bars are the current path
+    # itself, so a weld or a bar that is running hot shows here first, and it is
+    # the cell terminal that it heats.
+    #
+    # The temperature Arduino sends them on a line of their own,
+    # "B,<t1>,...,<tN>", after the six cell buses. This is how many it sends.
+    # 0, as shipped, means none are fitted: nothing is expected, checked or
+    # tripped on, and the thermal map shows the eleven places empty. Set it only
+    # once the sensors are on the module and their addresses are in the sketch
+    # (BUSBAR_SENSOR_COUNT in arduino/temperature_sensor_array), because from
+    # then on a bus-bar sensor that does not report faults the rig once armed,
+    # the same as a cell sensor.
+    busbar_sensor_count: int = 0
+
     # --- Resistor bank thermocouples ---
     # One thermocouple per bank on banks 1-4, read by the NI-DAQ rather than the
     # Arduino. Entry i is bank i+1, so ORDER IS MEANINGFUL, as with the voltage
     # taps. Banks 5-8 carry too little current to need one (docs/hardware_topology.md).
     #
-    # Module 3 per Bryce Marshall's bench test (tools/thermocouple_check.py),
-    # which read cDAQ1Mod3/ai0:1. Banks 3 and 4 on ai2/ai3 assume the remaining
-    # inputs of the same module -- check against the wiring.
+    # Slot 6 is an NI 9212 (8 thermocouple channels) with the TB-9212 mini-TC
+    # block, one channel per jack. The banks are on jacks TC0 (bank 1, 0.25
+    # ohm), TC2 (bank 2), TC4 (bank 3) and TC6 (bank 4), checked on the rig in
+    # October 2026. The odd jacks are empty: listing one would read an open
+    # thermocouple, and once armed fault as RESISTOR TC FAULT.
     resistor_tc_channels: List[str] = field(
         default_factory=lambda: list(DEFAULT_RESISTOR_TC_CHANNELS))
 
@@ -605,6 +703,15 @@ class DaqConfig:
     # however far the terminal block is from 25 C.
     resistor_tc_cjc_source: str = "BUILT_IN"
 
+    # How the thermocouple module converts, one of TC_ADC_MODES. The NI 9212's
+    # default, HIGH_RESOLUTION, took 2.2 s to read the four banks (550 ms with
+    # the task kept running), against a 3 s staleness trip. HIGH_SPEED reads them
+    # in 12 ms, so the banks really are read every RESISTOR_TC_PERIOD_S, and read
+    # within 0.1 C of high resolution at room temperature (measured October
+    # 2026). High resolution rejects 50/60 Hz pickup better: switch back if bank
+    # readings jitter with the fan and supplies running.
+    resistor_tc_adc_mode: str = "HIGH_SPEED"
+
     # --- Loop timing ---
     # Target seconds per DAQ cycle. 0.1 s is 10 Hz. The loop sleeps for whatever
     # is left of this interval after reading, so lowering it samples faster at
@@ -612,10 +719,29 @@ class DaqConfig:
     # or normal operation would look like a stalled DAQ.
     sample_period_s: float = 0.1
 
+    def __post_init__(self):
+        # rig_config.json is hand-edited, and a quoted "1.004" would otherwise
+        # reach the DAQ loop as a string. Failing here makes load() fall back to
+        # defaults with a message. NaN converts; safety_problems() blocks on it.
+        self.voltage_tap_gains = [float(g) for g in self.voltage_tap_gains]
+
     @property
     def channel_count(self) -> int:
         """How many voltage taps are configured. Should equal pack.series_count."""
         return len(self.voltage_channels)
+
+    def tap_scales(self):
+        """Volts at the module per volt at the DAQ input, one per tap, tap 1 first.
+
+        The divider multiplier, times that tap's own gain where the gains are a
+        full set. A set of the wrong length is not applied to anything: which
+        tap each value belonged to is no longer known, and safety_problems()
+        blocks ARM on it.
+        """
+        gains = self.voltage_tap_gains
+        if len(gains) != self.channel_count:
+            gains = [1.0] * self.channel_count
+        return [self.voltage_multiplier * g for g in gains]
 
     @property
     def sensor_count(self) -> int:
@@ -687,6 +813,10 @@ class DaqConfig:
         if tc_dupes:
             problems.append(f"Duplicate thermocouple channels: {', '.join(sorted(tc_dupes))}; "
                             f"two banks would show the same temperature.")
+        # Stops the voltage and current task starting, so nothing is measured.
+        if self.voltage_terminal_config not in TERMINAL_CONFIGS:
+            problems.append(f"Voltage input mode '{self.voltage_terminal_config}' is not one "
+                            f"of {', '.join(TERMINAL_CONFIGS)}.")
         # Either one stops the thermocouple task starting, so no bank is read.
         if self.thermocouple_type not in THERMOCOUPLE_TYPES:
             problems.append(f"Thermocouple type '{self.thermocouple_type}' is not one of "
@@ -694,6 +824,9 @@ class DaqConfig:
         if self.resistor_tc_cjc_source not in CJC_SOURCES:
             problems.append(f"Cold-junction source '{self.resistor_tc_cjc_source}' is not one "
                             f"of {', '.join(CJC_SOURCES)}.")
+        if self.resistor_tc_adc_mode not in TC_ADC_MODES:
+            problems.append(f"Thermocouple mode '{self.resistor_tc_adc_mode}' is not one "
+                            f"of {', '.join(TC_ADC_MODES)}.")
         # Zero reads every cell and the current as zero. A negative current scale
         # reads discharge as negative, which never reaches the over-current trip.
         # `not > 0` rather than `<= 0` so a NaN from the JSON is caught too.
@@ -704,6 +837,26 @@ class DaqConfig:
             problems.append(f"Current transducer scale {self.current_amps_per_volt} A/V must "
                             f"be positive, or discharge current never reaches the "
                             f"over-current trip.")
+        # Sizes the bus-bar arrays in the DAQ process. A negative one cannot.
+        if isinstance(self.busbar_sensor_count, bool) or \
+                not isinstance(self.busbar_sensor_count, int) or self.busbar_sensor_count < 0:
+            problems.append(f"Bus-bar sensor count {self.busbar_sensor_count!r} must be a "
+                            f"whole number, 0 for none fitted.")
+        # Tap gains scale the voltages every voltage trip reads. A set that does
+        # not line up with the taps, or a value no divider tolerance explains,
+        # means the cells are not being read as calibrated.
+        gains = self.voltage_tap_gains
+        if gains and len(gains) != self.channel_count:
+            problems.append(
+                f"{len(gains)} tap gains for {self.channel_count} voltage channels. One per "
+                f"tap, tap 1 first, or none; they are not applied until they match.")
+        bad = [i + 1 for i, g in enumerate(gains)
+               if not TAP_GAIN_MIN <= g <= TAP_GAIN_MAX]
+        if bad:
+            problems.append(
+                f"Tap gain(s) for tap {', '.join(map(str, bad))} are outside "
+                f"{TAP_GAIN_MIN:g} to {TAP_GAIN_MAX:g}. That is more than a divider's "
+                f"tolerance: check the tap, or correct the divider multiplier instead.")
 
         return problems
 
@@ -718,7 +871,9 @@ class DaqConfig:
         problems = []
         # One thermistor per cell is the design intent, so the thermal map covers
         # the whole module. A shortfall means hot cells with no sensor on them.
-        if self.sensor_count < pack.cell_count: #CHANGE THIS WHEN WE ADD THE INBETWEEN SENSORS FOR THE MODULES
+        # The bus-bar sensors between the groups are counted separately
+        # (busbar_sensor_count); these are the ones on the cells.
+        if self.sensor_count < pack.cell_count:
             problems.append(
                 f"{self.temp_bus_count} buses x {self.sensors_per_bus} sensors = "
                 f"{self.sensor_count} thermistors, but the pack has "
@@ -729,6 +884,14 @@ class DaqConfig:
             problems.append(
                 f"{self.sensor_count} thermistors configured for {pack.cell_count} cells. "
                 f"Any that are not fitted will read as failed sensors once armed."
+            )
+        # Bus-bar sensors are optional, so none is no problem. A count that is
+        # not one per bus bar still works, but the map cannot place them.
+        if self.busbar_sensor_count and self.busbar_sensor_count != pack.bus_bar_count:
+            problems.append(
+                f"{self.busbar_sensor_count} bus-bar sensors configured, but a "
+                f"{pack.series_count}S module has {pack.bus_bar_count} bus bars between its "
+                f"series groups. The thermal map shows them in a row without placing them."
             )
         # The bank has no thermal protection of its own (docs/hardware_topology.md).
         if not self.resistor_tc_channels:
@@ -745,16 +908,20 @@ class DaqConfig:
 DAQ_FIELD_LABELS = {
     'current_channel':       ("Current channel", ""),
     'voltage_channels':      ("Voltage channels", "comma separated"),
+    'voltage_terminal_config': ("Voltage input mode", "RSE NRSE DIFF DEFAULT"),
     'voltage_multiplier':    ("Divider multiplier", "x"),
+    'voltage_tap_gains':     ("Tap gains", "one per tap, from tools/tap_calibrate.py; blank for none"),
     'current_amps_per_volt': ("Current transducer", "A/V"),
     'ai_min_volts':          ("Analog input min", "V"),
     'ai_max_volts':          ("Analog input max", "V"),
     'temp_bus_count':        ("OneWire bus count", "buses"),
     'sensors_per_bus':       ("Sensors per bus", "sensors"),
     'temp_baud_rate':        ("Temp sensor baud", "baud"),
+    'busbar_sensor_count':   ("Bus-bar sensors", "0 until fitted; one per bus bar"),
     'resistor_tc_channels':  ("Resistor thermocouples", "bank 1 first, comma separated"),
     'thermocouple_type':     ("Thermocouple type", "B E J K N R S T"),
     'resistor_tc_cjc_source': ("Cold-junction source", "BUILT_IN or CONSTANT_USER_VALUE"),
+    'resistor_tc_adc_mode':  ("Thermocouple mode", "HIGH_SPEED HIGH_RESOLUTION DEFAULT"),
     'sample_period_s':       ("DAQ sample period", "s"),
 }
 
@@ -788,7 +955,9 @@ class SafetyLimits:
     # old one's ceiling.
     #
     # Editing a threshold in the GUI sidebar sets this to False automatically, so
-    # a deliberate operator override survives. Hand-editing rig_config.json
+    # a deliberate operator override survives, and the sidebar's "Derive limits
+    # from pack" box sets it True again. While it is False the main window says
+    # LIMITS HAND-SET in amber. Hand-editing rig_config.json
     # without also setting this False means the edit IS discarded on load -- but
     # loudly, via derivation_conflicts() below, not silently.
     derive_from_pack: bool = True
@@ -889,9 +1058,39 @@ class SafetyLimits:
     # what bounds the elements. Banks 5-8 have no thermocouple; at 140% they
     # rely on their rating margin and the fan alone.
     #
+    # Bus-bar over-temperature trip, in Celsius, for every bus-bar sensor
+    # (DaqConfig.busbar_sensor_count). Like the cell trip it applies in EVERY
+    # state. It does nothing while no bus-bar sensors are fitted.
+    #
+    # Not derived from the pack, and edited in rig_config.json: the Configure
+    # dialog does not show limits.
+    #
+    # 80 C is the RS50's own cut-off, the temperature its 70 A rating is quoted
+    # with. A bus bar is welded to the cell terminals, so its temperature is
+    # the terminal's, and the sensor sits on the current path itself. The cell
+    # sensors trip lower (65 C as shipped) because a cell top reads cooler than
+    # the cell; this one needs no such allowance. Lower it if the bars run cool
+    # in practice and you want an earlier warning of a poor weld. Above 125 C,
+    # the top of a DS18B20's range, it could never fire, and blocks ARM.
+    busbar_max_temp_c: float = 80.0
+
     # A switch between two fixed figures rather than a number, so nothing here
     # can raise the bank past 140%. The GUI sidebar toggles it live.
     bank_rated_power_only: bool = False
+
+    # Whether a run is faulted when the measured current does not fit the ladder
+    # setting commanded (LOAD MISMATCH; load_mismatch() in control_logic.py). It
+    # is what notices a wrong bank, a relay or contactor that did not move, a
+    # controller that restarted, or a current sensor that stopped reading.
+    #
+    # Leave it True with a module on. Switch it off only for the bench-supply
+    # tests, where the taps read one supply and the bank runs on another, so the
+    # two do not agree: 44 V on the taps and 30 V on the bank reads 32% low
+    # before any wiring, right on the check's edge, and 43% low once the supply
+    # is in current limit. The main window says so in amber for as long as it is
+    # off, because this file is saved on exit and the setting would otherwise
+    # carry over to a module.
+    load_check_enabled: bool = True
 
     def __post_init__(self):
         # rig_config.json is hand-edited, and a quoted "225" would otherwise reach
@@ -906,7 +1105,7 @@ class SafetyLimits:
     # the string "false" into an error and True into 1.0.
     NUMERIC_FIELDS = ('max_amps', 'amp_buffer', 'max_temp', 'min_volts', 'warn_volts',
                       'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout_s',
-                      'daq_stale_timeout_s', 'derate_start')
+                      'daq_stale_timeout_s', 'derate_start', 'busbar_max_temp_c')
 
     def apply_pack_derivation(self, pack: PackConfig):
         """Recompute limits from the cell datasheet. No-op if derivation is off."""
@@ -1006,6 +1205,13 @@ class SafetyLimits:
                 f"Derate start {self.derate_start:.1f} C is not below max temp "
                 f"{self.max_temp:.1f} C; derating cannot ramp."
             )
+        # Every trip still works without it, but nothing then notices a bank
+        # that is not at the resistance commanded.
+        if not self.load_check_enabled:
+            warnings.append(
+                "The load check is off: a wrong bank, a controller restart or a dead "
+                "current sensor will not fault a run. For bench supplies only."
+            )
         return warnings
 
     def to_command_dict(self):
@@ -1037,7 +1243,9 @@ class SafetyLimits:
             'derate_start': self.derate_start,
             # A copy, so the logic process never shares a list with this object.
             'resistor_max_temp': list(self.resistor_max_temp_c),
+            'busbar_max_temp': self.busbar_max_temp_c,
             'bank_rated_only': self.bank_rated_power_only,
+            'load_check': self.load_check_enabled,
         }
 
 
@@ -1046,7 +1254,7 @@ class SafetyLimits:
 # The command-dict keys every trip compares a reading against.
 NUMERIC_LIMIT_KEYS = ('max_amps', 'amp_buffer', 'max_temp', 'min_volts', 'min_cell_volts',
                       'cell_sense_floor', 'temp_stale_timeout', 'daq_stale_timeout',
-                      'derate_start')
+                      'derate_start', 'busbar_max_temp')
 
 
 def _finite(x):
@@ -1089,6 +1297,13 @@ def rating_exceedances(limits, pack: PackConfig):
             f"Per-cell trip {limits['min_cell_volts']:.2f} V is below the cell's "
             f"{pack.cell_min_voltage:.2f} V cutoff -- a cell would be damaged "
             f"before the trip fires."
+        )
+    # A bus-bar trip past the top of the sensor's range can never be reached:
+    # the DAQ throws away any DS18B20 reading above it as a sensor fault.
+    if limits['busbar_max_temp'] > DS18B20_MAX_C:
+        problems.append(
+            f"Bus-bar trip {limits['busbar_max_temp']:.0f} C is above the "
+            f"{DS18B20_MAX_C:.0f} C a DS18B20 can read, so it could never fire."
         )
     # A resistor trip above what the element is rated for only fires once the
     # element is already past its limit.
@@ -1222,6 +1437,16 @@ class RigConfig:
     def advisories(self):
         """Problems worth showing that leave nothing unwatched. Never block ARM."""
         problems = self.limits.advisories() + self.daq.advisories(self.pack)
+        # A trip below the cutoff blocks ARM. One sitting exactly on it does
+        # not, but it only fires as the cell reaches the voltage that damages
+        # it, and a cell voltage is the difference of two taps, each with its
+        # own error. The bench-supply tests left the file like this once.
+        if math.isclose(self.limits.min_cell_volts, self.pack.cell_min_voltage, abs_tol=1e-6):
+            problems.append(
+                f"Per-cell trip {self.limits.min_cell_volts:.2f} V is the cell's cutoff "
+                f"itself, with no margin for sag or for the taps' own error. Pack "
+                f"derivation sets {self.pack.cell_min_voltage + 0.20:.2f} V."
+            )
         # Limits and channels live in different sections, so only this level can
         # see whether every thermocoupled bank has a trip of its own.
         n_tc, n_lim = len(self.daq.resistor_tc_channels), len(self.limits.resistor_max_temp_c)

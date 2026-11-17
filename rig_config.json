@@ -1,7 +1,7 @@
 {
   "vehicle": {
-    "mass_car_kg": 260.0,
-    "mass_driver_kg": 70.0,
+    "mass_car_kg": 233.0,
+    "mass_driver_kg": 95.3,
     "rotational_mass_factor": 1.0,
     "air_density_kgm3": 1.2255,
     "gravity_ms2": 9.81,
@@ -23,15 +23,15 @@
     "cell_max_voltage": 4.2,
     "cell_nominal_voltage": 3.6,
     "cell_min_voltage": 2.5,
-    "cell_max_temp_c": 80.0,
-    "cell_dc_milliohm": 4.0,
+    "cell_max_temp_c": 65.0,
+    "cell_dc_milliohm": 6.5,
     "use_minimum_capacity": false
   },
   "limits": {
     "derive_from_pack": true,
     "max_amps": 275.0,
     "amp_buffer": 5.0,
-    "max_temp": 80.0,
+    "max_temp": 65.0,
     "min_volts": 36.0,
     "warn_volts": 38.0,
     "min_cell_volts": 2.7,
@@ -45,39 +45,46 @@
       225.0,
       225.0,
       150.0
-    ]
+    ],
+    "busbar_max_temp_c": 80.0,
+    "bank_rated_power_only": false,
+    "load_check_enabled": true
   },
   "daq": {
-    "current_channel": "cDAQ1Mod8/ai0",
+    "current_channel": "cDAQ1Mod7/ai0",
     "voltage_channels": [
       "cDAQ1Mod8/ai1",
       "cDAQ1Mod8/ai2",
       "cDAQ1Mod8/ai3",
-      "cDAQ1Mod7/ai0",
-      "cDAQ1Mod7/ai1",
-      "cDAQ1Mod7/ai2",
-      "cDAQ1Mod7/ai3",
-      "cDAQ1Mod6/ai0",
-      "cDAQ1Mod6/ai1",
-      "cDAQ1Mod6/ai2",
-      "cDAQ1Mod6/ai3",
-      "cDAQ1Mod5/ai0"
+      "cDAQ1Mod8/ai4",
+      "cDAQ1Mod8/ai5",
+      "cDAQ1Mod8/ai6",
+      "cDAQ1Mod8/ai7",
+      "cDAQ1Mod8/ai8",
+      "cDAQ1Mod8/ai9",
+      "cDAQ1Mod8/ai16",
+      "cDAQ1Mod8/ai17",
+      "cDAQ1Mod8/ai18"
     ],
+    "voltage_terminal_config": "RSE",
     "voltage_multiplier": 11.0,
+    "voltage_tap_gains": [],
     "current_amps_per_volt": 100.0,
     "ai_min_volts": -10.0,
     "ai_max_volts": 10.0,
     "temp_bus_count": 6,
     "sensors_per_bus": 8,
     "temp_baud_rate": 115200,
+    "busbar_sensor_count": 0,
     "resistor_tc_channels": [
-      "cDAQ1Mod3/ai0",
-      "cDAQ1Mod3/ai1",
-      "cDAQ1Mod3/ai2",
-      "cDAQ1Mod3/ai3"
+      "cDAQ1Mod6/ai0",
+      "cDAQ1Mod6/ai2",
+      "cDAQ1Mod6/ai4",
+      "cDAQ1Mod6/ai6"
     ],
     "thermocouple_type": "K",
     "resistor_tc_cjc_source": "BUILT_IN",
+    "resistor_tc_adc_mode": "HIGH_SPEED",
     "sample_period_s": 0.1
   }
 }

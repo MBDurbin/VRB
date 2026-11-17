@@ -24,12 +24,12 @@ scholarship; the RS50 replaced it.
 
 | Per module | Value |
 |---|---|
-| Continuous discharge current | 280 A (70 A × 4P) |
+| Continuous discharge current | 280 A (70 A × 4P) until the cells reach 80 °C; 160 A (40 A × 4P) for a whole discharge |
 | Capacity | 20.0 Ah (19.8 Ah minimum) |
 | Charge voltage | 50.4 V |
 | Nominal voltage | 43.2 V |
 | Discharge cutoff | 30.0 V (2.5 V/cell; not on the RS50 listing — confirm) |
-| Internal resistance | 0.012 Ω (4 mΩ/cell; an estimate — confirm) |
+| Internal resistance | 0.0195 Ω (6.5 mΩ/cell, Mooch's measurement, October 2025) |
 | Discharge temperature limit | 80 °C |
 
 ---
@@ -117,14 +117,16 @@ tidy.
 The command is a binary word representing **4 × the target resistance in ohms**
 (equivalently, the number of 0.25 Ω steps), **most significant bank first**: 32 Ω
 is `10000000`, 0.25 Ω is `00000001`. A `1` opens that bank's bypass relay and
-puts the bank in circuit. A received `00000000` is converted to `00000001` —
-0.25 Ω — so the bank is never commanded to zero resistance.
+puts the bank in circuit. `00000000` would bypass every bank at once, a dead
+short, so the firmware refuses it and moves nothing. (It used to convert it to
+`00000001`, bank 1 alone: the heaviest load the ladder has. A board still on a
+sketch from before November 2026 does that.) The host never sends it.
 
 | Character | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
 |---|---|---|---|---|---|---|---|---|
 | Bank | 8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 |
 | Resistance | 32 Ω | 16 Ω | 8 Ω | 4 Ω | 2 Ω | 1 Ω | 0.5 Ω | 0.25 Ω |
-| Arduino pin | 12 | 11 | 10 | 9 | 8 | 7 | 6 | 5 |
+| Arduino pin | 12 | **10** | **11** | 9 | 8 | 7 | 6 | 5 |
 
 The main contactor is pin 4. In software this table is `COMMAND_BANKS` and
 `BANK_RELAY_PIN` in `control_logic.py`; `tests/test_firmware_bank_map.py`
@@ -132,10 +134,20 @@ compiles the firmware and checks every one of the 255 settings against it.
 
 The host used to send the word reversed, least significant bank first, so 32 Ω
 arrived as `00000001` and switched in bank 1 alone: about 202 A / 10 kW at
-50.4 V instead of 1.6 A / 79 W. **Pin 5 is the only bank the firmware names.**
-That pins 6–12 carry banks 2–8 in order follows from the word being binary, and
-only a meter proves it: run `python tools/bench_relay_check.py`, `walk`, with
-the battery disconnected, before the first run and after any rewiring.
+50.4 V instead of 1.6 A / 79 W.
+
+**Which pin bypasses which bank is the relay board's wiring, and only a meter
+proves it**: run `python tools/bench_relay_check.py`, `walk`, with the battery
+disconnected, before the first run and after any rewiring. The October 2026
+walk found pin 10 on the 16 Ω bank and pin 11 on the 8 Ω bank, the other way
+round from the binary order, so the firmware and `BANK_RELAY_PIN` swap them.
+
+Outside a run the host sends `KILL` twice a second, and `alive` only while
+running. It also reads what the controller prints: a restart, the controller's
+own watchdog firing mid-run, and a rejected line are all acted on. And it
+checks the current it measures against the resistance it commanded, which is
+what would have caught both the reversed word and the crossed relays without a
+meter. See Safety layers in `PROJECT_CONTEXT.md`.
 
 Firmware: `arduino/resistor_bank_controller/`.
 
@@ -149,8 +161,9 @@ add up to significant capacitance.
 
 Sensors are split across **6 buses of 8**, pairing two series groups per bus
 (groups 1–2 on bus 1, 3–4 on bus 2, and so on). The split exists to improve
-signal integrity and keep bus capacitance down. The Arduino sends the updated
-values through a state machine so it transmits only when something has changed.
+signal integrity and keep bus capacitance down. The Arduino reads the buses in
+a state machine and sends every sensor on every sweep, about one sweep a second,
+so the host can tell a sensor that has stopped from one that has not changed.
 
 Firmware: `arduino/temperature_sensor_array/`.
 
@@ -174,6 +187,46 @@ reads the bus, and a wrong address there shows up immediately as `ERR`.
 Use `arduino/ds18b20_address_scanner/` to read the address off a replacement
 sensor, then update the sketch and this table together.
 
+### Bus-bar sensors
+
+A place for one more DS18B20 on each **bus bar between two series groups**:
+eleven on a 12S module, numbered from the bar between S1 and S2 to the bar
+between S11 and S12. The cell sensors above sit on the cell tops; a bus bar is
+the current path itself and is welded to the cell terminals, so a poor weld or a
+bar running hot shows there first.
+
+**None are fitted yet.** `busbar_sensor_count` in `rig_config.json` and
+`BUSBAR_SENSOR_COUNT` in the sketch are both 0, and with both at 0 nothing in
+the rig expects them. To fit them:
+
+1. Wire them to pin 8 of the temperature Arduino, and to pin 9 as well if one
+   bus is too long. The cell sensors are split eight to a bus to keep each bus's
+   capacitance down; eleven on one is more than that.
+2. Read each address with the scanner and put it in `busbarSensors[]` in the
+   sketch, in bus-bar order, with the bus it is on (0 for pin 8, 1 for pin 9).
+3. Set `BUSBAR_SENSOR_COUNT` to 11 and flash.
+4. Set `"busbar_sensor_count": 11` in `rig_config.json` and restart the rig.
+
+Do 3 and 4 together. The board sends them as `B,<t1>,...,<t11>` after the six
+cell buses, and the host takes that line only when it carries exactly the
+configured number of readings.
+
+| Bus bar | Between | Bus (pin) | ROM address |
+|---|---|---|---|
+| 1 | S1 and S2 | | not fitted |
+| 2 | S2 and S3 | | not fitted |
+| 3 | S3 and S4 | | not fitted |
+| 4 | S4 and S5 | | not fitted |
+| 5 | S5 and S6 | | not fitted |
+| 6 | S6 and S7 | | not fitted |
+| 7 | S7 and S8 | | not fitted |
+| 8 | S8 and S9 | | not fitted |
+| 9 | S9 and S10 | | not fitted |
+| 10 | S10 and S11 | | not fitted |
+| 11 | S11 and S12 | | not fitted |
+
+Fill this in with the sketch, as for the cell table.
+
 ---
 
 ## Current and voltage acquisition
@@ -184,6 +237,44 @@ output is where `DaqConfig.current_amps_per_volt = 100.0` comes from.
 **Voltage**: the board housing the Arduino also steps the module tap voltages
 down and feeds them to the NI-DAQ, which passes them to the application. The
 divider ratio is `DaqConfig.voltage_multiplier = 11.0` (a 10:1 divider).
+
+Each tap has its own divider, and none is exactly 10:1. A cell voltage is the
+difference of two taps, so those errors grow up the stack: with 1% resistors,
+taps 11 and 12 near 46 V and 50 V can put cell 12 almost a volt out.
+`DaqConfig.voltage_tap_gains` holds one correction per tap, and
+`python tools/tap_calibrate.py` measures them against a multimeter and prints
+the list. **The tolerance of the divider resistors is not recorded anywhere**,
+which is what decides how much this matters; until the taps are calibrated,
+treat per-cell voltages near the top of the stack as good to a few tenths of a
+volt.
+
+**The chassis** (cDAQ-9178, read with `tools/discover DAQ.py` in October 2026):
+
+| Slot | Module | Carries |
+|---|---|---|
+| 6 | NI 9212 + TB-9212 mini-TC | Bank thermocouples on jacks TC0, TC2, TC4, TC6 (`ai0`, `ai2`, `ai4`, `ai6`). The odd jacks are empty and read ~2284 °C, the module's open-thermocouple value |
+| 7 | NI 9215 (differential only) | Current sensor on `ai0`: signal on screw terminal 0 (AI0+), sensor 0 V on terminal 1 (AI0−) and terminal 9 (COM) |
+| 8 | NI 9205 (DSUB) + NI 9923 | The 12 cell taps, single-ended (RSE) against COM |
+
+**The 9205's D-SUB does not run in channel order**, and the NI 9923's terminal
+numbers are the D-SUB pin numbers (NI 9205 Getting Started Guide, Figure 1):
+
+| Terminals | Signal |
+|---|---|
+| 1–8 | AI0–AI7 |
+| 9 | DO0, a digital output: never a tap |
+| 10, 29 | COM: the tap ground, and the reference every RSE reading is measured against |
+| 11–18 | AI16–AI23 |
+| 19 | AISENSE |
+| 20–27 | AI8–AI15 |
+| 28 | PFI0 |
+| 30–37 | AI24–AI31 |
+
+The config expects ground on terminal 10 (COM), taps 1–7 on terminals 2–8,
+tap 8 on 20, tap 9 on 21, and taps 10–12 on 11–13. After any rewiring, power
+the taps and run `python tools/tap_map_check.py <top-of-stack volts>`: it reads
+every input and reports which tap each one carries, and whether
+`voltage_channels` matches.
 
 ---
 
@@ -198,8 +289,10 @@ resistor bank cooking. This is currently a procedural control only: *never run
 without the fan*.
 
 **2. Resistor thermal protection — banks 1–4 only.** One thermocouple per bank
-on banks 1–4, read by the NI-DAQ. The channels are `resistor_tc_channels` in
-`rig_config.json`, default `cDAQ1Mod3/ai0`–`ai3`, bank 1 first, Type K. They are
+on banks 1–4, read by an NI 9212 in slot 6 through its TB-9212 mini-TC block,
+on jacks TC0 (bank 1), TC2 (bank 2), TC4 (bank 3) and TC6 (bank 4). The channels
+are `resistor_tc_channels` in `rig_config.json`: `cDAQ1Mod6/ai0`, `ai2`, `ai4`,
+`ai6`, bank 1 first, Type K. They are
 read on their own thread so a slow thermocouple module cannot slow the voltage
 and current loop. Per-bank trips are `resistor_max_temp_c` in the `limits`
 section. Each bank is held to its own trip, which applies in every state and
@@ -276,7 +369,14 @@ heaviest setting in rating is 0.75 Ω, banks 1 and 2 sharing about **3.4 kW** at
 unrestricted.
 
 **4. Side-of-cell temperature sensors are not fitted.** Only the top of each cell
-is instrumented. Planned.
+is instrumented. Planned. The bus bars between the series groups have a place in
+the software and the sketch, and no sensors yet: see Bus-bar sensors above.
+
+**4a. The relay drive's behaviour in reset, and the module's fusing, are not
+recorded.** While the controller is restarting its pins float. Whether the relay
+MOSFETs have gate pull-downs, so every relay stays released then, is not written
+down anywhere, and neither is whether the module is fused. Both matter more now
+that the controller can restart itself on its hardware watchdog.
 
 **5. Bank composition is recorded here and nowhere else.** How many physical
 resistors form each ladder step, and how they are wired, exists only in this

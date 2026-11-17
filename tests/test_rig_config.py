@@ -180,7 +180,19 @@ class TestLimitDerivation:
         assert keys == {'max_amps', 'amp_buffer', 'max_temp', 'min_volts',
                         'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout',
                         'daq_stale_timeout', 'derate_en', 'derate_start',
-                        'resistor_max_temp', 'bank_rated_only'}
+                        'resistor_max_temp', 'busbar_max_temp', 'bank_rated_only',
+                        'load_check'}
+
+    def test_load_check_ships_on_and_says_so_when_off(self):
+        # Off is for the bench supplies only, and saved on exit, so it warns.
+        limits = SafetyLimits()
+        assert limits.load_check_enabled is True
+        assert limits.to_command_dict()['load_check'] is True
+        assert not any("load check" in w for w in limits.advisories())
+
+        limits.load_check_enabled = False
+        assert limits.to_command_dict()['load_check'] is False
+        assert any("load check is off" in w for w in limits.advisories())
 
     def test_per_cell_trip_derives_above_cell_cutoff(self):
         pack = PackConfig()
@@ -376,7 +388,7 @@ class TestPersistence:
 
     def test_empty_dict_yields_defaults(self):
         loaded = RigConfig.from_dict({})
-        assert math.isclose(loaded.vehicle.total_mass_kg, 330.0)
+        assert math.isclose(loaded.vehicle.total_mass_kg, 328.3)
 
     def test_loading_redderives_limits_for_changed_pack(self):
         # Someone edits the JSON to a bigger pack; limits must follow, not
@@ -422,6 +434,20 @@ class TestDaqConfig:
     def test_current_channel_colliding_with_voltage_is_reported(self):
         d = DaqConfig(current_channel="cDAQ1Mod8/ai1")
         assert any("also listed" in p for p in d.validate(PackConfig()))
+
+    def test_taps_are_read_single_ended_by_default(self):
+        # The taps are on a 9205 against COM. The driver's own default can pair
+        # two of them as one differential input.
+        assert DaqConfig().voltage_terminal_config == "RSE"
+
+    def test_an_unknown_input_mode_blocks_arm(self):
+        problems = DaqConfig(voltage_terminal_config="single").safety_problems(PackConfig())
+        assert any("Voltage input mode 'single'" in p for p in problems)
+
+    def test_default_wiring_is_one_tap_per_cell_and_no_shared_inputs(self):
+        d = DaqConfig()
+        assert len(d.voltage_channels) == PackConfig().series_count
+        assert d.safety_problems(PackConfig()) == []
 
     def test_duplicate_voltage_channels_are_reported(self):
         chans = list(DaqConfig().voltage_channels)
@@ -586,6 +612,17 @@ class TestArmBlockers:
         cfg.daq.sensors_per_bus = 9
         assert cfg.arm_blockers() == []
         assert any("thermistors configured" in p for p in cfg.advisories())
+
+    def test_a_cell_trip_sitting_on_the_cutoff_is_pointed_out(self):
+        # Below the cutoff blocks ARM; exactly on it does not, and is how the
+        # bench-supply tests once left the file for the first module.
+        cfg = RigConfig.defaults()
+        assert not any("cutoff itself" in p for p in cfg.advisories())
+        cfg.limits.derive_from_pack = False
+        cfg.limits.min_cell_volts = cfg.pack.cell_min_voltage
+        assert cfg.arm_blockers() == []
+        (note,) = [p for p in cfg.advisories() if "cutoff itself" in p]
+        assert "2.50 V" in note and "sets 2.70 V" in note
 
     def test_current_on_a_voltage_channel_blocks(self):
         assert any("also listed" in p

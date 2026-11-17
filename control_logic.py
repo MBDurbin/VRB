@@ -1,3 +1,4 @@
+import csv
 import math
 import os
 import threading
@@ -24,6 +25,20 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILES_DIR = os.path.join(PROJECT_DIR, "profiles")
 DEFAULT_LAP_CSV = "FSAE - ETS - Speed and Time 1 Lap.csv"
 CSV_FILENAME = os.path.join(PROFILES_DIR, DEFAULT_LAP_CSV)
+
+# A bench profile names the resistance itself, in this column, instead of a
+# speed for the car model to turn into power. It is for running the rig on bench
+# supplies, where there is no car to model, and for constant-resistance
+# discharges. Every row is held to the same floors and ratings as a lap row, so
+# it can ask for no more load than a lap at full demand can.
+RESISTANCE_COLUMN = "Resistance (ohm)"
+
+# Every stop and fault the logic process latches, one row each, appended across
+# sessions. logs/ is ignored by git, like the GUI's recordings.
+TRIP_LOG_PATH = os.path.join(PROJECT_DIR, "logs", "trip_log.csv")
+TRIP_LOG_FIELDS = ("Time", "State", "Reason", "Detail", "Amps", "Module_V", "Min_Cell_V",
+                   "Max_Cell_Temp_C", "Resistor_Temps_C", "Ladder_Ohm",
+                   "Sample_To_Kill_ms", "Kill_Sent")
 
 MAX_RESISTANCE = 63.75
 RESISTOR_RESOLUTION = 0.25
@@ -54,18 +69,19 @@ BANK_RATED_POWER_W = (8000.0, 4000.0, 2000.0, 1000.0, 500.0, 300.0, 200.0, 400.0
 #
 # The word is written most significant bank first, so it reads as the binary
 # number of 0.25 ohm steps: 32 ohm is 10000000, 0.25 ohm is 00000001. The
-# firmware drives characters 0-6 onto otherRelayPins[] = {12, ..., 6} and the
-# last character onto BANK_1_RELAY, pin 5, which it labels as the 0.25 ohm relay
-# and opens first on every change. The host used to send the word reversed,
-# least significant first, so 32 ohm arrived as 00000001 and switched in bank 1
-# alone: about 202 A at 50.4 V instead of 1.6 A.
+# firmware drives characters 0-6 onto otherRelayPins[] = {12, 10, 11, 9, 8, 7, 6}
+# and the last character onto BANK_1_RELAY, pin 5, which it labels as the
+# 0.25 ohm relay and opens first on every change. The host used to send the word
+# reversed, least significant first, so 32 ohm arrived as 00000001 and switched
+# in bank 1 alone: about 202 A at 50.4 V instead of 1.6 A.
 #
-# Pin 5 is the only bank the firmware names. Pins 6-12 carrying banks 2-8 in
-# order follows from the word being binary; confirm it on the bench with
-# `python tools/bench_relay_check.py` and `walk`, battery disconnected, before a
-# run, and after any rewiring of the relay board.
+# Which pin's relay bypasses which bank is the relay board's wiring, and only a
+# meter proves it: `python tools/bench_relay_check.py` and `walk`, battery
+# disconnected, before a run and after any rewiring. Metered in October 2026:
+# pin 10 bypasses the 16 ohm bank (7) and pin 11 the 8 ohm bank (6), the other
+# way round from the binary order, so the firmware and this table swap them.
 COMMAND_BANKS = (8, 7, 6, 5, 4, 3, 2, 1)
-BANK_RELAY_PIN = (5, 6, 7, 8, 9, 10, 11, 12)    # bank 1 first
+BANK_RELAY_PIN = (5, 6, 7, 8, 9, 11, 10, 12)    # bank 1 first
 
 # How far past the ratings above, and past VRB_MAX_POWER_W, the bank may run
 # unless SafetyLimits.bank_rated_power_only holds it to 100%. Fixed here, so the
@@ -176,15 +192,70 @@ def write_resistor(ser, payload):
         return False
 
 
+# What the resistor controller prints that the host acts on, as the start of the
+# line (arduino/resistor_bank_controller). The rest of what it prints is
+# progress chatter: "New State Received", "Action: ...".
+#
+# The host used to write to the controller and never read it. A board that
+# restarted mid-run dropped every relay, came back two seconds later, took the
+# next row's command and carried on, with nothing on record.
+CONTROLLER_LINES = (
+    ("Arduino Ready", "reset"),     # setup() ran: the board restarted
+    ("No Signal", "shed"),          # shedAllLoad(): its watchdog fired, or a KILL
+    ("Error:", "rejected"),         # a line it would not act on
+)
+
+# Opening the port restarts the board, and its start-up banner can arrive after
+# the handshake has already claimed the port. A banner this soon after is that
+# start, not a restart.
+CONTROLLER_BOOT_S = 5.0
+
+# Longest part-line kept between passes; a real line is under 60 bytes.
+MAX_CONTROLLER_PENDING = 512
+
+
+def read_controller_lines(ser, pending):
+    """Complete lines the controller has printed, without waiting: (lines, pending).
+
+    None, not the pair, if the port failed: the loop treats that as a lost
+    link, like a failed write. Only what has already arrived is read, so this
+    never holds the loop; a line still arriving stays in `pending`. A port with
+    nothing to read from (the test fakes) reads as silent.
+    """
+    try:
+        waiting = getattr(ser, 'in_waiting', 0)
+        if waiting:
+            pending += ser.read(waiting)
+    except (serial.SerialException, OSError):
+        return None
+    *raw, pending = pending.split(b"\n")
+    if len(pending) > MAX_CONTROLLER_PENDING:
+        pending = b""
+    return [line.decode('utf-8', errors='ignore').strip() for line in raw], pending
+
+
+def classify_controller_line(line):
+    """'reset', 'shed' or 'rejected' for a line the host acts on, else None."""
+    for start, kind in CONTROLLER_LINES:
+        if line.startswith(start):
+            return kind
+    return None
+
+
 def encode_steps(steps):
     """The command word for a ladder setting: one character per bank, COMMAND_BANKS order.
 
-    '1' puts that bank in circuit. Zero steps becomes bank 1 alone (0.25 ohm), as
-    the firmware's own all-zero interlock would, so the bank is never commanded
-    to zero resistance.
+    '1' puts that bank in circuit. A setting outside the ladder, zero or less or
+    more than every bank together, becomes every bank together: 63.75 ohm, the
+    lightest load there is. Nothing in the rig asks for one, so it would be a
+    bug, and a bug must not be answered with load. Zero used to become bank 1
+    alone, 0.25 ohm, the heaviest load, as the firmware's interlock made of an
+    all-zero word; the firmware now refuses that word outright, and the host
+    never writes it.
     """
-    if steps == 0:
-        steps = 1
+    every_bank = 2 ** len(COMMAND_BANKS) - 1
+    if not 1 <= steps <= every_bank:
+        steps = every_bank
     return "".join("1" if (steps >> (bank - 1)) & 1 else "0" for bank in COMMAND_BANKS)
 
 
@@ -275,6 +346,62 @@ def check_bank_power(voltage, amps, steps=None, power_factor=1.0):
     if steps and overpowered_banks(voltage, amps, steps, power_factor):
         return True, "BANK OVERPOWER"
     return False, None
+
+
+# The load check: whether the current measured fits the ladder setting commanded.
+#
+# Nothing else compares the two. Both wiring faults found so far were of this
+# kind, and both were found with a meter: the command word sent in reverse
+# (202 A where 1.6 A was asked for) and the 8 and 16 ohm relays crossed. It
+# also catches a controller that restarted, a contactor or relay that did not
+# move, and a current sensor that has stopped reading, which leaves the
+# over-current and bank-power trips blind.
+#
+# More current than the setting allows has no innocent cause: the module
+# voltage is measured at the taps, so every element at the low end of its
+# tolerance is +5% at most. Less has several: cable, contactor and relay
+# contacts in series with the ladder, elements at the top of their tolerance,
+# and their resistance rising as they heat. About -23% at the 0.25 ohm step
+# with 40 mOhm of wiring, so the low side is the looser.
+#
+# The floor in amps is for the top of the ladder, where an amp or two is the
+# 400 A sensor's own offset rather than the bank. It is low enough to see the
+# crossed 8 and 16 ohm relays (3 A against 6 A at 48 V), and it means a wrong
+# bank above about 16 ohm, where a volt or two moves less than 2 A, is not seen.
+LOAD_CHECK_HIGH = 0.15
+LOAD_CHECK_LOW = 0.35
+LOAD_CHECK_ABS_A = 2.0
+# Readings in a row that must disagree before it faults, each from a new DAQ
+# sample taken after the setting had settled (BANK_SETTLE_S). 0.3 s at 10 Hz.
+LOAD_CHECK_SAMPLES = 3
+
+
+def expected_load_amps(voltage, steps):
+    """The current a ladder setting draws at this module voltage. None if unknown."""
+    if not steps or not _finite(voltage):
+        return None
+    return voltage / (steps * RESISTOR_RESOLUTION)
+
+
+def load_mismatch(voltage, amps, steps):
+    """How one reading disagrees with the ladder setting, in words. None if it fits.
+
+    `steps` is the setting in circuit once it has settled. None also when there
+    is nothing to judge: no setting, or a reading that is not a number, which
+    INVALID READING reports.
+    """
+    expected = expected_load_amps(voltage, steps)
+    if expected is None or not _finite(amps):
+        return None
+    ohms = steps * RESISTOR_RESOLUTION
+    line = (f"Ladder at {ohms:.2f} ohm and {voltage:.1f} V should draw {expected:.1f} A; "
+            f"measured {amps:.1f} A")
+    if amps - expected > max(LOAD_CHECK_ABS_A, LOAD_CHECK_HIGH * expected):
+        return line + ". More: a bank that should be in circuit is bypassed"
+    if expected - amps > max(LOAD_CHECK_ABS_A, LOAD_CHECK_LOW * expected):
+        return line + (". Less: the contactor or a relay is open, the controller "
+                       "restarted, or the current sensor is not reading")
+    return None
 
 
 def check_cell_safety(cell_voltages, min_cell_voltage, sense_floor=0.5):
@@ -418,6 +545,66 @@ def check_resistor_temps(resistor_temps, max_temps):
     return False, None
 
 
+def busbar_label(number, expected=None):
+    """A bus-bar sensor in words: 'bus bar 4 (S4-S5)'.
+
+    `number` counts from 1. The groups it joins are named when the wiring has
+    one sensor per bus bar, a series count less one; otherwise the sensors
+    cannot be placed and only the number is given.
+    """
+    if expected and expected.get('busbar_sensors') == expected.get('cells', 0) - 1:
+        return f"bus bar {number} (S{number}-S{number + 1})"
+    return f"bus bar {number}"
+
+
+def hot_busbars(busbar_temps, max_temp):
+    """(number, temperature) for every bus bar at or over the trip; numbered from 1."""
+    return [(i + 1, t) for i, t in enumerate(busbar_temps)
+            if t is not None and t >= max_temp]
+
+
+def check_busbar_temps(busbar_temps, max_temp):
+    """Bus-bar over-temperature. Returns (is_fault, reason).
+
+    In every FSM state, like the cell trip: a bus bar is welded to the cell
+    terminals, and a hot one is hot whatever the state machine thinks. A sensor
+    that has not reported yet (None) is not judged here; check_busbar_health()
+    faults on it once armed. With no bus-bar sensors fitted the list is empty
+    and nothing can trip.
+    """
+    if hot_busbars(busbar_temps, max_temp):
+        return True, "BUSBAR OVERTEMP"
+    return False, None
+
+
+def stale_busbars(ages, stale_timeout_s):
+    """Bus bars, numbered from 1, with no valid reading within the timeout."""
+    if stale_timeout_s <= 0:
+        return []
+    return [i + 1 for i, age in enumerate(ages) if age > stale_timeout_s]
+
+
+def check_busbar_health(ages, stale_timeout_s, expected_count):
+    """Bus-bar sensor integrity. Returns (is_fault, reason).
+
+    As for the cell sensors: the Arduino prints ERR for a DS18B20 it cannot
+    read and the DAQ keeps that sensor's last value, so a bus bar's reading can
+    sit frozen at a safe-looking figure while the bar heats. Same timeout.
+
+    `expected_count` is how many the wiring says are fitted. None fitted is not
+    a fault: bus-bar sensors are an addition to the cell sensors, and a module
+    without them is still watched cell by cell.
+    """
+    if not expected_count:
+        return False, None
+    if not ages:
+        # Fail closed: configured, and nothing has ever arrived.
+        return True, "NO BUSBAR DATA"
+    if stale_busbars(ages, stale_timeout_s):
+        return True, "BUSBAR SENSOR FAULT"
+    return False, None
+
+
 def stale_resistor_banks(tc_ages, stale_timeout_s):
     """1-based banks whose thermocouple has no valid reading within the timeout."""
     if stale_timeout_s <= 0:
@@ -479,6 +666,7 @@ def expected_measurements(daq_cfg, pack):
         return {
             'cells': int(pack.series_count),
             'temp_sensors': int(daq_cfg.sensor_count),
+            'busbar_sensors': max(0, int(daq_cfg.busbar_sensor_count)),
             'resistor_tcs': len(daq_cfg.resistor_tc_channels),
             'max_volts': float(pack.max_voltage) * (1.0 + VOLTAGE_PLAUSIBLE_MARGIN),
             'max_cell_volts': float(pack.cell_max_voltage) + CELL_PLAUSIBLE_MARGIN_V,
@@ -520,11 +708,16 @@ def measurement_problems(data, expected=None):
            if t is not None and not _finite(t)]
     if bad:
         invalid("bank(s) " + ", ".join(map(str, bad)) + " temperature is not a number")
+    bad = [i + 1 for i, t in enumerate(data.get('busbar_temps', []))
+           if t is not None and not _finite(t)]
+    if bad:
+        invalid("bus bar(s) " + ", ".join(map(str, bad)) + " temperature is not a number")
 
     # Ages may be inf -- never read -- but a NaN age passes every staleness test.
     ages = ([data.get('daq_age_s', 0.0), data.get('temp_age_s', 0.0)]
             + [a for bus in data.get('temp_sensor_ages_s', []) for a in bus]
-            + list(data.get('resistor_temp_ages_s', [])))
+            + list(data.get('resistor_temp_ages_s', []))
+            + list(data.get('busbar_temp_ages_s', [])))
     if any(not _is_number(a) or math.isnan(a) for a in ages):
         invalid("a reading's age is not a number")
 
@@ -548,6 +741,8 @@ def measurement_problems(data, expected=None):
         for name, have, want in (
                 ("cell voltages", len(cells), expected['cells']),
                 ("temperature sensors", n_sensors, expected['temp_sensors']),
+                ("bus-bar sensors", len(data.get('busbar_temp_ages_s', [])),
+                 expected.get('busbar_sensors', 0)),
                 ("resistor thermocouples", len(data.get('resistor_temp_ages_s', [])),
                  expected['resistor_tcs'])):
             if have and have != want:
@@ -598,7 +793,7 @@ def report_config_problems(problems):
 
 
 def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=None,
-                    expected=None):
+                    expected=None, load_problem=None):
     """All safety checks against one telemetry packet. Returns (is_fault, reason).
 
     Measured dangers are reported ahead of data-integrity faults: if the pack is
@@ -606,9 +801,9 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     needs to hear about the current first.
 
     `armed` should be True only in ARMED/RUNNING. Cell over-temperature,
-    over-current, bank overpower and resistor over-temperature are always
-    checked -- any of them means something is wrong no matter what state the FSM
-    thinks it is in. Everything else is gated,
+    over-current, bus-bar over-temperature, bank overpower and resistor
+    over-temperature are always checked -- any of them means something is wrong
+    no matter what state the FSM thinks it is in. Everything else is gated,
     because before the rig is armed those readings describe a bench that is not
     loaded yet:
 
@@ -634,11 +829,21 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     `expected` is expected_measurements() for the running wiring and pack, for
     the count and range checks in measurement_problems(). Like the other
     integrity checks they apply once armed.
+
+    `load_problem` is load_mismatch()'s description once the measured current
+    has disagreed with the ladder setting for LOAD_CHECK_SAMPLES readings in a
+    row; the loop does the counting. Reported last: every other fault names a
+    cause, and this one only says the bank is not doing what it was told.
     """
     fault, reason = check_thermal_and_current(
         data.get('max_temp', 0.0), data.get('amps', 0.0),
         limits['max_temp'], limits['max_amps'], limits['amp_buffer'],
     )
+    if fault:
+        return True, reason
+
+    # The module's other temperature, straight after its cells and current.
+    fault, reason = check_busbar_temps(data.get('busbar_temps', []), limits['busbar_max_temp'])
     if fault:
         return True, reason
 
@@ -700,12 +905,165 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     if fault:
         return True, reason
 
+    fault, reason = check_busbar_health(
+        data.get('busbar_temp_ages_s', []), limits['temp_stale_timeout'],
+        expected.get('busbar_sensors', 0) if expected else 0)
+    if fault:
+        return True, reason
+
     fault, reason = check_resistor_tc_health(
         data.get('resistor_temp_ages_s', []), limits['temp_stale_timeout'])
     if fault:
         return True, reason
 
+    if load_problem:
+        return True, "LOAD MISMATCH"
+
     return False, None
+
+
+def trip_details(reason, data, limits, config_problems=(), expected=None, bank_steps=None):
+    """What tripped and the limit it crossed, as lines for the console and the trip log.
+
+    So an operator testing a trip can see it fired at the value it should, and
+    one meeting a real trip knows where to look. `bank_steps` is the settled
+    ladder setting, as evaluate_safety() took it. Empty for a reason with
+    nothing to add.
+    """
+    amps = data.get('amps', 0.0)
+    volts = data.get('voltage', 0.0)
+    cells = data.get('cell_voltages', [])
+
+    if reason == "OVERTEMP":
+        return [f"Hottest cell at {data.get('max_temp', 0.0):.1f} C "
+                f"(trip {limits['max_temp']:.1f} C)"]
+    if reason == "OVERCURRENT":
+        return [f"Current {amps:.1f} A (trip {limits['max_amps'] + limits['amp_buffer']:.1f} A)"]
+    if reason == "BANK OVERPOWER":
+        factor = bank_power_factor(limits)
+        lines = [f"Ladder at {volts * amps:.0f} W (limit {VRB_MAX_POWER_W * factor:.0f} W)"]
+        if bank_steps:
+            lines += [f"Bank {b} at {w:.0f} W (limit {lim:.0f} W)"
+                      for b, w, lim in overpowered_banks(volts, amps, bank_steps, factor)]
+        return lines
+    if reason == "RESISTOR OVERTEMP":
+        hot = hot_resistor_banks(data.get('resistor_temps', []), limits['resistor_max_temp'])
+        return [", ".join(f"Bank {b} at {t:.0f} C (trip {lim:.0f} C)" for b, t, lim in hot)]
+    if reason == "UNDERVOLTAGE":
+        return [f"Module at {volts:.2f} V (trip {limits['min_volts']:.2f} V)"]
+    if reason == "CELL UNDERVOLTAGE":
+        low = [(i + 1, v) for i, v in enumerate(cells)
+               if _finite(v) and v <= limits['min_cell_volts']]
+        return [", ".join(f"Cell {i} at {v:.3f} V" for i, v in low)
+                + f" (trip {limits['min_cell_volts']:.2f} V)"]
+    if reason == "CELL SENSE FAULT":
+        low = [(i + 1, v) for i, v in enumerate(cells)
+               if _finite(v) and v < limits['cell_sense_floor']]
+        return [", ".join(f"Cell {i} reads {v:.3f} V" for i, v in low)
+                + f" (below {limits['cell_sense_floor']:.2f} V: check its sense lead)"]
+    if reason == "DAQ DATA STALE":
+        return [f"Last DAQ packet {data.get('daq_age_s', 0.0):.2f} s old "
+                f"(limit {limits['daq_stale_timeout']:.2f} s)"]
+    if reason == "TEMP DATA STALE":
+        return [f"Last temperature reading {data.get('temp_age_s', 0.0):.1f} s old "
+                f"(limit {limits['temp_stale_timeout']:.1f} s)"]
+    if reason == "TEMP SENSOR FAULT":
+        dead = stale_temp_sensors(data.get('temp_sensor_ages_s', []), limits['temp_stale_timeout'])
+        return ["No valid reading from: " + ", ".join(f"bus {b} sensor {s}" for b, s in dead)]
+    if reason == "RESISTOR TC FAULT":
+        dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
+                                    limits['temp_stale_timeout'])
+        return ["No valid thermocouple reading from: " + ", ".join(f"bank {b}" for b in dead)]
+    if reason == "BUSBAR OVERTEMP":
+        hot = hot_busbars(data.get('busbar_temps', []), limits['busbar_max_temp'])
+        line = ", ".join(f"{busbar_label(n, expected)} at {t:.1f} C" for n, t in hot)
+        return [line[:1].upper() + line[1:] + f" (trip {limits['busbar_max_temp']:.1f} C)"]
+    if reason == "BUSBAR SENSOR FAULT":
+        dead = stale_busbars(data.get('busbar_temp_ages_s', []), limits['temp_stale_timeout'])
+        return ["No valid reading from: " + ", ".join(busbar_label(n, expected) for n in dead)]
+    if reason == "NO BUSBAR DATA":
+        wanted = expected.get('busbar_sensors', 0) if expected else 0
+        return [f"{wanted} bus-bar sensor(s) are configured and none has reported. Check "
+                f"BUSBAR_SENSOR_COUNT in the temperature sketch, or set "
+                f"busbar_sensor_count to 0 if they are not fitted"]
+    if reason == "CONFIG FAULT":
+        return [f"  - {problem}" for problem in config_problems]
+    if reason in ("INVALID READING", "INCOMPLETE DATA"):
+        return [f"  - {detail}" for _, detail in measurement_problems(data, expected)]
+    if reason == "LOAD MISMATCH":
+        problem = load_mismatch(volts, amps, bank_steps)
+        return [problem] if problem else []
+    return []
+
+
+def trip_record(reason, state, details, data=None, ladder_ohm=None, kill_sent=None,
+                killed_at=None):
+    """One row of the trip log, keyed by TRIP_LOG_FIELDS.
+
+    `state` is the FSM state the rig tripped from. `data` is the packet that
+    tripped it, for a measured trip; None for an operator stop or a lost link.
+    `kill_sent` is whether KILL reached the controller, None if none was
+    connected. `killed_at` is time.time() just after that write.
+
+    Sample_To_Kill_ms is how long the host took from the DAQ sampling the
+    packet to the KILL leaving it: the queue, the loop and the write. It leaves
+    out the sensor's own response and the contactor opening, which happen
+    outside the host, so time those on the bench.
+    """
+    now = killed_at if killed_at is not None else time.time()
+    record = dict.fromkeys(TRIP_LOG_FIELDS, '')
+    record.update({
+        'Time': (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))
+                 + f".{int(now % 1 * 1000):03d}"),
+        'State': state,
+        'Reason': reason,
+        'Detail': "; ".join(line.strip().removeprefix("- ") for line in details),
+        'Kill_Sent': {True: 'yes', False: 'NO'}.get(kill_sent, ''),
+    })
+    if ladder_ohm:
+        record['Ladder_Ohm'] = f"{ladder_ohm:.2f}"
+    if data is not None:
+        def number(value, spec):
+            return format(value, spec) if _finite(value) else ''
+        cells = [v for v in data.get('cell_voltages', []) if _finite(v)]
+        record.update({
+            'Amps': number(data.get('amps'), '.1f'),
+            'Module_V': number(data.get('voltage'), '.2f'),
+            'Min_Cell_V': number(min(cells), '.3f') if cells else '',
+            'Max_Cell_Temp_C': number(data.get('max_temp'), '.1f'),
+            'Resistor_Temps_C': "/".join(number(t, '.0f')
+                                         for t in data.get('resistor_temps', [])),
+        })
+        sampled_at = data.get('sampled_at')
+        if kill_sent and killed_at is not None and _finite(sampled_at):
+            record['Sample_To_Kill_ms'] = f"{(killed_at - sampled_at) * 1000.0:.0f}"
+    return record
+
+
+def append_trip_log(record, path=None):
+    """Append one trip_record() to the trip log. True if it was written.
+
+    Never raises. Called after the KILL has gone out, so a slow disk delays
+    nothing that matters, and a log that cannot be written -- open in Excel,
+    which locks it on Windows, or a read-only folder -- is reported and
+    skipped rather than taking down the logic process. `path` defaults to
+    TRIP_LOG_PATH, looked up at call time so tests can point it elsewhere.
+    """
+    path = path or TRIP_LOG_PATH
+    try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        with open(path, 'a', newline='', encoding='utf-8') as fh:
+            writer = csv.DictWriter(fh, fieldnames=TRIP_LOG_FIELDS)
+            if new:
+                writer.writeheader()
+            writer.writerow(record)
+        return True
+    except Exception as exc:
+        print(f"[LOGIC WARNING] Trip not written to {path}: {exc}")
+        return False
 
 #Double Checked
 def coulomb_step(amps, dt, remaining_ah, total_capacity_ah):
@@ -912,27 +1270,57 @@ def compute_target_resistance(voltage, req_power, max_safe_current, current_max_
     bench it under-loaded by a factor of N: an 81 kW lap demand drew 20 A instead
     of 180 A, and no plausible car power could reach the ladder's 0.25 ohm step.
     """
-    modules = max(1, modules_in_series)
-
-    if req_power <= 0:
-        req_r = MAX_RESISTANCE
-    else:
-        req_r = min(MAX_RESISTANCE, (modules * voltage ** 2) / req_power)
-
+    req_r = requested_resistance(voltage, req_power, modules_in_series)
     return max(req_r, resistance_floor(voltage, max_safe_current, current_max_temp,
                                        derate_enabled, derate_start_temp, max_safe_temp,
                                        power_factor))
 
 
+def requested_resistance(voltage, req_power, modules_in_series=1):
+    """The resistance that puts the car's current through one module: N * V^2 / P.
+
+    Before any floor, rating or ladder step, so it is what the car model asked
+    for and not what the bank was given. The two are reported side by side: the
+    ladder's 0.25 ohm steps are coarse where the heavy rows sit, and a row
+    asking for 0.36 ohm gets 0.25, 43% more current. Over the shipped lap that
+    leaves the charge within 5% of the ask but I^2 t, the cell heating, 3 to
+    17% high. No rounding rule removes it: nearest current reads 1 to 15% low
+    instead, and carrying the error forward trades it for larger single rows.
+    A power of zero or less, braking, asks for the lightest load.
+    """
+    modules = max(1, modules_in_series)
+    if req_power <= 0:
+        return MAX_RESISTANCE
+    return min(MAX_RESISTANCE, (modules * voltage ** 2) / req_power)
+
+
 def command_steps(voltage, req_power, max_safe_current, current_max_temp,
                   derate_enabled, derate_start_temp, max_safe_temp, modules_in_series=1,
                   power_factor=1.0):
-    """Ladder steps to send for one profile row.
+    """Ladder steps to send for one lap-profile row: the car's power demand,
+    turned into a resistance and then into a setting by steps_for_resistance().
+    """
+    req_r = compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
+                                      derate_enabled, derate_start_temp, max_safe_temp,
+                                      modules_in_series=modules_in_series,
+                                      power_factor=power_factor)
+    return steps_for_resistance(voltage, req_r, max_safe_current, current_max_temp,
+                                derate_enabled, derate_start_temp, max_safe_temp,
+                                power_factor=power_factor)
 
-    The request rounds to the nearest 0.25 ohm step, but the floor rounds UP.
-    Rounding everything to nearest used to undercut the floor at the bottom of
-    the ladder: a 0.29 ohm current-limit clamp became the 0.25 ohm step, which
-    draws 192 A from a full module.
+
+def steps_for_resistance(voltage, req_r, max_safe_current, current_max_temp,
+                         derate_enabled, derate_start_temp, max_safe_temp, power_factor=1.0):
+    """Ladder steps for a requested resistance, held to every floor and rating.
+
+    A lap row's request comes from command_steps(); a bench profile's is the
+    resistance it names (RESISTANCE_COLUMN). Both pass through here, so neither
+    can command more load than the other.
+
+    The request is raised to resistance_floor() and rounds to the nearest
+    0.25 ohm step, but the floor rounds UP. Rounding everything to nearest used
+    to undercut the floor at the bottom of the ladder: a 0.29 ohm current-limit
+    clamp became the 0.25 ohm step, which draws 192 A from a full module.
 
     Then every bank the setting puts in circuit must be within its own rating
     (steps_within_rating). That is not a floor: a bank alone carries the whole
@@ -941,12 +1329,12 @@ def command_steps(voltage, req_power, max_safe_current, current_max_temp,
     that fails moves to the nearest one at or above the floor that passes, the
     higher resistance on a tie.
     """
-    req_r = compute_target_resistance(voltage, req_power, max_safe_current, current_max_temp,
-                                      derate_enabled, derate_start_temp, max_safe_temp,
-                                      modules_in_series=modules_in_series,
-                                      power_factor=power_factor)
     floor_r = resistance_floor(voltage, max_safe_current, current_max_temp,
                                derate_enabled, derate_start_temp, max_safe_temp, power_factor)
+    if not math.isfinite(req_r):
+        # NaN rounds to the bottom step in resistance_to_steps(). Least load.
+        req_r = MAX_RESISTANCE
+    req_r = max(req_r, floor_r)
     steps = resistance_to_steps(req_r, min_r=floor_r)
     if steps_within_rating(steps, voltage, power_factor):
         return steps
@@ -973,6 +1361,7 @@ def NEUTRAL_PACKET():
         'cell_voltages': [], 'temperatures': [], 'power_kw': 0.0,
         'temp_age_s': float('inf'), 'temp_sensor_ages_s': [],
         'resistor_temps': [], 'resistor_temp_ages_s': [],
+        'busbar_temps': [], 'busbar_temp_ages_s': [],
         'hardware_status': {},
     }
 
@@ -986,21 +1375,96 @@ def load_lap_profile(path):
     in compute_target_resistance(), so `min(MAX_RESISTANCE, nan)` quietly returns
     MAX_RESISTANCE and the bank sits at minimum load for the tail of every lap
     without anything being reported.
+
+    A bench profile (a RESISTANCE_COLUMN instead of, or as well as, a speed)
+    is read the same way, by its resistance. It is refused outright if a row
+    asks for zero or less: the ladder's lightest load is MAX_RESISTANCE, and a
+    0 ohm row, meant as "off", would command its heaviest.
     """
     df = pd.read_csv(path)
     rows = df.to_dict('records')
+    demand = RESISTANCE_COLUMN if RESISTANCE_COLUMN in df.columns else 'Speed (mph)'
 
     usable = []
-    for row in rows:
+    for line, row in enumerate(rows, start=2):      # line 1 is the header
         try:
-            speed = float(row.get('Speed (mph)'))
+            value = float(row.get(demand))
             stamp = float(row.get('Time (s)'))
         except (TypeError, ValueError):
             continue
-        if math.isfinite(speed) and math.isfinite(stamp):
+        if math.isfinite(value) and math.isfinite(stamp):
+            if demand == RESISTANCE_COLUMN and value <= 0:
+                raise ValueError(
+                    f"line {line} asks for {value:g} ohm. The lightest load the ladder has "
+                    f"is {MAX_RESISTANCE} ohm; use that for no load.")
             usable.append(row)
 
     return usable, len(rows) - len(usable)
+
+
+def profile_resistance(row):
+    """The resistance a bench-profile row asks for, in ohms; None for a lap row."""
+    if RESISTANCE_COLUMN not in row:
+        return None
+    return float(row[RESISTANCE_COLUMN])
+
+
+# ================= LOAD OVERRIDE =================
+# The operator can take the load off the profile and hold a resistance or a power
+# of their own, from the GUI sidebar, before or during a run. The run still
+# follows the profile's clock and laps and ends with them; only the load each
+# moment changes. Like a bench-profile row, the override passes through
+# steps_for_resistance(), so the current limit, the bank's ratings and the
+# thermal derate hold it exactly as they hold a lap.
+OVERRIDE_MODES = ("RESISTANCE", "POWER")
+
+# While running, a changed override reaches the bank on the next loop pass, and
+# a power override is re-solved this often against the module voltage, which
+# falls as the module discharges.
+OVERRIDE_REFRESH_S = 0.5
+
+
+def parse_override(cmd):
+    """The override a SET_OVERRIDE command asks for: None, or (mode, value).
+
+    ("SET_OVERRIDE", None) hands the load back to the profile.
+    ("SET_OVERRIDE", "RESISTANCE", ohms) and ("SET_OVERRIDE", "POWER", watts)
+    hold that value. Anything else raises ValueError, so a malformed command
+    changes nothing.
+    """
+    if isinstance(cmd, tuple) and len(cmd) == 2 and cmd[1] is None:
+        return None
+    if not (isinstance(cmd, tuple) and len(cmd) == 3 and cmd[1] in OVERRIDE_MODES):
+        raise ValueError(f"not an override: {cmd!r}")
+    mode, value = cmd[1], cmd[2]
+    if not (_finite(value) and value > 0):
+        raise ValueError(f"{mode.lower()} must be a positive number, not {value!r}")
+    return mode, float(value)
+
+
+def override_resistance(override, voltage):
+    """The resistance an override asks for at this module voltage, before any floor.
+
+    POWER is power at the bank, V^2 / R, on the measured module voltage: what is
+    across the bank, and what the GUI's Power card shows as V x I. Without a
+    usable voltage it asks for the least load.
+    """
+    mode, value = override
+    if mode == "RESISTANCE":
+        return value
+    if not (_finite(voltage) and voltage > 0):
+        return MAX_RESISTANCE
+    return voltage ** 2 / value
+
+
+def describe_override(override):
+    """The override in words, for the console."""
+    if override is None:
+        return "off: the profile sets the load"
+    mode, value = override
+    if mode == "RESISTANCE":
+        return f"holding {value:.2f} ohm"
+    return f"holding {value / 1000.0:.2f} kW at the bank"
 
 
 def lap_row_interval(lap_data, idx, default=1.0):
@@ -1012,7 +1476,33 @@ def lap_row_interval(lap_data, idx, default=1.0):
     over-draining the pack by the same factor. Since compute_lap_physics()
     already derives acceleration from these timestamps, playback ignoring them
     also made the two disagree about how much time a row represents.
+
+    The last row has no row after it to say how long it lasts: see
+    last_row_interval().
     """
+    if lap_data and idx == len(lap_data) - 1:
+        return last_row_interval(lap_data, default)
+    return _row_gap(lap_data, idx, default)
+
+
+def next_row_due(due_at, now, hold_s):
+    """When the row after the one just sent is due.
+
+    One hold after this row was DUE, not after it was sent. The loop sends a
+    row on the first pass after it falls due, a little late each time, and
+    timing the next from the sending let that lateness add up: a 10 Hz lap ran
+    about 5% long, and the bank held every load that much longer.
+
+    If that moment has already gone, the loop is a whole row behind, after a
+    stall or because the rows come faster than the loop turns. The schedule
+    then restarts from now, so missed rows are not fired off in a burst.
+    """
+    due = due_at + hold_s
+    return due if due > now else now + hold_s
+
+
+def _row_gap(lap_data, idx, default):
+    """Seconds from row idx to the row after it, or `default` if that is unusable."""
     try:
         here = float(lap_data[idx].get('Time (s)'))
         nxt = float(lap_data[idx + 1].get('Time (s)'))
@@ -1023,6 +1513,28 @@ def lap_row_interval(lap_data, idx, default=1.0):
     if math.isfinite(dt) and dt > 0:
         return dt
     return default
+
+
+def last_row_interval(lap_data, default=1.0):
+    """Real seconds to hold a profile's last row.
+
+    Nothing follows it, so its length is taken from the rest of the profile. An
+    evenly sampled log holds it for one sample, as every other row. The default
+    second was used for all of them, so a 10 Hz lap stood on its final row ten
+    times too long, every lap.
+
+    A profile with uneven rows is a bench profile of steps and holds, and its
+    last row is the marker that ends the hold before it, not a sample. That one
+    keeps the default, or the shortest row if that is shorter still.
+    """
+    gaps = [_row_gap(lap_data, i, None) for i in range(len(lap_data) - 1)]
+    gaps = [g for g in gaps if g is not None]
+    if not gaps:
+        return default
+    shortest, longest = min(gaps), max(gaps)
+    if longest - shortest <= 0.01 * longest:
+        return longest
+    return min(default, shortest)
 
 
 def resistance_to_steps(req_r, min_r=0.0):
@@ -1039,24 +1551,34 @@ def resistance_to_steps(req_r, min_r=0.0):
 
 
 def heartbeat_due(fsm_state, since_last_s):
-    """Whether the resistor controller should be sent an "alive" now.
+    """Whether the resistor controller should be sent its keep-alive now.
 
-    RUNNING is included deliberately. The heartbeat used to stop once a run
-    began, leaving the per-row resistance commands as the only thing feeding the
-    Arduino's 2 s watchdog. With the shipped 1 s rows that left about 0.9 s of
-    margin; a profile with rows ~2 s apart, or a single command lost on the
-    wire, let the watchdog fire mid-run. That opens the main contactor under full
-    load, and the next command re-closes it a few milliseconds later.
-
-    "alive" moves no relay, so this holds the bank at its current resistance
-    between rows. The watchdog still protects against a stalled host, because
-    the heartbeat comes from this same loop.
-
-    Not in FAULT: the load has been killed, and letting the watchdog lapse there
-    is a second, independent guarantee that it stays shed.
+    In every state, every HEARTBEAT_INTERVAL_S. What is sent depends on the
+    state: see keepalive_message().
     """
-    return (fsm_state in ("IDLE", "ARMED", "RUNNING")
-            and since_last_s > HEARTBEAT_INTERVAL_S)
+    return since_last_s > HEARTBEAT_INTERVAL_S
+
+
+def keepalive_message(fsm_state):
+    """The line the controller is sent every HEARTBEAT_INTERVAL_S in this state.
+
+    RUNNING: "alive". It feeds the Arduino's 2 s watchdog and moves no relay, so
+    it holds the bank at its resistance between rows. Without it a profile with
+    rows ~2 s apart, or one command lost on the wire, let the watchdog open the
+    main contactor under full load, with the next command re-closing it
+    milliseconds later. The watchdog still catches a stalled host, because the
+    heartbeat comes from this same loop.
+
+    Every other state: "KILL". The bank must be disconnected whenever the rig is
+    not running, so the host says so again twice a second instead of saying
+    "alive". KILL does not feed the watchdog, so in FAULT the watchdog still
+    lapses as a second, independent guarantee. The heartbeat here used to be
+    "alive" in IDLE and ARMED: when a run ended, one KILL went out and the rig
+    went back to feeding the watchdog, so had that one line been lost the
+    contactor stayed closed at the last setting with nothing to open it. A failed
+    write still shows a dead link, as "alive" did.
+    """
+    return b"alive\n" if fsm_state == "RUNNING" else b"KILL\n"
 
 
 def is_valid_transition(current_state, command):
@@ -1075,18 +1597,30 @@ def is_valid_transition(current_state, command):
 TRANSITION_COMMANDS = ("ARM", "RUN", "RESET")
 
 
+def press_clock():
+    """The clock every ARM, RUN and RESET press, and every stop and fault, is stamped with.
+
+    time.perf_counter(): one clock for every process on the machine (on Windows
+    since Python 3.10) and fine-grained. time.monotonic() is system-wide too,
+    but on Windows before Python 3.13 it steps every 15.6 ms, so a RESET pressed
+    in the same step as the fault it follows compared equal to it and was
+    thrown away as stale. The operator had to press it again, and the tests for
+    it failed about one run in two.
+    """
+    return time.perf_counter()
+
+
 def transition_command(name, *args):
     """ARM, RUN or RESET as the GUI queues it: (name, *args, issued_at).
 
-    issued_at is time.monotonic() when the operator pressed the button. The logic
+    issued_at is press_clock() when the operator pressed the button. The logic
     process acts on the command only if it was issued after the most recent stop
     or fault (stale_transition() below), so a press already waiting in the queue
-    cannot undo an E-STOP. time.monotonic() is the system-wide clock on Windows
-    and Linux, so the GUI's stamp and the logic process's are comparable.
+    cannot undo an E-STOP.
     """
     if name not in TRANSITION_COMMANDS:
         raise ValueError(f"not a state transition: {name!r}")
-    return (name, *args, time.monotonic())
+    return (name, *args, press_clock())
 
 
 def parse_transition(cmd):
@@ -1102,6 +1636,23 @@ def parse_transition(cmd):
     if not isinstance(cmd, tuple) or len(cmd) != arg_count + 2 or not _finite(cmd[-1]):
         return name, (), None
     return name, tuple(cmd[1:-1]), float(cmd[-1])
+
+
+def run_laps(args):
+    """The lap count a RUN command carries, or None if it is not a count.
+
+    The GUI sends a spinbox value, but anything can put a RUN on the queue, and
+    a None or a 0 here used to reach the lap comparison mid-run.
+    """
+    try:
+        laps = args[0]
+    except (IndexError, TypeError):
+        return None
+    if isinstance(laps, bool) or not isinstance(laps, (int, float)):
+        return None
+    if not math.isfinite(laps) or laps != int(laps) or laps < 1:
+        return None
+    return int(laps)
 
 
 def stale_transition(issued_at, fault_at):
@@ -1132,10 +1683,17 @@ def kill_load(res_ser):
 
 
 def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Queue,
-                      stop_event: Event, discovery_lock=None, estop_event=None):
+                      stop_event: Event, discovery_lock=None, estop_event=None,
+                      sil_mode=False):
+    """The logic process: state machine, trips, lap playback and the resistor controller.
+
+    `sil_mode` is True when main_v2 found the SIL dongle and the DAQ is the
+    desk-test plant model. Its current is a slider the operator drags, not what
+    the ladder would draw, so the load check is skipped there.
+    """
     fsm_state = "DISCONNECTED"
     target_res = 0.0
-    # time.monotonic() at the most recent stop or fault; see stale_transition().
+    # press_clock() at the most recent stop or fault; see stale_transition().
     fault_at = None
 
     # --- Resistor controller discovery, off the safety loop ---
@@ -1178,17 +1736,45 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     discovery = threading.Thread(target=resistor_discovery_worker, daemon=True)
 
     res_ser = None
+    # What the controller has printed that is not yet a whole line, and when
+    # this handle was taken. See read_controller_lines() and CONTROLLER_BOOT_S.
+    res_pending = b""
+    res_connected_at = 0.0
+    controller_rejects = 0
+    # bank_steps_at of the setting last sent a second time after a rejection.
+    resent_setting_at = None
 
-    def latch_fault():
+    # Why the rig is in FAULT, for the GUI: the reason and trip_details()'s
+    # lines. Cleared by RESET.
+    fault_reason = None
+    fault_detail = []
+
+    def latch_fault(reason, details=()):
         """Enter FAULT, and void every ARM, RUN and RESET issued before now.
 
         Called for every stop and fault, including a stop while already in
         FAULT: the operator's latest press is a stop, so a RESET made before it
         must not clear it.
         """
-        nonlocal fsm_state, fault_at
+        nonlocal fsm_state, fault_at, fault_reason, fault_detail
         fsm_state = "FAULT"
-        fault_at = time.monotonic()
+        fault_at = press_clock()
+        fault_reason, fault_detail = reason, list(details)
+
+    def operator_stop(reason):
+        """E-STOP or a queued STOP: latch, KILL at once, then report and log it."""
+        stopped_in = fsm_state
+        had_link = res_ser is not None
+        latch_fault(reason, ["Operator stop"])
+        killed = kill_load(res_ser)
+        killed_at = time.time()
+        print("[LOGIC] EMERGENCY STOP triggered via GUI.")
+        if not killed:
+            drop_resistor_link("KILL")
+        append_trip_log(trip_record(
+            reason, stopped_in, fault_detail,
+            ladder_ohm=target_res if stopped_in == "RUNNING" else None,
+            kill_sent=killed if had_link else None, killed_at=killed_at))
 
     def drop_resistor_link(what):
         """The controller stopped taking writes, or its port closed under us.
@@ -1210,9 +1796,33 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 pass
         print(f"\n[LOGIC] Resistor controller link lost ({what}).")
         if fsm_state in ("ARMED", "RUNNING"):
-            latch_fault()
+            lost_in = fsm_state
+            latch_fault("RESISTOR LINK LOST",
+                        [f"Controller link lost ({what}); its watchdog sheds the load"])
             print("[LOGIC] RESISTOR LINK LOST ALARM! Commands are not reaching the "
                   "controller; its watchdog sheds the load 2 s after the last one did.")
+            append_trip_log(trip_record(
+                "RESISTOR LINK LOST", lost_in, fault_detail,
+                ladder_ohm=target_res if lost_in == "RUNNING" else None, kill_sent=False))
+
+    def controller_fault(reason, detail, packet):
+        """The controller reported something a loaded rig cannot carry on from.
+
+        KILL first, as for a measured trip: after a restart the board is back
+        and listening, and its next valid command would reconnect the bank.
+        """
+        tripped_in = fsm_state
+        latch_fault(reason, [detail])
+        killed = kill_load(res_ser)
+        killed_at = time.time()
+        print(f"\n[LOGIC] {reason} ALARM! Killing Load.")
+        print(f"[LOGIC] {detail}")
+        if not killed:
+            drop_resistor_link("KILL")
+        append_trip_log(trip_record(
+            reason, tripped_in, fault_detail, packet,
+            ladder_ohm=target_res if tripped_in == "RUNNING" else None,
+            kill_sent=killed, killed_at=killed_at))
 
     # All limits, the pack spec and the vehicle model come from rig_config.json
     # (falling back to the RS50 12S4P defaults). Nothing here is hardcoded, so a
@@ -1240,6 +1850,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
           f"bank {VRB_MAX_POWER_W * bank_power_factor(limits) / 1000:.1f} kW total and "
           f"{bank_power_factor(limits) * 100:.0f}% of each bank's rating | resistors "
           + "/".join(f"{t:.0f}" for t in limits['resistor_max_temp']) + " C")
+    if config.daq.busbar_sensor_count > 0:
+        print(f"[LOGIC] Bus bars: {config.daq.busbar_sensor_count} sensor(s), trip "
+              f"{limits['busbar_max_temp']:.0f} C in every state; one that stops reporting "
+              f"faults the rig once armed.")
+    else:
+        print("[LOGIC] Bus bars: no sensors configured (busbar_sensor_count is 0).")
     # Trips past a rating block ARM, and print with the config errors below.
     for warning in config.limits.advisories():
         print(f"[LOGIC WARNING] {warning}")
@@ -1259,7 +1875,8 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     settings_id = config.settings_fingerprint()
 
     last_heartbeat = time.time()
-    last_physics_time = time.time()
+    # When the next profile row is due while running. See next_row_due().
+    next_row_at = 0.0
 
     # --- COULOMB COUNTING VARIABLES ---
     total_capacity_ah = pack.capacity_ah
@@ -1282,9 +1899,52 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     bank_steps = None
     bank_steps_at = 0.0
 
+    # The load check: how many settled readings in a row have disagreed with
+    # the ladder setting, and the latest one's description. See load_mismatch().
+    load_check_run = 0
+    load_problem = None
+    if sil_mode:
+        print("[LOGIC] SIL mode: the load check is off. The plant's current is a slider, "
+              "not what the ladder would draw.")
+
+    # The operator's load override (parse_override()), None to follow the
+    # profile. override_due sends a change on the next pass rather than at the
+    # next row. profile_steps is the profile's own setting for the current row,
+    # computed even while overridden so handing back is immediate.
+    override = None
+    override_due = False
+    override_sent_at = 0.0
+    profile_steps = None
+
+    # The resistance asked for before any floor, rating or 0.25 ohm step: the
+    # row's own (profile_asked), and whichever of that and the override is in
+    # force (asked_res). Reported beside the setting sent, because near the
+    # bottom of the ladder the two differ by a large part of the load. See
+    # requested_resistance().
+    profile_asked = None
+    asked_res = None
+
+    def set_ladder(steps):
+        """Send a ladder setting while running, and note it for the per-bank trip."""
+        nonlocal target_res, bank_steps, bank_steps_at
+        # What the ladder is actually set to, not the continuous request. Near
+        # the bottom of the ladder the two can differ by a whole step.
+        target_res = steps * RESISTOR_RESOLUTION
+        if send_binary_command(res_ser, steps):
+            # The firmware ignores a repeat of its current setting, so only a
+            # change restarts the settle time.
+            if steps != bank_steps:
+                bank_steps, bank_steps_at = steps, time.time()
+        else:
+            drop_resistor_link("resistance command")
+
+    # The profile this process actually holds, reported in every packet. The
+    # window used to show whichever file the operator last picked, loaded or not.
+    profile_name = None
     try:
         lap_data, dropped = load_lap_profile(CSV_FILENAME)
         total_rows = len(lap_data)
+        profile_name = DEFAULT_LAP_CSV
         print(f"[LOGIC] Loaded default lap profile: {total_rows} rows"
               + (f" ({dropped} unusable rows dropped)." if dropped else "."))
     except Exception as e:
@@ -1300,6 +1960,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
     # finally below can leave it running.
     discovery.start()
     clean_exit = False
+    crash = None
     try:
         while not stop_event.is_set():
             # Never `continue` past the loop body on an empty queue. Doing so skipped
@@ -1312,11 +1973,13 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                 data = daq_queue.get(timeout=0.1)
                 last_data = data
                 last_daq_rx = time.time()
+                fresh_sample = True
             except Empty:
                 # Carry the last packet forward, tagged with its age so the staleness
                 # check can fault on it. Copy it: section G writes FSM fields into
                 # the packet before forwarding.
                 data = dict(last_data) if last_data is not None else NEUTRAL_PACKET()
+                fresh_sample = False
 
             data['daq_age_s'] = time.time() - last_daq_rx
 
@@ -1326,12 +1989,58 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             if res_ser is None:
                 with slot_lock:
                     res_ser = resistor_slot['ser']
+                if res_ser is not None:
+                    res_pending, res_connected_at = b"", time.time()
 
             # A port that closed under us is a lost link, like a failed write. It
             # used to drop a running rig to DISCONNECTED, and a reconnect then took
             # it straight back to IDLE with no fault on record.
             if res_ser is not None and not res_ser.is_open:
                 drop_resistor_link("port closed")
+
+            # --- A2. What the controller has to say ---
+            # Read before the commands below, so a line is judged against the
+            # state the rig was in when the controller printed it.
+            if res_ser is not None:
+                heard = read_controller_lines(res_ser, res_pending)
+                if heard is None:
+                    drop_resistor_link("read")
+                else:
+                    lines, res_pending = heard
+                    for kind in filter(None, map(classify_controller_line, lines)):
+                        if kind == "rejected":
+                            controller_rejects += 1
+                            print(f"[LOGIC WARNING] The resistor controller rejected a line "
+                                  f"({controller_rejects} so far). A command may not have "
+                                  f"been applied.")
+                            # If that was this row's command, the bank is still at
+                            # the row before. Say it again, once per setting; the
+                            # firmware ignores a repeat of what it already holds.
+                            # If it is refused again the load check faults the run.
+                            if (fsm_state == "RUNNING" and bank_steps is not None
+                                    and resent_setting_at != bank_steps_at):
+                                resent_setting_at = bank_steps_at = time.time()
+                                if not send_binary_command(res_ser, bank_steps):
+                                    drop_resistor_link("resistance command")
+                                    break
+                        elif kind == "reset":
+                            if time.time() - res_connected_at < CONTROLLER_BOOT_S:
+                                continue
+                            if fsm_state in ("ARMED", "RUNNING"):
+                                controller_fault(
+                                    "CONTROLLER RESET",
+                                    "The resistor controller restarted, which drops every "
+                                    "relay. Check its supply: a brownout or noise as the "
+                                    "contactor or relay coils switch", data)
+                            else:
+                                print("[LOGIC WARNING] The resistor controller restarted.")
+                        elif kind == "shed" and fsm_state == "RUNNING" and bank_steps is not None:
+                            # The host sends no KILL while RUNNING, so this was the
+                            # controller's own watchdog: heartbeats did not reach it.
+                            controller_fault(
+                                "CONTROLLER SHED LOAD",
+                                "The resistor controller's watchdog opened the contactor "
+                                "mid-run: it went 2 s without hearing from the host", data)
 
             if res_ser is None:
                 if fsm_state != "FAULT":
@@ -1346,10 +2055,7 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             # check and the clear is the same stop.
             if estop_event is not None and estop_event.is_set():
                 estop_event.clear()
-                latch_fault()
-                print("[LOGIC] EMERGENCY STOP triggered via GUI.")
-                if not kill_load(res_ser):
-                    drop_resistor_link("KILL")
+                operator_stop("E-STOP")
 
             # --- C. Process GUI Commands ---
             while not gui_cmd_queue.empty():
@@ -1390,32 +2096,44 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             print("[LOGIC] Ignoring config change while RUNNING. Stop the run first.")
                         else:
                             try:
+                                # Everything that can fail on a bad value is
+                                # worked out first, on the side. The swap below
+                                # then cannot stop half way: a config that
+                                # raised used to be reported as rejected after
+                                # its pack and limits were already in force.
                                 new_config = RigConfig.from_dict(cmd[1])
-                                config = new_config
-                                pack = config.pack
-                                vehicle = config.vehicle
-
-                                limits = config.limits.to_command_dict()
+                                new_pack, new_vehicle = new_config.pack, new_config.vehicle
+                                new_limits = new_config.limits.to_command_dict()
+                                new_capacity = float(new_pack.capacity_ah)
+                                if not (math.isfinite(new_capacity) and new_capacity > 0):
+                                    raise ValueError(f"module capacity {new_capacity!r} Ah")
+                                new_settings_id = new_config.settings_fingerprint()
+                                summary = (f"[LOGIC] Config updated -> {new_pack.cell_model} "
+                                           f"{new_pack.series_count}S{new_pack.parallel_count}P, "
+                                           f"{new_capacity:.1f} Ah, "
+                                           f"{new_vehicle.total_mass_kg:.0f} kg car+driver")
+                                warnings = list(new_config.limits.advisories())
+                            except Exception as exc:
+                                print(f"[LOGIC ERROR] Rejected bad config, nothing changed: {exc}")
+                            else:
+                                config, pack, vehicle = new_config, new_pack, new_vehicle
+                                limits = new_limits
 
                                 # A new pack is judged against the wiring the DAQ is
                                 # running, not the new DAQ section, which waits for a
-                                # restart. Straight after the swap, so nothing below
-                                # can leave it judging the old pack.
+                                # restart. Neither call can raise: both fail closed.
                                 config_problems = config_blockers(running_daq, pack, limits)
                                 expected = expected_measurements(running_daq, pack)
-                                settings_id = config.settings_fingerprint()
+                                settings_id = new_settings_id
 
                                 # Capacity change invalidates the running coulomb
                                 # count, so rebaseline rather than carry a stale Ah.
-                                total_capacity_ah = pack.capacity_ah
+                                total_capacity_ah = new_capacity
                                 remaining_ah = total_capacity_ah
                                 last_coulomb_time = time.time()
 
-                                print(f"[LOGIC] Config updated -> {pack.cell_model} "
-                                      f"{pack.series_count}S{pack.parallel_count}P, "
-                                      f"{pack.capacity_ah:.1f} Ah, "
-                                      f"{vehicle.total_mass_kg:.0f} kg car+driver")
-                                for warning in config.limits.advisories():
+                                print(summary)
+                                for warning in warnings:
                                     print(f"[LOGIC WARNING] {warning}")
 
                                 report_config_problems(config_problems)
@@ -1423,8 +2141,24 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                     print("[LOGIC] DAQ settings changed. They apply on restart; "
                                           "until then ARM is judged against the wiring the DAQ "
                                           "started with.")
-                            except Exception as exc:
-                                print(f"[LOGIC ERROR] Rejected bad config: {exc}")
+
+                    elif isinstance(cmd, tuple) and cmd[0] == "SET_OVERRIDE":
+                        # Taken in any state, RUNNING included: it moves the load
+                        # only within the floors a lap row is held to.
+                        try:
+                            override = parse_override(cmd)
+                        except ValueError as exc:
+                            print(f"[LOGIC] Ignoring load override: {exc}")
+                        else:
+                            override_due = True
+                            print(f"[LOGIC] Load override {describe_override(override)}.")
+
+                    elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV" and fsm_state == "RUNNING":
+                        # Like a new config: not under a run. It used to be taken,
+                        # sending the run back to row 0 of the new profile with the
+                        # old one's speed carried in, and the file was parsed on
+                        # this loop while it was holding a load.
+                        print("[LOGIC] Ignoring profile change while RUNNING. Stop the run first.")
 
                     elif isinstance(cmd, tuple) and cmd[0] == "LOAD_CSV":
                         filepath = cmd[1]
@@ -1432,12 +2166,16 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             lap_data, dropped = load_lap_profile(filepath)
                             total_rows = len(lap_data)
                             current_row_idx = 0
+                            profile_name = os.path.basename(str(filepath))
                             print(f"\n[LOGIC] Successfully loaded new lap profile: {filepath}")
                             print(f"[LOGIC] Total rows: {total_rows}"
                                   + (f" ({dropped} unusable rows dropped)" if dropped else ""))
                             if total_rows > 1:
                                 span = lap_row_interval(lap_data, 0)
                                 print(f"[LOGIC] Row interval from profile timestamps: {span:.3f} s")
+                            if lap_data and profile_resistance(lap_data[0]) is not None:
+                                print("[LOGIC] Bench profile: each row sets the resistance, held "
+                                      "to the same current, power and derate floors as a lap.")
                         except Exception as e:
                             print(f"\n[LOGIC ERROR] Failed to load new CSV: {e}")
 
@@ -1453,15 +2191,27 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                             print("[LOGIC] System ARMED.")
 
                     elif name == "RUN" and is_valid_transition(fsm_state, "RUN"):
-                        if total_rows > 0:
-                            total_laps = args[0]
+                        laps = run_laps(args)
+                        if laps is None:
+                            print(f"[LOGIC] Cannot RUN: laps must be a whole number of 1 or "
+                                  f"more, not {args[0] if args else None!r}.")
+                        elif total_rows > 0:
+                            total_laps = laps
                             fsm_state = "RUNNING"
                             current_row_idx = 0
                             current_lap = 1
                             prev_velocity_ms = 0.0
                             prev_time_s = 0.0
                             row_interval = lap_row_interval(lap_data, 0)
+                            # The first row is due now.
+                            next_row_at = time.time()
                             bank_steps = None
+                            # An override in force goes out on the first pass;
+                            # without one, the first row does.
+                            profile_steps = None
+                            profile_asked = asked_res = None
+                            override_due = False
+                            override_sent_at = 0.0
 
                             # Coulomb count deliberately CARRIES OVER between runs.
                             # Resetting to full here meant two manually-triggered
@@ -1475,20 +2225,21 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                                   f"row interval {row_interval:.3f} s | "
                                   f"starting SOC {(remaining_ah / total_capacity_ah) * 100:.1f}% "
                                   f"({remaining_ah:.2f} Ah)")
+                            if override is not None:
+                                print(f"[LOGIC] Load override {describe_override(override)}; "
+                                      f"the profile sets only the timing and laps.")
                         else:
                             print("[LOGIC] Cannot RUN: No lap data loaded!")
 
                     elif cmd == "STOP" and is_valid_transition(fsm_state, "STOP"):
                         # Still accepted from the queue, for callers with no E-STOP
                         # event (the bench tools); the GUI uses the event.
-                        latch_fault()
-                        print("[LOGIC] EMERGENCY STOP triggered via GUI.")
-                        if not kill_load(res_ser):
-                            drop_resistor_link("KILL")
+                        operator_stop("STOP")
 
                     elif name == "RESET" and is_valid_transition(fsm_state, "RESET"):
                         fsm_state = "IDLE"
                         target_res = 0.0
+                        fault_reason, fault_detail = None, []
                 except Empty:
                     break
 
@@ -1503,45 +2254,52 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     and time.time() - bank_steps_at >= BANK_SETTLE_S):
                 settled_steps = bank_steps
 
+            # The load check counts new DAQ samples only, each taken after the
+            # setting had settled: a packet carried forward is the same reading
+            # again, and one sampled before the relays moved belongs to the
+            # setting before. A reading that fits clears the count.
+            if fsm_state != "RUNNING" or sil_mode or not limits.get('load_check', True):
+                load_check_run, load_problem = 0, None
+            elif fresh_sample and settled_steps is not None:
+                sampled_at = data.get('sampled_at')
+                if not _finite(sampled_at) or sampled_at - bank_steps_at >= BANK_SETTLE_S:
+                    load_problem = load_mismatch(data.get('voltage'), data.get('amps'),
+                                                 settled_steps)
+                    load_check_run = load_check_run + 1 if load_problem else 0
+
             is_fault, trigger_reason = evaluate_safety(
                 data, limits, armed=fsm_state in ("ARMED", "RUNNING"),
                 config_problems=config_problems, bank_steps=settled_steps,
-                expected=expected)
+                expected=expected,
+                load_problem=load_problem if load_check_run >= LOAD_CHECK_SAMPLES else None)
 
-            if is_fault and fsm_state not in ["FAULT", "DISCONNECTED"]:
-                latch_fault()
+            # DISCONNECTED latches too. It used to be skipped along with FAULT, so
+            # a rig waiting on its controller or its temperature board showed
+            # nothing and logged nothing with every cell at 95 C. Only the trips
+            # that apply in every state can fire there: `armed` is False.
+            if is_fault and fsm_state != "FAULT":
+                tripped_in = fsm_state
+                had_link = res_ser is not None
+                latch_fault(trigger_reason)
+                # KILL first: describing, printing and logging the trip all wait
+                # until it has gone out.
+                killed = kill_load(res_ser)
+                killed_at = time.time()
                 print(f"\n[LOGIC] {trigger_reason} ALARM! Killing Load.")
-                if trigger_reason == "TEMP SENSOR FAULT":
-                    dead = stale_temp_sensors(data.get('temp_sensor_ages_s', []),
-                                              limits['temp_stale_timeout'])
-                    print("[LOGIC] No valid reading from: "
-                          + ", ".join(f"bus {b} sensor {s}" for b, s in dead))
-                elif trigger_reason == "RESISTOR OVERTEMP":
-                    hot = hot_resistor_banks(data.get('resistor_temps', []),
-                                             limits['resistor_max_temp'])
-                    print("[LOGIC] " + ", ".join(f"Bank {b} at {t:.0f} C (trip {lim:.0f} C)"
-                                                 for b, t, lim in hot))
-                elif trigger_reason == "CONFIG FAULT":
-                    for problem in config_problems:
-                        print(f"[LOGIC]   - {problem}")
-                elif trigger_reason in ("INVALID READING", "INCOMPLETE DATA"):
-                    for _, detail in measurement_problems(data, expected):
-                        print(f"[LOGIC]   - {detail}")
-                elif trigger_reason == "BANK OVERPOWER":
-                    volts, amps = data.get('voltage', 0.0), data.get('amps', 0.0)
-                    factor = bank_power_factor(limits)
-                    print(f"[LOGIC] Ladder at {volts * amps:.0f} W "
-                          f"(limit {VRB_MAX_POWER_W * factor:.0f} W)")
-                    if settled_steps:
-                        for b, w, lim in overpowered_banks(volts, amps, settled_steps, factor):
-                            print(f"[LOGIC] Bank {b} at {w:.0f} W (limit {lim:.0f} W)")
-                elif trigger_reason == "RESISTOR TC FAULT":
-                    dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
-                                                limits['temp_stale_timeout'])
-                    print("[LOGIC] No valid thermocouple reading from: "
-                          + ", ".join(f"bank {b}" for b in dead))
-                if not kill_load(res_ser):
+                try:
+                    fault_detail = trip_details(trigger_reason, data, limits, config_problems,
+                                                expected, settled_steps)
+                except Exception as exc:
+                    # Describing a trip must never stop the loop that handles it.
+                    fault_detail = [f"(could not describe the trip: {exc!r})"]
+                for line in fault_detail:
+                    print(f"[LOGIC] {line}")
+                if not killed:
                     drop_resistor_link("KILL")
+                append_trip_log(trip_record(
+                    trigger_reason, tripped_in, fault_detail, data,
+                    ladder_ohm=target_res if tripped_in == "RUNNING" else None,
+                    kill_sent=killed if had_link else None, killed_at=killed_at))
 
             # --- E. Coulomb Counting Math ---
             current_time = time.time()
@@ -1553,9 +2311,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             # --- F. Finite State Machine Actions ---
             if res_ser and res_ser.is_open:
                 if heartbeat_due(fsm_state, time.time() - last_heartbeat):
-                    # A failed heartbeat used to be swallowed, leaving the handle in
-                    # place and the rig RUNNING with nothing reaching the Arduino.
-                    if not write_resistor(res_ser, b"alive\n"):
+                    # "alive" while running, KILL in every other state: see
+                    # keepalive_message(). A failed one used to be swallowed,
+                    # leaving the handle in place and the rig RUNNING with
+                    # nothing reaching the Arduino.
+                    if not write_resistor(res_ser, keepalive_message(fsm_state)):
                         drop_resistor_link("heartbeat")
                     last_heartbeat = time.time()
 
@@ -1563,80 +2323,124 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
                     # Dwell on each row for the interval the profile itself declares,
                     # not a fixed second. A 10 Hz log played at 1 row/s would run ten
                     # times too slow and hold every power demand ten times too long.
-                    if time.time() - last_physics_time >= row_interval:
+                    # Rows are due on the profile's own timeline: next_row_due().
+                    now = time.time()
+                    if now >= next_row_at:
+                        if current_row_idx >= total_rows and current_lap < total_laps:
+                            # Straight on to the next lap's first row in this
+                            # pass. The wrap used to cost a pass of its own.
+                            current_lap += 1
+                            current_row_idx = 0
+                            print(f"[LOGIC] Starting Lap {current_lap} of {total_laps}")
+
                         if current_row_idx < total_rows:
                             row = lap_data[current_row_idx]
-
-                            # Standing start is the start of the RUN, not of a lap:
-                            # lap 2 onwards inherits the car's carried velocity.
-                            standing_start = (current_lap == 1 and current_row_idx == 0)
-
-                            # On a lap repeat the profile's clock restarts, so the
-                            # raw timestamp difference is large and negative. Bridge
-                            # that one frame with the profile's own sampling
-                            # interval rather than a literal, so this stays correct
-                            # whatever rate the loaded CSV was logged at.
-                            wrap_dt = None
-                            if current_row_idx == 0 and current_lap > 1:
-                                wrap_dt = lap_row_interval(lap_data, 0)
-
-                            velocity_ms, acceleration, current_time_s = compute_lap_physics(
-                                row, prev_velocity_ms, prev_time_s,
-                                standing_start, current_row_idx, lap_wrap_dt=wrap_dt
-                            )
-                            prev_velocity_ms = velocity_ms
-                            prev_time_s = current_time_s
-
-                            req_power = compute_required_power(velocity_ms, acceleration, vehicle)
-
                             voltage = data['voltage']
                             current_max_temp = data['max_temp']
+                            bench_ohms = profile_resistance(row)
 
-                            steps = command_steps(
-                                voltage, req_power, limits['max_amps'], current_max_temp,
-                                limits['derate_en'], limits['derate_start'], limits['max_temp'],
-                                modules_in_series=pack.modules_in_series,
-                                power_factor=bank_power_factor(limits)
-                            )
-
-                            # What the ladder is actually set to, not the continuous
-                            # request. Near the bottom of the ladder the two can
-                            # differ by a whole step.
-                            target_res = steps * RESISTOR_RESOLUTION
-
-                            if send_binary_command(res_ser, steps):
-                                # The firmware ignores a repeat of its current
-                                # setting, so only a change restarts the settle time.
-                                if steps != bank_steps:
-                                    bank_steps, bank_steps_at = steps, time.time()
+                            if bench_ohms is not None:
+                                # A bench profile names the resistance. Held to the
+                                # same floors and ratings as a lap row.
+                                profile_asked = bench_ohms
+                                steps = steps_for_resistance(
+                                    voltage, bench_ohms, limits['max_amps'], current_max_temp,
+                                    limits['derate_en'], limits['derate_start'],
+                                    limits['max_temp'], power_factor=bank_power_factor(limits)
+                                )
                             else:
-                                drop_resistor_link("resistance command")
+                                # Standing start is the start of the RUN, not of a
+                                # lap: lap 2 onwards inherits the car's velocity.
+                                standing_start = (current_lap == 1 and current_row_idx == 0)
 
-                            row_interval = lap_row_interval(lap_data, current_row_idx)
+                                # On a lap repeat the profile's clock restarts, so the
+                                # raw timestamp difference is large and negative.
+                                # Bridge that one frame with the profile's own
+                                # sampling interval rather than a literal, so this
+                                # stays correct whatever rate the CSV was logged at.
+                                wrap_dt = None
+                                if current_row_idx == 0 and current_lap > 1:
+                                    wrap_dt = lap_row_interval(lap_data, 0)
+
+                                velocity_ms, acceleration, current_time_s = compute_lap_physics(
+                                    row, prev_velocity_ms, prev_time_s,
+                                    standing_start, current_row_idx, lap_wrap_dt=wrap_dt
+                                )
+                                prev_velocity_ms = velocity_ms
+                                prev_time_s = current_time_s
+
+                                req_power = compute_required_power(velocity_ms, acceleration,
+                                                                   vehicle)
+
+                                profile_asked = requested_resistance(
+                                    voltage, req_power, pack.modules_in_series)
+                                steps = command_steps(
+                                    voltage, req_power, limits['max_amps'], current_max_temp,
+                                    limits['derate_en'], limits['derate_start'],
+                                    limits['max_temp'],
+                                    modules_in_series=pack.modules_in_series,
+                                    power_factor=bank_power_factor(limits)
+                                )
+
+                            # Worked out even while overridden, so the physics keeps
+                            # pace with the lap and handing back is immediate.
+                            profile_steps = steps
+                            if override is None:
+                                asked_res = profile_asked
+                                set_ladder(steps)
+
+                            hold = lap_row_interval(lap_data, current_row_idx)
                             current_row_idx += 1
-                            last_physics_time = time.time()
+                            next_row_at = next_row_due(next_row_at, now, hold)
                         else:
-                            if current_lap < total_laps:
-                                current_lap += 1
-                                current_row_idx = 0
-                                row_interval = lap_row_interval(lap_data, 0)
-                                print(f"[LOGIC] Starting Lap {current_lap} of {total_laps}")
+                            target_res = 0.0
+                            if kill_load(res_ser):
+                                fsm_state = "IDLE"
+                                print(f"[LOGIC] All {total_laps} laps completed. System Idling.")
                             else:
-                                target_res = 0.0
-                                if kill_load(res_ser):
-                                    fsm_state = "IDLE"
-                                    print(f"[LOGIC] All {total_laps} laps completed. System Idling.")
-                                else:
-                                    # Still RUNNING here, so this latches a fault:
-                                    # the KILL that ends the run never went out.
-                                    drop_resistor_link("KILL at the end of the run")
-                                last_physics_time = time.time()
+                                # Still RUNNING here, so this latches a fault:
+                                # the KILL that ends the run never went out.
+                                drop_resistor_link("KILL at the end of the run")
+
+                    # The operator's override, in place of the profile's load: sent
+                    # as soon as it changes, and re-solved every OVERRIDE_REFRESH_S
+                    # because a power override follows the module voltage. When it
+                    # is handed back, the current row's own setting goes out at once.
+                    if fsm_state == "RUNNING" and (override is not None or override_due):
+                        if override_due or time.time() - override_sent_at >= OVERRIDE_REFRESH_S:
+                            steps = profile_steps
+                            asked_res = profile_asked
+                            if override is not None:
+                                voltage = data['voltage']
+                                asked_res = override_resistance(override, voltage)
+                                steps = steps_for_resistance(
+                                    voltage, asked_res,
+                                    limits['max_amps'], data['max_temp'],
+                                    limits['derate_en'], limits['derate_start'],
+                                    limits['max_temp'], power_factor=bank_power_factor(limits)
+                                )
+                            override_due = False
+                            override_sent_at = time.time()
+                            if steps is not None:
+                                set_ladder(steps)
 
             # --- G. Pipeline Forwarding ---
             data['fsm_state'] = fsm_state
             data['target_resistance'] = target_res
             data['current_lap'] = current_lap
             data['total_laps'] = total_laps
+            # The profile in force and the row last sent, for the window and
+            # the recording. Rows count from 1; 0 before the first is sent.
+            data['profile_name'] = profile_name
+            data['profile_rows'] = total_rows
+            data['profile_row'] = current_row_idx if fsm_state == "RUNNING" else 0
+            # What the ladder setting in circuit should draw at this voltage, for
+            # the recording: the load check's own figure. None when not running.
+            data['expected_amps'] = (expected_load_amps(data.get('voltage'), bank_steps)
+                                     if fsm_state == "RUNNING" else None)
+            # What was asked for before it was rounded to a step, beside
+            # target_resistance, the step sent.
+            data['requested_resistance'] = asked_res if fsm_state == "RUNNING" else None
             data['remaining_ah'] = remaining_ah
             data['true_soc'] = true_soc
             data['hardware_status']['res_arduino'] = (res_ser is not None)
@@ -1649,6 +2453,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             data['active_limits'] = {k: (list(v) if isinstance(v, list) else v)
                                      for k, v in limits.items()}
             data['active_settings'] = settings_id
+            # The override in force, so the window can show it took.
+            data['load_override'] = override
+            # Why it faulted, so the window can say so rather than only FAULT.
+            in_fault = fsm_state == "FAULT"
+            data['fault_reason'] = fault_reason if in_fault else None
+            data['fault_detail'] = list(fault_detail) if in_fault else []
 
             # Never blocks: a blocking get or put here would stall every trip, the
             # E-STOP and the heartbeat behind the GUI's queue. See put_latest().
@@ -1659,8 +2469,11 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
         # does not keep showing the last state it was sent -- RUNNING, say.
         print(f"\n[LOGIC CRITICAL ERROR] {exc!r}. Killing the load and stopping the "
               f"logic process.")
+        crash = exc
         crashed = NEUTRAL_PACKET()
         crashed['fsm_state'] = "FAULT"
+        crashed['fault_reason'] = "LOGIC ERROR"
+        crashed['fault_detail'] = [repr(exc)]
         crashed['hardware_status'] = {'res_arduino': False}
         put_latest(telemetry_queue, crashed)
         raise
@@ -1675,12 +2488,18 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
             final_ser = resistor_slot['ser'] or res_ser
             resistor_slot['ser'] = None
 
+        killed = None
         if final_ser is not None:
-            kill_load(final_ser)
+            killed = kill_load(final_ser)
             try:
                 final_ser.close()
             except Exception:
                 pass
+
+        # Logged after the KILL above, like every other trip.
+        if crash is not None:
+            append_trip_log(trip_record("LOGIC ERROR", fsm_state, [repr(crash)],
+                                        kill_sent=killed, killed_at=time.time()))
 
         # The worker is a daemon and waits on logic_done, so it exits on its
         # own; join briefly so its port handles are released before the process

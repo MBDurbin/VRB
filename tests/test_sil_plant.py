@@ -2,7 +2,7 @@
 The SIL plant models the configured pack and wiring, not a hardcoded one.
 
 It used to hardcode the Molicel P45B's 45 mOhm module and a 4x12 sensor layout,
-so after the move to the RS50 its sag was 3-4x too large, and its packets would
+so after the move to the RS50 its sag was 2-3x too large, and its packets would
 not match a different sensor layout. Runs on Qt's offscreen platform.
 """
 import os
@@ -36,7 +36,7 @@ def packet(app, cfg, amps):
 
 
 def test_sag_follows_the_configured_pack(app):
-    cfg = RigConfig.defaults()              # RS50 12S4P: 12 mOhm module
+    cfg = RigConfig.defaults()              # RS50 12S4P: 19.5 mOhm module
     data = packet(app, cfg, 250.0)
     assert abs(data['voltage'] - (cfg.pack.max_voltage - 250.0 * cfg.pack.resistance_ohm)) < 1e-9
 

@@ -18,6 +18,7 @@ the 32 ohm bank. That is the bench meter's job (tools/bench_relay_check.py).
 Needs a C++ compiler (g++, clang++ or c++ on PATH); skipped without one.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -122,10 +123,24 @@ def test_every_setting_from_a_cold_start(firmware):
             == expected_banks(s)
 
 
-def test_zero_steps_is_bank_1_alone_on_both_sides(firmware):
-    # Host and firmware each turn zero into 0.25 ohm; both must pick bank 1.
-    assert command(0) == command(1)
-    assert banks_in_circuit(run(firmware, ["0" * 8])[-1]) == [1]
+def test_all_zeros_is_refused_and_moves_nothing(firmware):
+    # Every bank bypassed is a dead short. It used to be turned into bank 1
+    # alone, the heaviest load there is. From cold the contactor stays open.
+    pins = run(firmware, ["0" * 8])[-1]
+    assert pins[MAIN_RELAY_PIN] == RELAY_OPEN
+    assert banks_in_circuit(pins) == list(range(1, 9))
+
+    # Mid-run it leaves the setting in circuit exactly as it was.
+    pins = run(firmware, [command(128), "0" * 8])[-1]
+    assert pins[MAIN_RELAY_PIN] == RELAY_CLOSE
+    assert banks_in_circuit(pins) == [8]
+
+
+def test_all_zeros_does_not_feed_the_watchdog(firmware):
+    # A refused line is not control traffic: the bank still sheds 2 s after
+    # the last real command, however many arrive.
+    pins = run(firmware, [command(128), "@wait 1500", "0" * 8, "@wait 600"])[-1]
+    assert pins[MAIN_RELAY_PIN] == RELAY_OPEN
 
 
 def test_kill_opens_the_main_relay_and_puts_every_bank_in_circuit(firmware):
@@ -149,3 +164,82 @@ class TestEncoding:
         assert sorted(cl.COMMAND_BANKS) == list(range(1, 9))
         assert len(set(cl.BANK_RELAY_PIN)) == 8
         assert MAIN_RELAY_PIN not in cl.BANK_RELAY_PIN
+
+    def test_a_setting_outside_the_ladder_is_the_lightest_load_never_the_heaviest(self):
+        # Nothing asks for one. If something ever does, it gets every bank in
+        # circuit, 63.75 ohm, and never the all-zero word the firmware refuses.
+        for steps in (0, -1, 256, 1000):
+            assert cl.encode_steps(steps) == "11111111"
+        assert "00000000" not in {cl.encode_steps(s) for s in range(-5, 300)}
+
+
+def sketch_source():
+    with open(os.path.join(SKETCH_DIR, "resistor_bank_controller.ino"), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def sketch_int(source, name):
+    """The value of `const int|long NAME = <number>;` in the sketch."""
+    match = re.search(rf"const\s+(?:int|long)\s+{name}\s*=\s*(\d+)\s*;", source)
+    assert match, f"{name} not found in the sketch"
+    return int(match.group(1))
+
+
+class TestSketchAgainstHost:
+    """The sketch's own tables, read from its source, against the host's.
+
+    The tests above compile and run the firmware, and skip on a machine with no
+    C++ compiler, which is how the pin 10 and 11 swap went untested on the
+    laptop it was made on. These need nothing but the file, so they always run.
+    They check the tables agree; only the compiled tests check what the sketch
+    does with them.
+    """
+
+    def test_every_command_character_drives_the_pin_the_host_expects(self):
+        source = sketch_source()
+        match = re.search(r"otherRelayPins\[\]\s*=\s*\{([^}]*)\}", source)
+        assert match, "otherRelayPins not found in the sketch"
+        other_pins = [int(p) for p in match.group(1).split(",")]
+        # The sketch drives characters 0..6 onto otherRelayPins in order, and
+        # the last character onto BANK_1_RELAY.
+        sketch_pins = other_pins + [sketch_int(source, "BANK_1_RELAY")]
+        host_pins = [cl.BANK_RELAY_PIN[bank - 1] for bank in cl.COMMAND_BANKS]
+        assert sketch_pins == host_pins
+
+    def test_the_main_contactor_pin_and_the_command_length(self):
+        source = sketch_source()
+        assert sketch_int(source, "RELAY_MAIN_PIN") == MAIN_RELAY_PIN
+        assert re.search(r"COMMAND_LENGTH\s*=\s*numOtherRelays\s*\+\s*1\s*;", source)
+        assert len(cl.COMMAND_BANKS) == 8
+
+    def test_an_open_relay_is_a_low_pin(self):
+        # '1' in the word means the bypass relay open and the bank in circuit.
+        source = sketch_source()
+        assert re.search(r"RELAY_OPEN\s*=\s*LOW\s*;", source)
+        assert re.search(r"RELAY_CLOSE\s*=\s*HIGH\s*;", source)
+
+    def test_the_heartbeat_fits_inside_the_sketchs_watchdog(self):
+        timeout_s = sketch_int(sketch_source(), "TIMEOUT_LIMIT") / 1000.0
+        assert cl.HEARTBEAT_INTERVAL_S * 3 < timeout_s
+
+    def test_the_sketch_answers_the_lines_the_host_sends(self):
+        source = sketch_source()
+        for line in ('"?WHOAMI"', '"RESISTOR_CTRL"', '"alive"', '"KILL"'):
+            assert line in source, line
+        assert cl.keepalive_message("RUNNING") == b"alive\n"
+        assert cl.keepalive_message("IDLE") == b"KILL\n"
+
+    def test_only_alive_and_a_command_feed_the_watchdog(self):
+        # KILL is the keep-alive outside a run. If the sketch ever fed its
+        # watchdog on KILL, the watchdog would never lapse in FAULT.
+        source = sketch_source()
+        kill_branch = re.search(r'incomingData == "KILL".*?\{(.*?)\}', source, re.S)
+        assert kill_branch and "feedWatchdog" not in kill_branch.group(1)
+        # Two calls in loop(): for "alive", and for a valid command.
+        assert len(re.findall(r"^\s+feedWatchdog\(\);", source, re.M)) == 2
+
+    def test_all_zeros_is_refused_before_the_watchdog_is_fed(self):
+        source = sketch_source()
+        refused = source.index("All zeros would short the bank")
+        fed = source.index("feedWatchdog();", source.index("isValidCommand(incomingData)"))
+        assert refused < fed

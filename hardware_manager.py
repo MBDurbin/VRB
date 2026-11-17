@@ -2,12 +2,13 @@ import math
 import serial
 import serial.tools.list_ports
 import nidaqmx
-from nidaqmx.constants import CJCSource, TemperatureUnits, ThermocoupleType
+from nidaqmx.constants import (ADCTimingMode, CJCSource, TemperatureUnits,
+                               TerminalConfiguration, ThermocoupleType)
 import time
 import threading
 from multiprocessing import Queue, Event
 
-from rig_config import RigConfig
+from rig_config import DS18B20_MAX_C, DS18B20_MIN_C, RigConfig
 from queue_util import put_latest
 
 # ================= CONFIGURATION =================
@@ -31,10 +32,83 @@ RESISTOR_TC_PERIOD_S = 0.25
 TC_MIN_C = -40.0
 TC_MAX_C = 600.0
 
-# What a DS18B20 can measure. A cell reading outside it is a sensor fault, and
-# is skipped like an ERR so that sensor's age grows.
-DS18B20_MIN_C = -55.0
-DS18B20_MAX_C = 125.0
+# What a DS18B20 can measure is DS18B20_MIN_C to DS18B20_MAX_C, from rig_config.
+# A cell or bus-bar reading outside it is a sensor fault, and is skipped like an
+# ERR so that sensor's age grows.
+
+# How the temperature Arduino marks its bus-bar line: "B,<t1>,...,<tN>", after
+# the numbered lines for the cell buses.
+BUSBAR_LINE_PREFIX = "B"
+
+
+# Opening a port resets the Arduino on it, and the temperature board then takes
+# about 4.8 s to boot and set up its 48 sensors (measured October 2026). One
+# ?WHOAMI two seconds after opening, read for two more, was lost every time: the
+# board was reset, missed, and reset again on the next sweep, so the rig never
+# left DISCONNECTED. So the question is repeated until the answer comes or the
+# time runs out, counted from the first ask.
+WHOAMI_TIMEOUT_S = 6.0
+WHOAMI_RETRY_S = 1.0
+WHOAMI_READ_S = 0.1
+
+
+def await_identity(ser, expected, timeout_s=WHOAMI_TIMEOUT_S, retry_s=WHOAMI_RETRY_S):
+    """Ask ?WHOAMI every retry_s until `expected` arrives on a line of its own.
+
+    True if it did within timeout_s. Other lines are skipped: the temperature
+    board streams its readings, and a question that arrived while it was still
+    booting is answered behind them. Reads whatever has arrived, so `ser`
+    should have a short read timeout (WHOAMI_READ_S).
+    """
+    deadline = time.monotonic() + timeout_s
+    next_ask = time.monotonic()
+    pending = b""
+    while time.monotonic() < deadline:
+        if time.monotonic() >= next_ask:
+            ser.write(b"?WHOAMI\n")
+            next_ask = time.monotonic() + retry_s
+        pending += ser.read(ser.in_waiting or 1)
+        *lines, pending = pending.split(b"\n")
+        if any(line.decode('utf-8', errors='ignore').strip() == expected for line in lines):
+            return True
+    return False
+
+
+# Longest part-line kept between passes. A real temperature line is under 60
+# bytes; anything longer without a newline is noise, and is dropped rather than
+# grown without limit.
+MAX_PENDING_BYTES = 1024
+
+
+def read_available_lines(ser, pending):
+    """Complete lines that have already arrived, without waiting. Returns (lines, pending).
+
+    This used to be readlines(), which keeps reading until the port has been
+    quiet for its whole timeout (0.1 s). The temperature board streams without
+    stopping, pausing only for its 100 ms conversion once a sweep, so one call
+    held the DAQ loop for a sweep or more, and indefinitely when the pause fell
+    under the timeout. Current and voltage went unread for as long. Now only
+    what is waiting is taken, and a line still arriving is kept in `pending` for
+    the next pass.
+    """
+    waiting = ser.in_waiting
+    if waiting:
+        pending += ser.read(waiting)
+    *lines, pending = pending.split(b"\n")
+    if len(pending) > MAX_PENDING_BYTES:
+        pending = b""
+    return lines, pending
+
+
+def scale_taps(raw_volts, scales):
+    """Tap voltages at the module, from the volts read at the DAQ's inputs.
+
+    `scales` is DaqConfig.tap_scales(): the divider multiplier times each tap's
+    own calibration gain. One multiplier used to serve all twelve taps, so each
+    divider's own error went straight into the cell voltages, and grew up the
+    stack because a cell is the difference of two taps.
+    """
+    return [v * s for v, s in zip(raw_volts, scales)]
 
 
 def derive_cell_voltages(cumulative_voltages):
@@ -74,13 +148,6 @@ def parse_temperature_line(line, sensors_per_bus, bus_count):
 
     readings = {} #create a dictionary
     for i in range(sensors_per_bus): #i = sensor index
-        raw = parts[i + 1]
-        if raw == "ERR":
-            continue
-        try:
-            value = float(raw)
-        except ValueError:
-            continue
         # float() accepts "nan" and "inf". Neither is a temperature, and a NaN
         # loses every comparison, so it would hide from max() and the overtemp
         # trip while still counting as a fresh reading for that sensor. Nor is
@@ -89,10 +156,54 @@ def parse_temperature_line(line, sensors_per_bus, bus_count):
         # look cold. The sketch already sends ERR for anything at or below
         # -100 C; this holds if it ever stops. 85 C, the power-on value, is
         # within range and reads hot, so it fails closed on its own.
-        if math.isfinite(value) and DS18B20_MIN_C <= value <= DS18B20_MAX_C:
+        value = parse_sensor_field(parts[i + 1])
+        if value is not None:
             readings[i] = value
 
     return bus_idx, readings
+
+
+def parse_sensor_field(raw):
+    """One field of a temperature line as degrees C, or None if it is not a reading.
+
+    None for ERR, for text that is not a number, for nan and inf (float() takes
+    both), and for anything outside what a DS18B20 can measure: -127 is the
+    library's "disconnected" value, and as a fresh reading it would make that
+    sensor look cold.
+    """
+    raw = raw.strip()
+    if raw == "ERR":
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if math.isfinite(value) and DS18B20_MIN_C <= value <= DS18B20_MAX_C:
+        return value
+    return None
+
+
+def parse_busbar_line(line, sensor_count):
+    """Parse the bus-bar line from the temperature Arduino: "B,<t1>,...,<tN>".
+
+    Returns {index: temp} for the sensors that gave a reading, bus bar 1 (the
+    bar between S1 and S2) at index 0. None if this is not the bus-bar line, or
+    it does not carry exactly `sensor_count` fields: a line cut short must not
+    be applied as if the missing sensors were simply not there. None too when
+    no bus-bar sensors are configured, so a board that sends the line anyway is
+    ignored rather than half believed.
+    """
+    if sensor_count <= 0:
+        return None
+    parts = line.split(',')
+    if parts[0].strip() != BUSBAR_LINE_PREFIX or len(parts) != sensor_count + 1:
+        return None
+    readings = {}
+    for i, raw in enumerate(parts[1:]):
+        value = parse_sensor_field(raw)
+        if value is not None:
+            readings[i] = value
+    return readings
 
 
 def temperature_sensor_ages(last_valid_rx, now):
@@ -152,6 +263,15 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     for problem in daq_cfg.advisories(pack):
         print(f"[DAQ WARNING] {problem}")
 
+    # Fixed for the life of the process, like the channel list they belong to.
+    tap_scales = daq_cfg.tap_scales()
+    if len(daq_cfg.voltage_tap_gains) == daq_cfg.channel_count and daq_cfg.channel_count:
+        print("[DAQ] Tap gains applied: "
+              + ", ".join(f"{g:.4f}" for g in daq_cfg.voltage_tap_gains))
+    else:
+        print(f"[DAQ] No tap gains: every tap takes the x{daq_cfg.voltage_multiplier:g} "
+              f"divider multiplier alone. tools/tap_calibrate.py measures them.")
+
     hardware_state = {
         'temp_ser': None,
     }
@@ -192,15 +312,15 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                         continue
 
                 try:
-                    ser = serial.Serial(port.device, daq_cfg.temp_baud_rate, timeout=2)
+                    ser = serial.Serial(port.device, daq_cfg.temp_baud_rate,
+                                        timeout=WHOAMI_READ_S)
                     time.sleep(2)  # Wait for Arduino to clear bootloader
                     ser.reset_input_buffer()
 
-                    ser.write(b"?WHOAMI\n")
-                    response = ser.readline().decode('utf-8').strip()
+                    found = await_identity(ser, "TEMP_SENSOR")
 
                     with state_lock:
-                        if response == "TEMP_SENSOR" and hardware_state['temp_ser'] is None:
+                        if found and hardware_state['temp_ser'] is None:
                             # FIX 2: Do NOT close the port! Prevent double-reset.
                             ser.timeout = 0.1
                             hardware_state['temp_ser'] = ser
@@ -248,6 +368,23 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     # None means no valid reading yet.
     sensor_last_rx = [[None] * daq_cfg.sensors_per_bus for _ in range(daq_cfg.temp_bus_count)]
 
+    # Bus-bar sensors, bus bar 1 (between S1 and S2) first: the last valid
+    # reading of each and when it arrived. None until a sensor's first reading,
+    # like the resistor thermocouples and unlike the cell array's 0.0, so one
+    # that has never reported cannot be taken for a cold bus bar. Both lists
+    # are empty when none are configured, and nothing downstream expects any.
+    n_busbar = max(0, daq_cfg.busbar_sensor_count)
+    busbar_temps = [None] * n_busbar
+    busbar_last_rx = [None] * n_busbar
+    if n_busbar:
+        print(f"[DAQ] Expecting {n_busbar} bus-bar sensor(s) on the temperature board's "
+              f"'{BUSBAR_LINE_PREFIX}' line.")
+
+    # The end of a temperature line that had not finished arriving at the last
+    # pass, and the port it came from. See read_available_lines().
+    temp_pending = b""
+    temp_pending_port = None
+
     # --- NI-DAQ: current and cumulative cell voltages ---
     # No simulated fallback. A DAQ that failed to start used to be replaced by a
     # healthy pack at rest (15 A, every cell at nominal + 0.5 V), so a rig
@@ -260,12 +397,23 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     task = None
     try:
         task = nidaqmx.Task()
+        # The current input takes the driver's default: it is on a 9215, which
+        # is differential only. The taps take voltage_terminal_config, set
+        # explicitly because on a 9205 the default can pair two taps as one
+        # differential input.
         task.ai_channels.add_ai_voltage_chan(
             daq_cfg.current_channel,
             min_val=daq_cfg.ai_min_volts, max_val=daq_cfg.ai_max_volts)
+        tap_mode = TerminalConfiguration[daq_cfg.voltage_terminal_config]
         for ch in daq_cfg.voltage_channels:
             task.ai_channels.add_ai_voltage_chan(
-                ch, min_val=daq_cfg.ai_min_volts, max_val=daq_cfg.ai_max_volts)
+                ch, terminal_config=tap_mode,
+                min_val=daq_cfg.ai_min_volts, max_val=daq_cfg.ai_max_volts)
+        # Started once and left running. A task that is never started is
+        # started and stopped by the driver around every read: 113 ms a read
+        # on this rig against 2 ms started (measured October 2026), so the loop
+        # could never reach even its 10 Hz.
+        task.start()
         ni_daq_active = True
         print("[DAQ] Hardware NI-DAQ initialized.")
     except Exception as e:
@@ -295,13 +443,20 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     try:
         tc_task = nidaqmx.Task()
         for ch in daq_cfg.resistor_tc_channels:
-            tc_task.ai_channels.add_ai_thrmcpl_chan(
+            chan = tc_task.ai_channels.add_ai_thrmcpl_chan(
                 ch, min_val=TC_MIN_C, max_val=TC_MAX_C,
                 units=TemperatureUnits.DEG_C,
                 thermocouple_type=ThermocoupleType[daq_cfg.thermocouple_type],
                 cjc_source=CJCSource[daq_cfg.resistor_tc_cjc_source])
+            # The NI 9212's own default, high resolution, took 2.2 s to read the
+            # four banks against a 3 s staleness trip. See DaqConfig.
+            if daq_cfg.resistor_tc_adc_mode != "DEFAULT":
+                chan.ai_adc_timing_mode = ADCTimingMode[daq_cfg.resistor_tc_adc_mode]
+        # Started once, like the voltage task: 12 ms a read against 139 ms.
+        tc_task.start()
         print(f"[DAQ] Resistor thermocouples initialized: {n_tc} bank(s), "
-              f"type {daq_cfg.thermocouple_type}, CJC {daq_cfg.resistor_tc_cjc_source}.")
+              f"type {daq_cfg.thermocouple_type}, CJC {daq_cfg.resistor_tc_cjc_source}, "
+              f"{daq_cfg.resistor_tc_adc_mode.lower().replace('_', ' ')} mode.")
     except Exception as e:
         print(f"\n[WARNING] Resistor thermocouples unavailable: {e}")
         print("[WARNING] The rig will not arm without resistor temperatures.")
@@ -345,8 +500,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                     daq_data = task.read()
                     current = daq_data[0] * daq_cfg.current_amps_per_volt
                     raw_daq_voltages = daq_data[1:]
-                    actual_cumulative_voltages = [
-                        v * daq_cfg.voltage_multiplier for v in raw_daq_voltages]
+                    actual_cumulative_voltages = scale_taps(raw_daq_voltages, tap_scales)
                 except Exception as exc:
                     # Lost mid-session: USB pulled, chassis powered down. This
                     # used to end the loop, so packets stopped and the logic
@@ -362,6 +516,9 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                     except Exception:
                         pass
                     task = None
+            # When current and voltage were read. The logic process times its
+            # KILL from this, for the trip log.
+            sampled_at = time.time()
 
             cell_voltages, total_pack_voltage = derive_cell_voltages(actual_cumulative_voltages)
 
@@ -369,23 +526,35 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
             with state_lock:
                 current_temp_ser = hardware_state['temp_ser']
 
+            if current_temp_ser is not temp_pending_port:
+                # A new or reconnected board: a part-line from the old one is junk.
+                temp_pending, temp_pending_port = b"", current_temp_ser
+
             if current_temp_ser:
                 try:
-                    if current_temp_ser.in_waiting > 0:
-                        lines = current_temp_ser.readlines()
-                        for line in lines:
-                            decoded_line = line.decode('utf-8', errors='ignore').strip()
-                            parsed = parse_temperature_line(
-                                decoded_line, daq_cfg.sensors_per_bus, daq_cfg.temp_bus_count)
-                            if parsed is None:
-                                continue
-                            bus_idx, readings = parsed
+                    lines, temp_pending = read_available_lines(current_temp_ser, temp_pending)
+                    for line in lines:
+                        decoded_line = line.decode('utf-8', errors='ignore').strip()
+                        # The bus-bar line first: it starts with a letter, which
+                        # the cell-bus parser would only throw away.
+                        bars = parse_busbar_line(decoded_line, n_busbar)
+                        if bars is not None:
                             rx_time = time.time()
-                            for i, temp_c in readings.items():
-                                battery_temps[bus_idx][i] = temp_c
-                                sensor_last_rx[bus_idx][i] = rx_time
-                            if readings:
-                                last_temp_rx = rx_time
+                            for i, temp_c in bars.items():
+                                busbar_temps[i] = temp_c
+                                busbar_last_rx[i] = rx_time
+                            continue
+                        parsed = parse_temperature_line(
+                            decoded_line, daq_cfg.sensors_per_bus, daq_cfg.temp_bus_count)
+                        if parsed is None:
+                            continue
+                        bus_idx, readings = parsed
+                        rx_time = time.time()
+                        for i, temp_c in readings.items():
+                            battery_temps[bus_idx][i] = temp_c
+                            sensor_last_rx[bus_idx][i] = rx_time
+                        if readings:
+                            last_temp_rx = rx_time
                 except serial.SerialException:
                     print("\n[DAQ ERROR] Temperature Sensor LOST! Watchdog engaging...")
                     current_temp_ser.close()
@@ -402,6 +571,7 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 bank_temps = list(resistor_temps)
                 bank_ages = reading_ages(resistor_last_rx, now)
             data_packet = {
+                'sampled_at': sampled_at,
                 'amps': current,
                 'voltage': total_pack_voltage,
                 'cell_voltages': cell_voltages,
@@ -413,6 +583,10 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 # Bank 1 first. None until a bank's first valid reading.
                 'resistor_temps': bank_temps,
                 'resistor_temp_ages_s': bank_ages,
+                # Bus bar 1 first, None until its first valid reading. Both
+                # empty when no bus-bar sensors are configured.
+                'busbar_temps': list(busbar_temps),
+                'busbar_temp_ages_s': reading_ages(busbar_last_rx, now),
                 'hardware_status': {
                     'temp_arduino': current_temp_ser is not None,
                     'resistor_tc': tc_task is not None,

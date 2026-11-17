@@ -545,6 +545,66 @@ def check_resistor_temps(resistor_temps, max_temps):
     return False, None
 
 
+def busbar_label(number, expected=None):
+    """A bus-bar sensor in words: 'bus bar 4 (S4-S5)'.
+
+    `number` counts from 1. The groups it joins are named when the wiring has
+    one sensor per bus bar, a series count less one; otherwise the sensors
+    cannot be placed and only the number is given.
+    """
+    if expected and expected.get('busbar_sensors') == expected.get('cells', 0) - 1:
+        return f"bus bar {number} (S{number}-S{number + 1})"
+    return f"bus bar {number}"
+
+
+def hot_busbars(busbar_temps, max_temp):
+    """(number, temperature) for every bus bar at or over the trip; numbered from 1."""
+    return [(i + 1, t) for i, t in enumerate(busbar_temps)
+            if t is not None and t >= max_temp]
+
+
+def check_busbar_temps(busbar_temps, max_temp):
+    """Bus-bar over-temperature. Returns (is_fault, reason).
+
+    In every FSM state, like the cell trip: a bus bar is welded to the cell
+    terminals, and a hot one is hot whatever the state machine thinks. A sensor
+    that has not reported yet (None) is not judged here; check_busbar_health()
+    faults on it once armed. With no bus-bar sensors fitted the list is empty
+    and nothing can trip.
+    """
+    if hot_busbars(busbar_temps, max_temp):
+        return True, "BUSBAR OVERTEMP"
+    return False, None
+
+
+def stale_busbars(ages, stale_timeout_s):
+    """Bus bars, numbered from 1, with no valid reading within the timeout."""
+    if stale_timeout_s <= 0:
+        return []
+    return [i + 1 for i, age in enumerate(ages) if age > stale_timeout_s]
+
+
+def check_busbar_health(ages, stale_timeout_s, expected_count):
+    """Bus-bar sensor integrity. Returns (is_fault, reason).
+
+    As for the cell sensors: the Arduino prints ERR for a DS18B20 it cannot
+    read and the DAQ keeps that sensor's last value, so a bus bar's reading can
+    sit frozen at a safe-looking figure while the bar heats. Same timeout.
+
+    `expected_count` is how many the wiring says are fitted. None fitted is not
+    a fault: bus-bar sensors are an addition to the cell sensors, and a module
+    without them is still watched cell by cell.
+    """
+    if not expected_count:
+        return False, None
+    if not ages:
+        # Fail closed: configured, and nothing has ever arrived.
+        return True, "NO BUSBAR DATA"
+    if stale_busbars(ages, stale_timeout_s):
+        return True, "BUSBAR SENSOR FAULT"
+    return False, None
+
+
 def stale_resistor_banks(tc_ages, stale_timeout_s):
     """1-based banks whose thermocouple has no valid reading within the timeout."""
     if stale_timeout_s <= 0:
@@ -606,6 +666,7 @@ def expected_measurements(daq_cfg, pack):
         return {
             'cells': int(pack.series_count),
             'temp_sensors': int(daq_cfg.sensor_count),
+            'busbar_sensors': max(0, int(daq_cfg.busbar_sensor_count)),
             'resistor_tcs': len(daq_cfg.resistor_tc_channels),
             'max_volts': float(pack.max_voltage) * (1.0 + VOLTAGE_PLAUSIBLE_MARGIN),
             'max_cell_volts': float(pack.cell_max_voltage) + CELL_PLAUSIBLE_MARGIN_V,
@@ -647,11 +708,16 @@ def measurement_problems(data, expected=None):
            if t is not None and not _finite(t)]
     if bad:
         invalid("bank(s) " + ", ".join(map(str, bad)) + " temperature is not a number")
+    bad = [i + 1 for i, t in enumerate(data.get('busbar_temps', []))
+           if t is not None and not _finite(t)]
+    if bad:
+        invalid("bus bar(s) " + ", ".join(map(str, bad)) + " temperature is not a number")
 
     # Ages may be inf -- never read -- but a NaN age passes every staleness test.
     ages = ([data.get('daq_age_s', 0.0), data.get('temp_age_s', 0.0)]
             + [a for bus in data.get('temp_sensor_ages_s', []) for a in bus]
-            + list(data.get('resistor_temp_ages_s', [])))
+            + list(data.get('resistor_temp_ages_s', []))
+            + list(data.get('busbar_temp_ages_s', [])))
     if any(not _is_number(a) or math.isnan(a) for a in ages):
         invalid("a reading's age is not a number")
 
@@ -675,6 +741,8 @@ def measurement_problems(data, expected=None):
         for name, have, want in (
                 ("cell voltages", len(cells), expected['cells']),
                 ("temperature sensors", n_sensors, expected['temp_sensors']),
+                ("bus-bar sensors", len(data.get('busbar_temp_ages_s', [])),
+                 expected.get('busbar_sensors', 0)),
                 ("resistor thermocouples", len(data.get('resistor_temp_ages_s', [])),
                  expected['resistor_tcs'])):
             if have and have != want:
@@ -733,9 +801,9 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     needs to hear about the current first.
 
     `armed` should be True only in ARMED/RUNNING. Cell over-temperature,
-    over-current, bank overpower and resistor over-temperature are always
-    checked -- any of them means something is wrong no matter what state the FSM
-    thinks it is in. Everything else is gated,
+    over-current, bus-bar over-temperature, bank overpower and resistor
+    over-temperature are always checked -- any of them means something is wrong
+    no matter what state the FSM thinks it is in. Everything else is gated,
     because before the rig is armed those readings describe a bench that is not
     loaded yet:
 
@@ -771,6 +839,11 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
         data.get('max_temp', 0.0), data.get('amps', 0.0),
         limits['max_temp'], limits['max_amps'], limits['amp_buffer'],
     )
+    if fault:
+        return True, reason
+
+    # The module's other temperature, straight after its cells and current.
+    fault, reason = check_busbar_temps(data.get('busbar_temps', []), limits['busbar_max_temp'])
     if fault:
         return True, reason
 
@@ -829,6 +902,12 @@ def evaluate_safety(data, limits, armed=True, config_problems=(), bank_steps=Non
     # TEMP LINK LOST is the more useful thing to tell the operator.
     fault, reason = check_temp_sensors(
         data.get('temp_sensor_ages_s', []), limits['temp_stale_timeout'])
+    if fault:
+        return True, reason
+
+    fault, reason = check_busbar_health(
+        data.get('busbar_temp_ages_s', []), limits['temp_stale_timeout'],
+        expected.get('busbar_sensors', 0) if expected else 0)
     if fault:
         return True, reason
 
@@ -895,6 +974,18 @@ def trip_details(reason, data, limits, config_problems=(), expected=None, bank_s
         dead = stale_resistor_banks(data.get('resistor_temp_ages_s', []),
                                     limits['temp_stale_timeout'])
         return ["No valid thermocouple reading from: " + ", ".join(f"bank {b}" for b in dead)]
+    if reason == "BUSBAR OVERTEMP":
+        hot = hot_busbars(data.get('busbar_temps', []), limits['busbar_max_temp'])
+        line = ", ".join(f"{busbar_label(n, expected)} at {t:.1f} C" for n, t in hot)
+        return [line[:1].upper() + line[1:] + f" (trip {limits['busbar_max_temp']:.1f} C)"]
+    if reason == "BUSBAR SENSOR FAULT":
+        dead = stale_busbars(data.get('busbar_temp_ages_s', []), limits['temp_stale_timeout'])
+        return ["No valid reading from: " + ", ".join(busbar_label(n, expected) for n in dead)]
+    if reason == "NO BUSBAR DATA":
+        wanted = expected.get('busbar_sensors', 0) if expected else 0
+        return [f"{wanted} bus-bar sensor(s) are configured and none has reported. Check "
+                f"BUSBAR_SENSOR_COUNT in the temperature sketch, or set "
+                f"busbar_sensor_count to 0 if they are not fitted"]
     if reason == "CONFIG FAULT":
         return [f"  - {problem}" for problem in config_problems]
     if reason in ("INVALID READING", "INCOMPLETE DATA"):
@@ -1270,6 +1361,7 @@ def NEUTRAL_PACKET():
         'cell_voltages': [], 'temperatures': [], 'power_kw': 0.0,
         'temp_age_s': float('inf'), 'temp_sensor_ages_s': [],
         'resistor_temps': [], 'resistor_temp_ages_s': [],
+        'busbar_temps': [], 'busbar_temp_ages_s': [],
         'hardware_status': {},
     }
 
@@ -1758,6 +1850,12 @@ def run_logic_process(daq_queue: Queue, telemetry_queue: Queue, gui_cmd_queue: Q
           f"bank {VRB_MAX_POWER_W * bank_power_factor(limits) / 1000:.1f} kW total and "
           f"{bank_power_factor(limits) * 100:.0f}% of each bank's rating | resistors "
           + "/".join(f"{t:.0f}" for t in limits['resistor_max_temp']) + " C")
+    if config.daq.busbar_sensor_count > 0:
+        print(f"[LOGIC] Bus bars: {config.daq.busbar_sensor_count} sensor(s), trip "
+              f"{limits['busbar_max_temp']:.0f} C in every state; one that stops reporting "
+              f"faults the rig once armed.")
+    else:
+        print("[LOGIC] Bus bars: no sensors configured (busbar_sensor_count is 0).")
     # Trips past a rating block ARM, and print with the config errors below.
     for warning in config.limits.advisories():
         print(f"[LOGIC WARNING] {warning}")

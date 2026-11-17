@@ -98,6 +98,74 @@ DeviceAddress bus6_IDs[SENSORS_PER_BUS] = {
   { 0x28, 0x04, 0x25, 0xFB, 0x0F, 0x00, 0x00, 0x52 }  // Sensor D12
 };
 
+// ================= BUS-BAR SENSORS =================
+// One DS18B20 on each bus bar that joins one group of four parallel cells to
+// the next: eleven on a 12S module, the bar between S1 and S2 first and the bar
+// between S11 and S12 last. The cell sensors above sit on the cell tops; these
+// sit on the current path itself, so a weld or a bar running hot shows here
+// first.
+//
+// They are sent on a line of their own after the six cell buses:
+//
+//     B,<t1>,<t2>,...,<tN>
+//
+// with ERR for a sensor that cannot be read, as on the cell lines. The host
+// takes the line only if it carries exactly as many readings as
+// busbar_sensor_count in rig_config.json says, so the two numbers must match.
+//
+// TO FIT THEM:
+//   1. Wire the sensors to BUSBAR_BUS_A_PIN, and to BUSBAR_BUS_B_PIN as well if
+//      one bus is too long: the cell sensors are split eight to a bus to keep
+//      each bus's capacitance down, and eleven on one is more than that.
+//   2. Read each sensor's address with arduino/ds18b20_address_scanner and put
+//      it in busbarSensors[] below, in bus-bar order, with the bus it is on.
+//   3. Set BUSBAR_SENSOR_COUNT to the number fitted and flash this sketch.
+//   4. Set "busbar_sensor_count" in rig_config.json to the same number and
+//      restart the rig.
+// Do 3 and 4 together. With the count set here and not there the host ignores
+// the line; with it set there and not here the rig faults NO BUSBAR DATA as
+// soon as it is armed.
+//
+// 0 leaves all of this out of the build: no line is sent and nothing changes.
+#ifndef BUSBAR_SENSOR_COUNT
+#define BUSBAR_SENSOR_COUNT 0
+#endif
+
+#if BUSBAR_SENSOR_COUNT > 0
+#define BUSBAR_BUS_A_PIN 8
+#define BUSBAR_BUS_B_PIN 9
+
+OneWire oneWireBusbarA(BUSBAR_BUS_A_PIN);
+OneWire oneWireBusbarB(BUSBAR_BUS_B_PIN);
+DallasTemperature busbarBusA(&oneWireBusbarA);
+DallasTemperature busbarBusB(&oneWireBusbarB);
+DallasTemperature* busbarBuses[] = {&busbarBusA, &busbarBusB};
+const int NUM_BUSBAR_BUSES = 2;
+
+struct BusbarSensor {
+  uint8_t bus;            // 0: the bus on BUSBAR_BUS_A_PIN. 1: BUSBAR_BUS_B_PIN.
+  DeviceAddress address;  // from arduino/ds18b20_address_scanner
+};
+
+// In bus-bar order. Every address here is a placeholder: a row left as it is
+// reads ERR, and the rig names that bus bar as a failed sensor once armed.
+// A row short of BUSBAR_SENSOR_COUNT reads ERR too; a row too many will not
+// compile.
+BusbarSensor busbarSensors[BUSBAR_SENSOR_COUNT] = {
+  {0, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 1:  between S1 and S2
+  {0, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 2:  between S2 and S3
+  {0, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 3:  between S3 and S4
+  {0, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 4:  between S4 and S5
+  {0, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 5:  between S5 and S6
+  {0, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 6:  between S6 and S7
+  {1, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 7:  between S7 and S8
+  {1, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 8:  between S8 and S9
+  {1, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 9:  between S9 and S10
+  {1, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 10: between S10 and S11
+  {1, {0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}}, // Bus bar 11: between S11 and S12
+};
+#endif
+
 unsigned long lastRequestTime = 0;
 int currentState = 0;
 const int CONVERSION_DELAY = 100; // 100ms wait for 9-bit resolution
@@ -107,12 +175,20 @@ DeviceAddress* all_bus_IDs[] = {bus1_IDs, bus2_IDs, bus3_IDs, bus4_IDs, bus5_IDs
 
 void setup() {
   Serial.begin(115200); // Crucial: Fast baud rate so serial sending doesn't cause lag
- 
+
   for (int i = 0; i < NUM_BUSES; i++) {
     buses[i]->begin();
     buses[i]->setResolution(9); // Drop to 9-bit for maximum speed (94ms conversion)
     buses[i]->setWaitForConversion(false);
   }
+
+#if BUSBAR_SENSOR_COUNT > 0
+  for (int i = 0; i < NUM_BUSBAR_BUSES; i++) {
+    busbarBuses[i]->begin();
+    busbarBuses[i]->setResolution(9);
+    busbarBuses[i]->setWaitForConversion(false);
+  }
+#endif
 }
 
 void loop() {
@@ -133,6 +209,11 @@ void loop() {
       for (int i = 0; i < NUM_BUSES; i++) {
         buses[i]->requestTemperatures();
       }
+#if BUSBAR_SENSOR_COUNT > 0
+      for (int i = 0; i < NUM_BUSBAR_BUSES; i++) {
+        busbarBuses[i]->requestTemperatures();
+      }
+#endif
       lastRequestTime = currentMillis;
       currentState = 1; // Move to the waiting state
       break;
@@ -170,11 +251,35 @@ void loop() {
       Serial.println(); // End the line, Python will read this as a complete packet
      
       currentState++; // Move to the next bus (or back to start)
-     
+
+#if BUSBAR_SENSOR_COUNT == 0
       if (currentState > 7) {
         currentState = 0; // All buses read, restart the cycle
       }
+#endif
       break;
     }
+
+#if BUSBAR_SENSOR_COUNT > 0
+    // STATE 8: READ AND TRANSMIT THE BUS BARS, then restart the cycle
+    case 8: {
+      Serial.print("B"); // Marks the bus-bar line; the cell lines start with a number
+      for (int i = 0; i < BUSBAR_SENSOR_COUNT; i++) {
+        float tempC = -127.0; // what the library returns for a sensor it cannot read
+        if (busbarSensors[i].bus < NUM_BUSBAR_BUSES) {
+          tempC = busbarBuses[busbarSensors[i].bus]->getTempC(busbarSensors[i].address);
+        }
+        Serial.print(",");
+        if (tempC <= -100.0) {
+          Serial.print("ERR");
+        } else {
+          Serial.print(tempC, 1);
+        }
+      }
+      Serial.println();
+      currentState = 0;
+      break;
+    }
+#endif
   }
 }

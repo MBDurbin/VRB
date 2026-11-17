@@ -8,7 +8,7 @@ import time
 import threading
 from multiprocessing import Queue, Event
 
-from rig_config import RigConfig
+from rig_config import DS18B20_MAX_C, DS18B20_MIN_C, RigConfig
 from queue_util import put_latest
 
 # ================= CONFIGURATION =================
@@ -32,10 +32,13 @@ RESISTOR_TC_PERIOD_S = 0.25
 TC_MIN_C = -40.0
 TC_MAX_C = 600.0
 
-# What a DS18B20 can measure. A cell reading outside it is a sensor fault, and
-# is skipped like an ERR so that sensor's age grows.
-DS18B20_MIN_C = -55.0
-DS18B20_MAX_C = 125.0
+# What a DS18B20 can measure is DS18B20_MIN_C to DS18B20_MAX_C, from rig_config.
+# A cell or bus-bar reading outside it is a sensor fault, and is skipped like an
+# ERR so that sensor's age grows.
+
+# How the temperature Arduino marks its bus-bar line: "B,<t1>,...,<tN>", after
+# the numbered lines for the cell buses.
+BUSBAR_LINE_PREFIX = "B"
 
 
 # Opening a port resets the Arduino on it, and the temperature board then takes
@@ -145,13 +148,6 @@ def parse_temperature_line(line, sensors_per_bus, bus_count):
 
     readings = {} #create a dictionary
     for i in range(sensors_per_bus): #i = sensor index
-        raw = parts[i + 1]
-        if raw == "ERR":
-            continue
-        try:
-            value = float(raw)
-        except ValueError:
-            continue
         # float() accepts "nan" and "inf". Neither is a temperature, and a NaN
         # loses every comparison, so it would hide from max() and the overtemp
         # trip while still counting as a fresh reading for that sensor. Nor is
@@ -160,10 +156,54 @@ def parse_temperature_line(line, sensors_per_bus, bus_count):
         # look cold. The sketch already sends ERR for anything at or below
         # -100 C; this holds if it ever stops. 85 C, the power-on value, is
         # within range and reads hot, so it fails closed on its own.
-        if math.isfinite(value) and DS18B20_MIN_C <= value <= DS18B20_MAX_C:
+        value = parse_sensor_field(parts[i + 1])
+        if value is not None:
             readings[i] = value
 
     return bus_idx, readings
+
+
+def parse_sensor_field(raw):
+    """One field of a temperature line as degrees C, or None if it is not a reading.
+
+    None for ERR, for text that is not a number, for nan and inf (float() takes
+    both), and for anything outside what a DS18B20 can measure: -127 is the
+    library's "disconnected" value, and as a fresh reading it would make that
+    sensor look cold.
+    """
+    raw = raw.strip()
+    if raw == "ERR":
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if math.isfinite(value) and DS18B20_MIN_C <= value <= DS18B20_MAX_C:
+        return value
+    return None
+
+
+def parse_busbar_line(line, sensor_count):
+    """Parse the bus-bar line from the temperature Arduino: "B,<t1>,...,<tN>".
+
+    Returns {index: temp} for the sensors that gave a reading, bus bar 1 (the
+    bar between S1 and S2) at index 0. None if this is not the bus-bar line, or
+    it does not carry exactly `sensor_count` fields: a line cut short must not
+    be applied as if the missing sensors were simply not there. None too when
+    no bus-bar sensors are configured, so a board that sends the line anyway is
+    ignored rather than half believed.
+    """
+    if sensor_count <= 0:
+        return None
+    parts = line.split(',')
+    if parts[0].strip() != BUSBAR_LINE_PREFIX or len(parts) != sensor_count + 1:
+        return None
+    readings = {}
+    for i, raw in enumerate(parts[1:]):
+        value = parse_sensor_field(raw)
+        if value is not None:
+            readings[i] = value
+    return readings
 
 
 def temperature_sensor_ages(last_valid_rx, now):
@@ -328,6 +368,18 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
     # None means no valid reading yet.
     sensor_last_rx = [[None] * daq_cfg.sensors_per_bus for _ in range(daq_cfg.temp_bus_count)]
 
+    # Bus-bar sensors, bus bar 1 (between S1 and S2) first: the last valid
+    # reading of each and when it arrived. None until a sensor's first reading,
+    # like the resistor thermocouples and unlike the cell array's 0.0, so one
+    # that has never reported cannot be taken for a cold bus bar. Both lists
+    # are empty when none are configured, and nothing downstream expects any.
+    n_busbar = max(0, daq_cfg.busbar_sensor_count)
+    busbar_temps = [None] * n_busbar
+    busbar_last_rx = [None] * n_busbar
+    if n_busbar:
+        print(f"[DAQ] Expecting {n_busbar} bus-bar sensor(s) on the temperature board's "
+              f"'{BUSBAR_LINE_PREFIX}' line.")
+
     # The end of a temperature line that had not finished arriving at the last
     # pass, and the port it came from. See read_available_lines().
     temp_pending = b""
@@ -483,6 +535,15 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                     lines, temp_pending = read_available_lines(current_temp_ser, temp_pending)
                     for line in lines:
                         decoded_line = line.decode('utf-8', errors='ignore').strip()
+                        # The bus-bar line first: it starts with a letter, which
+                        # the cell-bus parser would only throw away.
+                        bars = parse_busbar_line(decoded_line, n_busbar)
+                        if bars is not None:
+                            rx_time = time.time()
+                            for i, temp_c in bars.items():
+                                busbar_temps[i] = temp_c
+                                busbar_last_rx[i] = rx_time
+                            continue
                         parsed = parse_temperature_line(
                             decoded_line, daq_cfg.sensors_per_bus, daq_cfg.temp_bus_count)
                         if parsed is None:
@@ -522,6 +583,10 @@ def run_daq_process(telemetry_queue: Queue, stop_event: Event, config: RigConfig
                 # Bank 1 first. None until a bank's first valid reading.
                 'resistor_temps': bank_temps,
                 'resistor_temp_ages_s': bank_ages,
+                # Bus bar 1 first, None until its first valid reading. Both
+                # empty when no bus-bar sensors are configured.
+                'busbar_temps': list(busbar_temps),
+                'busbar_temp_ages_s': reading_ages(busbar_last_rx, now),
                 'hardware_status': {
                     'temp_arduino': current_temp_ser is not None,
                     'resistor_tc': tc_task is not None,

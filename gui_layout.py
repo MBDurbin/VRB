@@ -149,7 +149,7 @@ LIMIT_LABELS = {
     'temp_stale_timeout': "Temp stale timeout", 'daq_stale_timeout': "DAQ stale timeout",
     'derate_en': "Thermal derate", 'derate_start': "Derate start",
     'resistor_max_temp': "Resistor trips", 'bank_rated_only': "Bank at rated power only",
-    'load_check': "Check load against ladder",
+    'load_check': "Check load against ladder", 'busbar_max_temp': "Bus-bar trip",
 }
 
 # How long the controller may take to acknowledge a settings change before the
@@ -187,13 +187,18 @@ RECORD_LEAD = ["Timestamp", "Pack_V", "Amps", "Power_kW", "Max_Temp", "SOC_Est",
 RECORD_RUN = ["Lap", "Row", "Asked_Res", "Expected_A", "Remaining_Ah", "DAQ_Age_s"]
 
 
-def record_headers(series, parallel, bank_count):
-    """The recording's header row for this pack and wiring."""
+def record_headers(series, parallel, bank_count, busbar_count=0):
+    """The recording's header row for this pack and wiring.
+
+    BusBar_1_T is the bar between S1 and S2. There are no bus-bar columns while
+    no bus-bar sensors are configured.
+    """
     headers = list(RECORD_LEAD)
     headers += [f"Cell_{i + 1}_V" for i in range(series)]
     headers += [f"S{s}_T{p}" for s in range(1, series + 1) for p in range(1, parallel + 1)]
     headers += RECORD_RUN
     headers += [f"Bank_{b + 1}_T" for b in range(bank_count)]
+    headers += [f"BusBar_{b + 1}_T" for b in range(busbar_count)]
     return headers
 
 
@@ -214,7 +219,8 @@ def _padded(values, count, digits):
     return row + [''] * (count - len(row))
 
 
-def record_row(packet, started_at, series, parallel, bank_count, received_at=None):
+def record_row(packet, started_at, series, parallel, bank_count, busbar_count=0,
+               received_at=None):
     """One recording row for one telemetry packet, matching record_headers().
 
     Timestamp is when the DAQ took the sample, in seconds from `started_at`,
@@ -242,6 +248,7 @@ def record_row(packet, started_at, series, parallel, bank_count, received_at=Non
         _cell(packet.get('remaining_ah'), 3), _cell(packet.get('daq_age_s'), 3),
     ]
     row += _padded(packet.get('resistor_temps', []), bank_count, 1)
+    row += _padded(packet.get('busbar_temps', []), busbar_count, 1)
     return row
 
 
@@ -336,6 +343,8 @@ OVERRIDE_SPINS = {
 DEFAULT_INT_RANGE = (1, 999)
 INT_FIELD_RANGES = {
     'temp_baud_rate': (300, 2_000_000),
+    # From 0: none fitted is a setting, and the box must be able to go back to it.
+    'busbar_sensor_count': (0, 64),
 }
 
 # Configure-dialog list fields that hold numbers, not channel names.
@@ -617,7 +626,13 @@ class ConfigDialog(QtWidgets.QDialog):
             f"RESISTOR TRIPS    "
             + "  |  ".join(f"B{i + 1} {t:.0f} C"
                            for i, t in enumerate(candidate.limits.resistor_max_temp_c))
-            + "   (edit in rig_config.json)"
+            + "   (edit in rig_config.json)\n"
+            f"BUS BARS          "
+            + (f"{candidate.daq.busbar_sensor_count} sensors, trip "
+               f"{candidate.limits.busbar_max_temp_c:.0f} C (edit in rig_config.json)"
+               if candidate.daq.busbar_sensor_count > 0 else
+               f"no sensors fitted; a {pack.series_count}S module has "
+               f"{pack.bus_bar_count} between its series groups")
         )
 
         text = config_problem_text(candidate)
@@ -657,16 +672,32 @@ class ConfigDialog(QtWidgets.QDialog):
 
 
 # ================= HEATMAP WINDOW =================
+def busbar_places(series_count, busbar_count):
+    """(how many bus-bar tiles the thermal map draws, whether they sit between columns).
+
+    One sensor per bus bar, a series count less one, is drawn where the bars
+    are: each tile between the two series groups its bar joins. With none
+    fitted the same places are drawn, empty, so the map shows where they go.
+    Any other count cannot be placed, and is drawn as a plain row.
+    """
+    between_groups = max(0, series_count - 1)
+    if busbar_count <= 0 or busbar_count == between_groups:
+        return between_groups, True
+    return busbar_count, False
+
+
 class HeatmapWindow(QtWidgets.QWidget):
-    def __init__(self, series_count=12, parallel_count=4):
+    def __init__(self, series_count=12, parallel_count=4, busbar_count=0):
         super().__init__()
         # Grid follows the configured pack topology rather than a hardcoded
         # 12S4P, so a future team's pack draws correctly.
         self.series_count = series_count
         self.parallel_count = parallel_count
+        # Bus-bar sensors configured: 0 while none are fitted.
+        self.busbar_count = max(0, busbar_count)
 
         self.setWindowTitle(f"{series_count}S{parallel_count}P Thermal Map")
-        self.resize(min(1600, 62 * series_count + 80), 82 * parallel_count + 80)
+        self.resize(min(1600, 62 * series_count + 80), 82 * parallel_count + 170)
 
         main_layout = QtWidgets.QVBoxLayout(self)
         main_layout.setContentsMargins(theme.GAP_LG, theme.GAP_MD, theme.GAP_LG, theme.GAP_LG)
@@ -715,19 +746,75 @@ class HeatmapWindow(QtWidgets.QWidget):
 
             main_layout.addLayout(row_layout)
 
+        # --- Bus bars ---
+        # One tile per bus bar, under the cells and half a column across, so
+        # each sits between the two series groups its bar joins.
+        places, between = busbar_places(series_count, self.busbar_count)
+        main_layout.addSpacing(theme.GAP_MD)
+        self.lbl_busbar_caption = QtWidgets.QLabel()
+        self.lbl_busbar_caption.setProperty("variant", "section")
+        main_layout.addWidget(self.lbl_busbar_caption)
+
+        busbar_layout = QtWidgets.QHBoxLayout()
+        busbar_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        busbar_layout.setContentsMargins((self.CELL_SIZE + 3) // 2 if between else 0, 0, 0, 0)
+        busbar_layout.setSpacing(3)
+        self.busbar_labels = []
+        for i in range(places):
+            lbl = QtWidgets.QLabel("--")
+            lbl.setFixedSize(self.CELL_SIZE, 34)
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet(self._cell_style(theme.SURFACE_HIGH, theme.TEXT_MUTED))
+            lbl.setToolTip(f"Bus bar {i + 1}, between S{i + 1} and S{i + 2}" if between
+                           else f"Bus-bar sensor {i + 1}")
+            busbar_layout.addWidget(lbl)
+            self.busbar_labels.append(lbl)
+        main_layout.addLayout(busbar_layout)
+        self.show_busbar_caption(None)
+
         swatches = "".join(
             f"<span style='color:{hexcode}'>■</span>" for _, hexcode in theme.HEAT_STOPS)
-        legend = QtWidgets.QLabel(f"cool &nbsp;{swatches}&nbsp; at limit")
+        legend = QtWidgets.QLabel(f"cool &nbsp;{swatches}&nbsp; at limit &nbsp;·&nbsp; "
+                                  f"dashed red: a bus-bar reading gone stale")
         legend.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 11px;")
         main_layout.addSpacing(theme.GAP_SM)
         main_layout.addWidget(legend)
 
-    def _cell_style(self, bg, fg):
+    def _cell_style(self, bg, fg, border=None):
         return (
             f"background-color: {bg}; color: {fg}; font-family: {theme.FONT_MONO}; "
             f"font-weight: 700; font-size: 12px; border-radius: {theme.RADIUS_SM}px; "
-            f"border: 1px solid {theme.BORDER_SUBTLE};"
+            f"border: {border or f'1px solid {theme.BORDER_SUBTLE}'};"
         )
+
+    def show_busbar_caption(self, limit):
+        if not self.busbar_count:
+            text = (f"BUS BARS · {len(self.busbar_labels)} PLACES · NO SENSORS FITTED "
+                    f"(busbar_sensor_count is 0)")
+        else:
+            text = f"BUS-BAR TEMPERATURES · {self.busbar_count} SENSORS"
+            if limit is not None:
+                text += f" · TRIP {limit:.0f} °C"
+        self.lbl_busbar_caption.setText(text)
+
+    def update_busbars(self, temps, ages, limit, stale_timeout_s):
+        """temps/ages: per bus-bar sensor, bus bar 1 first. limit: the trip, C."""
+        self.show_busbar_caption(limit)
+        for i, lbl in enumerate(self.busbar_labels):
+            fitted = i < self.busbar_count
+            temp = temps[i] if fitted and i < len(temps) else None
+            age = ages[i] if i < len(ages) else float('inf')
+            # The same rule as a resistor bank's tile: no trip means no sensor.
+            fill, status = bank_tile(temp, age, limit if fitted else None, stale_timeout_s)
+            if temp is None:
+                lbl.setText("--")
+                lbl.setStyleSheet(self._cell_style(theme.SURFACE_HIGH, theme.TEXT_MUTED))
+                continue
+            _, ratio = theme.heat_colour(temp, limit)
+            text_colour = "#ffffff" if (ratio < 0.35 or ratio > 0.75) else "#14171c"
+            border = f"2px dashed {theme.DANGER}" if status == "STALE" else None
+            lbl.setText(f"{temp:.0f}")
+            lbl.setStyleSheet(self._cell_style(fill, text_colour, border))
 
     def update_temps(self, temp_array, current_max_safe_temp):
         flat_temps = []
@@ -1074,10 +1161,18 @@ class TelemetryGUI(QtWidgets.QMainWindow):
         self.card_temp = MetricCard("Max Temp", "--- °C", theme.TEXT)
         self.card_soc = MetricCard("Charge", "--- %", theme.SUCCESS)
         self.card_lap = MetricCard("Lap", "-- / --", theme.TEXT_DIM)
+        # The hottest bus bar, beside the hottest cell. Only once bus-bar
+        # sensors are configured, so a module without them shows no dead card.
+        self.card_busbar = None
+        if self.config.daq.busbar_sensor_count > 0:
+            self.card_busbar = MetricCard("Max Bus Bar", "--- °C", theme.TEXT)
 
         status_row.addWidget(self.lbl_fsm_state, stretch=3)
-        for card in (self.card_voltage, self.card_current, self.card_power,
-                     self.card_temp, self.card_soc, self.card_lap):
+        cards = [self.card_voltage, self.card_current, self.card_power, self.card_temp,
+                 self.card_soc, self.card_lap]
+        if self.card_busbar is not None:
+            cards.insert(4, self.card_busbar)
+        for card in cards:
             status_row.addWidget(card, stretch=2)
         main_layout.addLayout(status_row)
 
@@ -1887,7 +1982,8 @@ class TelemetryGUI(QtWidgets.QMainWindow):
     def toggle_heatmap(self):
         if self.heatmap_window is None:
             self.heatmap_window = HeatmapWindow(
-                self.config.pack.series_count, self.config.pack.parallel_count)
+                self.config.pack.series_count, self.config.pack.parallel_count,
+                self.config.daq.busbar_sensor_count)
 
         if self.heatmap_window.isVisible():
             self.heatmap_window.hide()
@@ -2039,8 +2135,27 @@ class TelemetryGUI(QtWidgets.QMainWindow):
             self.lbl_delta_v.setText(f"ΔV   {delta_v:.3f} V")
             self.lbl_delta_v.setStyleSheet(theme.delta_v_style(delta_v))
 
-            if self.heatmap_window and self.heatmap_window.isVisible() and temps:
-                self.heatmap_window.update_temps(temps, self.lim_t_crit)
+            busbar_temps = latest_data.get('busbar_temps', [])
+            busbar_limit = self.config.limits.busbar_max_temp_c
+            if self.card_busbar is not None:
+                read = [t for t in busbar_temps if t is not None]
+                if read:
+                    hottest = max(read)
+                    colour = theme.TEXT
+                    if hottest >= busbar_limit:
+                        colour = theme.DANGER
+                    elif hottest >= busbar_limit - 10.0:
+                        colour = theme.WARNING
+                    self.card_busbar.set_value(f"{hottest:.1f} °C", colour)
+                else:
+                    self.card_busbar.set_value("--- °C", theme.TEXT_MUTED)
+
+            if self.heatmap_window and self.heatmap_window.isVisible():
+                if temps:
+                    self.heatmap_window.update_temps(temps, self.lim_t_crit)
+                self.heatmap_window.update_busbars(
+                    busbar_temps, latest_data.get('busbar_temp_ages_s', []),
+                    busbar_limit, self.config.limits.temp_stale_timeout_s)
 
             if self.resistor_map_window and self.resistor_map_window.isVisible():
                 self.resistor_map_window.update_banks(
@@ -2067,9 +2182,10 @@ class TelemetryGUI(QtWidgets.QMainWindow):
                 self.p_current.setXRange(self.time_data[0], self.time_data[-1], padding=0)
 
     def record_shape(self):
-        """(series, parallel, banks) the recording's columns are laid out for."""
+        """(series, parallel, banks, bus bars) the recording's columns are laid out for."""
         return (self.config.pack.series_count, self.config.pack.parallel_count,
-                len(self.config.daq.resistor_tc_channels))
+                len(self.config.daq.resistor_tc_channels),
+                max(0, self.config.daq.busbar_sensor_count))
 
     def record_packet(self, packet, received_at):
         """Write one packet to the recording, unless it is a sample already written.

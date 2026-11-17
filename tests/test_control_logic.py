@@ -184,6 +184,7 @@ def _limits(**overrides):
         'temp_stale_timeout': 3.0, 'daq_stale_timeout': 1.0,
         'derate_en': False, 'derate_start': 55.0,
         'resistor_max_temp': [225.0, 225.0, 225.0, 150.0],
+        'busbar_max_temp': 80.0,
     }
     base.update(overrides)
     return base

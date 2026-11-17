@@ -180,7 +180,8 @@ class TestLimitDerivation:
         assert keys == {'max_amps', 'amp_buffer', 'max_temp', 'min_volts',
                         'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout',
                         'daq_stale_timeout', 'derate_en', 'derate_start',
-                        'resistor_max_temp', 'bank_rated_only', 'load_check'}
+                        'resistor_max_temp', 'busbar_max_temp', 'bank_rated_only',
+                        'load_check'}
 
     def test_load_check_ships_on_and_says_so_when_off(self):
         # Off is for the bench supplies only, and saved on exit, so it warns.

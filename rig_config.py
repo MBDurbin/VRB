@@ -400,6 +400,15 @@ class PackConfig:
     # current figures above already apply to the whole battery unchanged.
 
     @property
+    def bus_bar_count(self) -> int:
+        """Bus bars joining one series group to the next within the module: S - 1.
+
+        Eleven for 12S. The two end terminals are not counted: they join the
+        module to the bank, not one group of cells to another.
+        """
+        return max(0, self.series_count - 1)
+
+    @property
     def battery_cell_count(self) -> int:
         """Every cell in the car: 48 per module x 9 modules = 432."""
         return self.cell_count * self.modules_in_series
@@ -534,6 +543,11 @@ CJC_SOURCES = ("BUILT_IN", "CONSTANT_USER_VALUE")
 # module's own; a module without the setting (an NI 9211) needs DEFAULT.
 TC_ADC_MODES = ("HIGH_SPEED", "HIGH_RESOLUTION", "DEFAULT")
 
+# What a DS18B20 can measure. A reading outside it is a sensor fault, not a
+# temperature, and a trip set above the top of it could never fire.
+DS18B20_MIN_C = -55.0
+DS18B20_MAX_C = 125.0
+
 # The range a per-tap gain may take (DaqConfig.voltage_tap_gains). A divider of
 # 1% resistors is within about 2% of its nominal ratio; 10% is a wrong part.
 # NaN falls outside it, as every comparison with NaN is False.
@@ -647,6 +661,25 @@ class DaqConfig:
     # value in its sketch or the handshake returns garbage and the device is
     # never identified. High because 48 readings per sweep is a lot of text.
     temp_baud_rate: int = 115200
+
+    # --- Bus-bar temperature sensors ---
+    # One DS18B20 on each bus bar that joins one group of parallel cells to the
+    # next: a 12S module has eleven, between S1 and S2 up to between S11 and
+    # S12. Entry 1 is the bar between S1 and S2. See bus_bar_count on PackConfig.
+    #
+    # The cell sensors sit on the cell tops. The bus bars are the current path
+    # itself, so a weld or a bar that is running hot shows here first, and it is
+    # the cell terminal that it heats.
+    #
+    # The temperature Arduino sends them on a line of their own,
+    # "B,<t1>,...,<tN>", after the six cell buses. This is how many it sends.
+    # 0, as shipped, means none are fitted: nothing is expected, checked or
+    # tripped on, and the thermal map shows the eleven places empty. Set it only
+    # once the sensors are on the module and their addresses are in the sketch
+    # (BUSBAR_SENSOR_COUNT in arduino/temperature_sensor_array), because from
+    # then on a bus-bar sensor that does not report faults the rig once armed,
+    # the same as a cell sensor.
+    busbar_sensor_count: int = 0
 
     # --- Resistor bank thermocouples ---
     # One thermocouple per bank on banks 1-4, read by the NI-DAQ rather than the
@@ -806,6 +839,11 @@ class DaqConfig:
             problems.append(f"Current transducer scale {self.current_amps_per_volt} A/V must "
                             f"be positive, or discharge current never reaches the "
                             f"over-current trip.")
+        # Sizes the bus-bar arrays in the DAQ process. A negative one cannot.
+        if isinstance(self.busbar_sensor_count, bool) or \
+                not isinstance(self.busbar_sensor_count, int) or self.busbar_sensor_count < 0:
+            problems.append(f"Bus-bar sensor count {self.busbar_sensor_count!r} must be a "
+                            f"whole number, 0 for none fitted.")
         # Tap gains scale the voltages every voltage trip reads. A set that does
         # not line up with the taps, or a value no divider tolerance explains,
         # means the cells are not being read as calibrated.
@@ -847,6 +885,14 @@ class DaqConfig:
                 f"{self.sensor_count} thermistors configured for {pack.cell_count} cells. "
                 f"Any that are not fitted will read as failed sensors once armed."
             )
+        # Bus-bar sensors are optional, so none is no problem. A count that is
+        # not one per bus bar still works, but the map cannot place them.
+        if self.busbar_sensor_count and self.busbar_sensor_count != pack.bus_bar_count:
+            problems.append(
+                f"{self.busbar_sensor_count} bus-bar sensors configured, but a "
+                f"{pack.series_count}S module has {pack.bus_bar_count} bus bars between its "
+                f"series groups. The thermal map shows them in a row without placing them."
+            )
         # The bank has no thermal protection of its own (docs/hardware_topology.md).
         if not self.resistor_tc_channels:
             problems.append("No resistor thermocouple channels: nothing is watching the "
@@ -871,6 +917,7 @@ DAQ_FIELD_LABELS = {
     'temp_bus_count':        ("OneWire bus count", "buses"),
     'sensors_per_bus':       ("Sensors per bus", "sensors"),
     'temp_baud_rate':        ("Temp sensor baud", "baud"),
+    'busbar_sensor_count':   ("Bus-bar sensors", "0 until fitted; one per bus bar"),
     'resistor_tc_channels':  ("Resistor thermocouples", "bank 1 first, comma separated"),
     'thermocouple_type':     ("Thermocouple type", "B E J K N R S T"),
     'resistor_tc_cjc_source': ("Cold-junction source", "BUILT_IN or CONSTANT_USER_VALUE"),
@@ -1009,6 +1056,22 @@ class SafetyLimits:
     # what bounds the elements. Banks 5-8 have no thermocouple; at 140% they
     # rely on their rating margin and the fan alone.
     #
+    # Bus-bar over-temperature trip, in Celsius, for every bus-bar sensor
+    # (DaqConfig.busbar_sensor_count). Like the cell trip it applies in EVERY
+    # state. It does nothing while no bus-bar sensors are fitted.
+    #
+    # Not derived from the pack, and edited in rig_config.json: the Configure
+    # dialog does not show limits.
+    #
+    # 80 C is the RS50's own cut-off, the temperature its 70 A rating is quoted
+    # with. A bus bar is welded to the cell terminals, so its temperature is
+    # the terminal's, and the sensor sits on the current path itself. The cell
+    # sensors trip lower (65 C as shipped) because a cell top reads cooler than
+    # the cell; this one needs no such allowance. Lower it if the bars run cool
+    # in practice and you want an earlier warning of a poor weld. Above 125 C,
+    # the top of a DS18B20's range, it could never fire, and blocks ARM.
+    busbar_max_temp_c: float = 80.0
+
     # A switch between two fixed figures rather than a number, so nothing here
     # can raise the bank past 140%. The GUI sidebar toggles it live.
     bank_rated_power_only: bool = False
@@ -1040,7 +1103,7 @@ class SafetyLimits:
     # the string "false" into an error and True into 1.0.
     NUMERIC_FIELDS = ('max_amps', 'amp_buffer', 'max_temp', 'min_volts', 'warn_volts',
                       'min_cell_volts', 'cell_sense_floor', 'temp_stale_timeout_s',
-                      'daq_stale_timeout_s', 'derate_start')
+                      'daq_stale_timeout_s', 'derate_start', 'busbar_max_temp_c')
 
     def apply_pack_derivation(self, pack: PackConfig):
         """Recompute limits from the cell datasheet. No-op if derivation is off."""
@@ -1178,6 +1241,7 @@ class SafetyLimits:
             'derate_start': self.derate_start,
             # A copy, so the logic process never shares a list with this object.
             'resistor_max_temp': list(self.resistor_max_temp_c),
+            'busbar_max_temp': self.busbar_max_temp_c,
             'bank_rated_only': self.bank_rated_power_only,
             'load_check': self.load_check_enabled,
         }
@@ -1188,7 +1252,7 @@ class SafetyLimits:
 # The command-dict keys every trip compares a reading against.
 NUMERIC_LIMIT_KEYS = ('max_amps', 'amp_buffer', 'max_temp', 'min_volts', 'min_cell_volts',
                       'cell_sense_floor', 'temp_stale_timeout', 'daq_stale_timeout',
-                      'derate_start')
+                      'derate_start', 'busbar_max_temp')
 
 
 def _finite(x):
@@ -1231,6 +1295,13 @@ def rating_exceedances(limits, pack: PackConfig):
             f"Per-cell trip {limits['min_cell_volts']:.2f} V is below the cell's "
             f"{pack.cell_min_voltage:.2f} V cutoff -- a cell would be damaged "
             f"before the trip fires."
+        )
+    # A bus-bar trip past the top of the sensor's range can never be reached:
+    # the DAQ throws away any DS18B20 reading above it as a sensor fault.
+    if limits['busbar_max_temp'] > DS18B20_MAX_C:
+        problems.append(
+            f"Bus-bar trip {limits['busbar_max_temp']:.0f} C is above the "
+            f"{DS18B20_MAX_C:.0f} C a DS18B20 can read, so it could never fire."
         )
     # A resistor trip above what the element is rated for only fires once the
     # element is already past its limit.

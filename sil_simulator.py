@@ -32,6 +32,7 @@ class SILSimulatorWindow(QtWidgets.QWidget):
         self.temp_buses = daq.temp_bus_count
         self.sensors_per_bus = daq.sensors_per_bus
         self.n_banks = len(daq.resistor_tc_channels)
+        self.n_busbars = max(0, daq.busbar_sensor_count)
 
         self.init_ui()
 
@@ -154,6 +155,10 @@ class SILSimulatorWindow(QtWidgets.QWidget):
             'temp_sensor_ages_s': [[0.0] * len(bus) for bus in fake_temps],
             'resistor_temps': bank_temps,
             'resistor_temp_ages_s': [0.0] * len(bank_temps),
+            # The bus bars follow the cell slider: they are welded to the
+            # cells. None when no bus-bar sensors are configured.
+            'busbar_temps': [sim_temp] * self.n_busbars,
+            'busbar_temp_ages_s': [0.0] * self.n_busbars,
             'hardware_status': {
                 'ni_daq': not hw_fault,
                 'temp_arduino': not hw_fault,

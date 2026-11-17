@@ -131,6 +131,22 @@ default) faults the rig as `TEMP SENSOR FAULT`, and the console names the bus an
 sensor. A sensor that reads `ERR` from power-up counts too, so a known-dead
 sensor has to be fixed before the rig can be armed.
 
+**Bus-bar sensors.** The sketch has a place for one more DS18B20 on each bus
+bar between two series groups, eleven on a 12S module. They go on pin 8, and
+pin 9 as well if one bus is too long, and are sent on a line of their own after
+the six cell buses:
+
+```
+B,<t1>,<t2>,...,<t11>
+```
+
+`BUSBAR_SENSOR_COUNT` is 0 as shipped, which leaves all of it out of the build.
+To fit them, fill in `busbarSensors[]` (address, and bus 0 or 1, for each bar in
+order), set `BUSBAR_SENSOR_COUNT`, flash, and set `busbar_sensor_count` in
+`rig_config.json` to the same number. The host takes the line only when it
+carries exactly that many readings. The steps are at the top of that part of
+the sketch and in `docs/hardware_topology.md`.
+
 **The 48 sensor ROM addresses are hardcoded in this sketch.** Changing
 `sensors_per_bus` or `temp_bus_count` in `rig_config.json` does *not* change what
 the firmware reads; the addresses here must be edited and the sketch re-flashed.

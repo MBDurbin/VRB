@@ -14,7 +14,7 @@ Unit tests cover the decision math (`pytest`). This covers everything else.
 python -m pytest
 ```
 
-All 48 tests must pass before starting. Then plug in the SIL dongle and:
+All of them must pass before starting. Then plug in the SIL dongle and:
 
 ```bash
 python main_v2.py
@@ -27,6 +27,17 @@ pack, recompute the sag and trip currents from its resistance.
 
 Confirm the console prints `--> SIL KEY UNLOCKED on COMx` and both the SIL
 plant-model window and the main telemetry GUI appear.
+
+**Most of sections B, C and D need a resistor controller on USB.** The state
+only leaves `DISCONNECTED` once the logic process has found one, and `ARM` is
+taken only from `IDLE`. Plug the resistor Arduino in with the relay supply off
+and **the battery disconnected**: in SIL mode it is driven from the sliders, not
+from a module. Without a controller, the trips that apply in every state still
+latch from `DISCONNECTED` (B1, B4, B5, B16 to B18), and that is all that can be
+tried.
+
+SIL mode skips the load check: the plant's current is a slider, not what the
+ladder would draw. The console says so at start-up.
 
 ---
 
@@ -114,7 +125,10 @@ and always-fresh timestamps, so these need either a unit test or real hardware
 | D4 | Set `Derate Start` above `Max Temp`, enable derate, then RUN | No crash. Logic process stays alive (fail-safe full derate) |
 | D5 | Set `Max Amp` to 0, then RUN | No crash, no divide-by-zero |
 | D8 | Set `V Crit` to 45 V while running at 4.20 V/cell OCV | Trips `UNDERVOLTAGE` — confirms the spinbox actually reaches the logic process |
-| D9 | While `RUNNING`, press **Configure** | Refused with "Run in progress"; nothing changes or saves. The controller ignores a new config mid-run |
+| D9 | While `RUNNING`, press **Configure**, then **Load Profile** | Neither opens. An amber line beside the hardware pills says `Run in progress: stop it before ...`; nothing changes or saves. No dialog box appears: one would take E-STOP's clicks until it was dismissed |
+| D13 | While `RUNNING`, with the Thermal Map window in front, press **Esc** | Immediate `FAULT`, as the E-STOP button. Esc is the E-STOP from any of the rig's windows |
+| D14 | From `IDLE`, change `Max Amp` to 60, then tick **Derive limits from pack** | `LIMITS HAND-SET` appears in amber beside the car and pack label after the edit, and the box unticks itself. Ticking it puts 275 A back and the notice goes |
+| D15 | End the logic process from Task Manager (it is the `python.exe` that is not drawing a window; try until the banner changes) | Within 2 s the state banner reads `NO TELEMETRY` and counts up. It used to go on showing the last state it was sent |
 | D10 | From `IDLE`, **Configure**, change the cell's max temp, press **Cancel**. Then nudge `E-stop buffer` | Sidebar `Max Temp` is unchanged before and after the nudge, and no `NOT IN FORCE` line appears: the cancelled preview did not leak into the live limits |
 | D11 | Drag `V Warn` to a new value | Only the dashed plot line moves. Console shows no `Limits updated`, and after a restart there is no "Hand-edited limits were replaced" dialog |
 | D12 | Use the rig normally through C and D | The red `NOT IN FORCE ON THE CONTROLLER` line beside the car and pack label never appears. If it does, the controller is not using the settings shown |
@@ -125,8 +139,8 @@ and always-fresh timestamps, so these need either a unit test or real hardware
 
 | # | Step | Expected |
 |---|------|----------|
-| E1 | START RECORDING, run 1 lap, STOP RECORDING | `logs/telemetry_*.csv` created with 68 columns + header |
-| E2 | Open the CSV | Rows are contiguous, SOC decreases monotonically, no blank/garbage rows |
+| E1 | START RECORDING, run 1 lap, STOP RECORDING | `logs/telemetry_*.csv` created with 78 columns + header for the shipped 12S4P and four bank thermocouples: the 68 it always had, then lap, row, `Asked_Res`, `Expected_A`, remaining Ah, packet age and four bank temperatures. Bus-bar columns follow if any are configured |
+| E2 | Open the CSV | Rows are contiguous, `Timestamp` rises by the plant's 0.05 s with no repeats, SOC decreases monotonically, no blank/garbage rows |
 | E3 | START RECORDING then close the GUI without stopping | File closes cleanly, no truncation/corruption |
 
 ## F. Shutdown / process hygiene

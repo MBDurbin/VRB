@@ -70,6 +70,7 @@ Start `python main_v2.py`, current supply off, tap supply on at 44.0 V.
 | A4 | Bank thermocouples (Resistor Map) against the thermocouple reader | Within a few °C of room temperature and of each other |
 | A5 | Thermal Map | All 48 cells read, none blank |
 | A6 | Press **ARM** | `ARMED`, and it stays there for 10 s. Then **E-STOP**, **RESET** |
+| A7 | Sidebar: untick **Check load against ladder** | `LOAD CHECK OFF` in amber beside the car and pack label. The taps are on one supply and the bank on another here, so the measured current cannot fit what the tap voltage says the ladder should draw: 32% low at best, more in current limit. Leave it off for sections B to H, except B7 |
 
 ## B. Load under control, no trips
 
@@ -83,6 +84,7 @@ Fan on, current supply output on.
 | B4 | Mid-run, change it to 1 Ω | Within half a second: ladder 1.00 Ω, clamp ~30 A |
 | B5 | Fixed power, 1.0 kW | Ladder 44² / 1000 = 1.94 → 2.00 Ω, the nearest step; 15 A. The Power card shows 44 V × 15 A = 0.66 kW, while the bank really dissipates 30 V × 15 A = 0.45 kW. On a battery the two agree |
 | B6 | Back to **Lap profile** | The profile takes the load back at once |
+| B7 | Tick **Check load against ladder**. Load `Bench - Hold 1 ohm.csv`, ARM, RUN, and once the clamp reads ~30 A switch the current supply's output **off** | `LOAD MISMATCH` within about a second: `Ladder at 1.00 ohm and 44.0 V should draw 44.0 A; measured 0.x A. Less: the contactor or a relay is open ...`. This is the check that notices a bank not doing what it was told. Untick it again afterwards. (With the supply on it may or may not trip: 30 A against 44 A is right on its edge. That is why it is off for these tests) |
 
 ## C. Current and bank-power trips
 
@@ -125,13 +127,14 @@ reader beside the sensor.
 
 | # | Step | Expected |
 |---|---|---|
-| E1 | Bench harness, shipped 80 °C trip. Warm one DS18B20 with the heat gun as above | `OVERTEMP` as the reader passes 80 °C, from `IDLE` too: `Hottest cell at 80.x C (trip 80.0 C)` |
+| E1 | Bench harness, shipped 65 °C trip. Warm one DS18B20 with the heat gun as above | `OVERTEMP` as the reader passes 65 °C, from `IDLE` too: `Hottest cell at 65.x C (trip 65.0 C)` |
 | E1a | Gentler alternative: sidebar **Max temp** 5 °C above the hottest sensor, and warm one between finger and thumb | Same trip at the lowered value |
 | E2 | ARM, then unplug one DS18B20's data lead | `TEMP SENSOR FAULT` within ~3 s, naming the bus and sensor |
 | E3 | ARM, then unplug the temperature Arduino's USB | `TEMP LINK LOST` |
 | E4 | Fan off, current supply off, `IDLE`. Heat gun on bank 1's thermocouple, thermocouple reader beside it. Keep the airflow off the cDAQ module (its cold junction), relays, PCB and wiring | `RESISTOR OVERTEMP`, `Bank 1 at 225 C (trip 225 C)`, from `IDLE`. Reader within a few °C of the trip. Repeat for banks 2-4 (bank 4 trips at 150 °C) |
 | E4a | Gentler alternative: lower `resistor_max_temp_c` in `rig_config.json` to 60 for each bank, restart | Same trips at 60 °C |
-| E5 | ARM, then unplug one thermocouple at the NI module | `RESISTOR TC FAULT` within ~3 s, naming the bank |
+| E5 | ARM, then unplug one thermocouple at the NI module | `RESISTOR TC FAULT` within ~3 s, naming the bank. It can come out as `RESISTOR OVERTEMP` instead (`Bank 1 at 573 C` on 22 October): an opening thermocouple swings through the believable range on its way to the open-circuit reading, and a sample caught there is a temperature past the trip. Either way the load is killed |
+| E6 | Only with bus-bar sensors fitted (`busbar_sensor_count` above 0). Warm one, then unplug one while `ARMED` | `BUSBAR OVERTEMP` at the 80 °C trip, from `IDLE` too, naming the bar and its groups: `Bus bar 7 (S7-S8) at 80.x C`. Unplugged: `BUSBAR SENSOR FAULT` within ~3 s |
 
 ## F. Lost links and the watchdog
 
@@ -144,6 +147,8 @@ the clamp takes to reach 0. A phone video of the clamp is enough.
 | F2 | Unplug the resistor Arduino's USB | `RESISTOR LINK LOST`. Contactor opens at once if the Arduino is USB-powered, or within 2 s on its watchdog if not. Note which |
 | F3 | Task Manager: end every `python.exe` | Contactor opens within 2 s: the Arduino's watchdog, with no host at all. No trip-log row, because nothing is left to write it |
 | F4 | Plug everything back, restart, RUN again | Comes back up normally |
+| F5 | Mid-run, press the resistor Arduino's **reset button** | `CONTROLLER RESET` about 2 s later, when the board has restarted and printed its banner. Every relay dropped the moment the button was pressed; the fault is what stops the next row's command reconnecting the bank. Before November 2026 the run simply carried on |
+| F6 | Let a run finish, and watch the contactor for a minute in `IDLE` | It stays open, with no clicking. The host now repeats KILL twice a second outside a run. If the contactor clicks in time with that, the board is on a sketch from before October 2026: reflash it |
 
 ## G. Operator stops
 
@@ -151,6 +156,8 @@ the clamp takes to reach 0. A phone video of the clamp is enough.
 |---|---|---|
 | G1 | **E-STOP** mid-run (Hold 1 Ω) | `FAULT` at once; clamp to 0; trip log `E-STOP`, `RUNNING`, `yes` |
 | G2 | With the rig in `FAULT`, press **RESET** | `IDLE`; the red `TRIPPED:` line clears |
+| G3 | Mid-run, with the Thermal Map window in front, press **Esc** | The same as G1. Esc is the E-STOP from any of the rig's windows |
+| G4 | Mid-run, press **Configure**, then **Load Profile** | Neither opens. An amber line beside the hardware pills says `Run in progress: stop it before ...`. No box to click away: a box would take E-STOP's clicks |
 
 ## H. Endurance
 
@@ -180,9 +187,14 @@ skipped (with a console warning) rather than allowed to stall the rig.
 ## Afterwards
 
 Sidebar changes are saved to `rig_config.json` when the window closes, and a
-threshold edit there switches off pack derivation. Before a battery goes back
-on:
+threshold edit there switches off pack derivation. That is how a session of
+these tests once left the file at 60 A with the per-cell trip on the cutoff,
+ready for the first module. Before a battery goes on:
 
-1. `git diff rig_config.json`. If the only changes are this test's, `git checkout -- rig_config.json`.
-2. Load override back to **Lap profile**. It is not saved; a restart also resets it.
-3. Turns off the Hanalem, tap leads back on the module harness, the module's own taps checked against the multimeter again (A2).
+1. Tick **Check load against ladder** and **Derive limits from pack** in the
+   sidebar. Both amber notices beside the car and pack label, `LOAD CHECK OFF`
+   and `LIMITS HAND-SET`, must be gone before the window is closed.
+2. `git diff rig_config.json`. If the only changes are this test's, `git checkout -- rig_config.json`.
+3. Load override back to **Lap profile**. It is not saved; a restart also resets it.
+4. Turns off the Hanalem, tap leads back on the module harness, the module's own taps checked against the multimeter again (A2).
+5. With the module's taps on, `python tools/tap_calibrate.py` and the multimeter give a gain for each tap. Per-cell voltages near the top of the stack are only good to a few tenths of a volt without them.

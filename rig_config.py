@@ -290,7 +290,7 @@ class PackConfig:
     # side wall a cell test measures, so keep the trip under 80 (rig_config.json
     # ships 65). A run held above 40 A/cell (160 A for 4P) for long ends on the
     # temperature trip, not the current one.
-    cell_max_continuous_a: float = 70
+    cell_max_continuous_a: float = 70.0
 
     # Fully-charged resting voltage of one cell. Sets the top of the pack's
     # voltage range. Not a trip threshold; it is a reference for the GUI's plot
@@ -557,7 +557,6 @@ TAP_GAIN_MAX = 1.10
 
 @dataclass
 class DaqConfig:
-    #NOTE: NEED TO VERIFY WHEN BACK IN UTAH
     """NI-DAQ channel mapping, scaling, and temperature bus layout.
 
     Channel names and sensor counts describe physical wiring, so they cannot be
@@ -639,7 +638,6 @@ class DaqConfig:
     # for a bidirectional current sensor reading below zero during regen.
     ai_min_volts: float = -10.0
     ai_max_volts: float = 10.0
-    #NOTE THIS WILL NEED EDITING WHEN WE ADD THE INBETWEEN TEMPS
     # --- Temperature sensor layout ---
     # DS18B20s on OneWire buses. The Arduino emits one CSV line per bus:
     # "<bus number>,<t1>,...,<tN>", so a line carries sensors_per_bus + 1 fields.
@@ -873,7 +871,9 @@ class DaqConfig:
         problems = []
         # One thermistor per cell is the design intent, so the thermal map covers
         # the whole module. A shortfall means hot cells with no sensor on them.
-        if self.sensor_count < pack.cell_count: #CHANGE THIS WHEN WE ADD THE INBETWEEN SENSORS FOR THE MODULES
+        # The bus-bar sensors between the groups are counted separately
+        # (busbar_sensor_count); these are the ones on the cells.
+        if self.sensor_count < pack.cell_count:
             problems.append(
                 f"{self.temp_bus_count} buses x {self.sensors_per_bus} sensors = "
                 f"{self.sensor_count} thermistors, but the pack has "
@@ -955,7 +955,9 @@ class SafetyLimits:
     # old one's ceiling.
     #
     # Editing a threshold in the GUI sidebar sets this to False automatically, so
-    # a deliberate operator override survives. Hand-editing rig_config.json
+    # a deliberate operator override survives, and the sidebar's "Derive limits
+    # from pack" box sets it True again. While it is False the main window says
+    # LIMITS HAND-SET in amber. Hand-editing rig_config.json
     # without also setting this False means the edit IS discarded on load -- but
     # loudly, via derivation_conflicts() below, not silently.
     derive_from_pack: bool = True

@@ -4,8 +4,10 @@ Self-contained summary of the system, its validated constants, and its open
 questions. Written to be dropped into a Claude Project (or read cold by anyone
 new to the repo).
 
-Last updated: 2026-11-04. Reflects the move to Reliance RS50 cells, the
-October 2026 safety-review fixes, and Mooch's measured RS50 figures.
+Last updated: 2026-11-16. Reflects the move to Reliance RS50 cells, the
+October 2026 safety-review fixes, Mooch's measured RS50 figures, and the
+November 2026 audit: the load check, the controller read-back, per-tap
+calibration and the bus-bar temperature sensors.
 
 ---
 
@@ -30,6 +32,24 @@ regardless, which happens to match the shipped 1 Hz profile but would run a
 over-draining the pack by the same factor. `compute_lap_physics()` already
 derived acceleration from those timestamps, so fixed playback also made the two
 disagree about how much time a row represents.
+
+Rows are due on the profile's timeline, not the loop's: each is due one hold
+after the row before it *was due* (`next_row_due()`), so the few tens of
+milliseconds each pass arrives late do not add up down the lap. Timed from the
+sending, a 10 Hz profile ran 13% long in the timing harness; it now runs 0.7%
+long, which is the loop's own pace. An evenly sampled profile holds its last
+row for one sample (`last_row_interval()`); a bench profile's last row only
+ends the hold before it and keeps the 1 s default.
+
+**The ladder is coarse where the heavy rows sit, and the recording shows by how
+much.** A row asking for 0.36 Ω gets the 0.25 Ω step: 43% more current. Over the
+shipped lap the charge drawn lands within 5% of what the car model asks for, but
+I²t, the cell heating, runs 3–17% high depending on module voltage. No rounding
+rule removes it: nearest *current* reads 1–15% low instead, and carrying the
+error forward makes single rows worse. So the rounding is unchanged, and every
+packet carries `requested_resistance` (the ask, before any floor or step)
+beside `target_resistance` (the step sent). Use the two when comparing bench
+heat with the car.
 
 **Lap boundaries are continuations, not restarts.** `is_first_row` means the
 standing start of the *run* (lap 1, row 0) — tying it to `row_idx == 0` alone
@@ -100,6 +120,14 @@ recent stop or fault (`stale_transition()`). Without that, a `RESET`, `ARM` and
 `RUN` already waiting in the queue were processed straight after an E-STOP, in
 the same pass, and the rig was `RUNNING` again with the next resistance command
 reconnecting the load. A fault is cleared only by a `RESET` pressed after it.
+The stamps are `time.perf_counter()` (`press_clock()`): `time.monotonic()`
+steps every 15.6 ms on Windows before Python 3.13, so a `RESET` pressed in the
+same step as its fault tied with it and was dropped.
+
+`DISCONNECTED` is where the rig waits for its resistor controller or its
+temperature board. The trips that apply in every state latch from there too; it
+used to be skipped, so a waiting rig showed nothing with every cell at 95 °C.
+A profile is not swapped under a run, any more than a config is.
 
 ## Hardware
 
@@ -112,10 +140,16 @@ reconnecting the load. A fault is cleared only by a `RESET` pressed after it.
   in an 8-bit word. Wired across the module under test.
 - **Resistor Arduino**: 9600 baud, answers `RESISTOR_CTRL` to `?WHOAMI`. Has an
   independent 2 s serial watchdog that opens the main contactor and sheds all
-  load if the host goes quiet.
+  load if the host goes quiet, and (in the repo's sketch, on the classic AVR
+  boards) the chip's own watchdog timer behind that, for a sketch that hangs.
 - **Temperature Arduino**: 115200 baud, answers `TEMP_SENSOR`. 6 buses × 8
-  sensors, 9-bit resolution for speed, non-blocking state machine.
-- **NI cDAQ**: modules 5–8, 10:1 dividers (`VOLTAGE_MULTIPLIER = 11.0`).
+  cell sensors, 9-bit resolution for speed, non-blocking state machine. Room
+  for a DS18B20 on each bus bar between the series groups, eleven on a 12S
+  module, sent on a `B,...` line of their own; none fitted as shipped (see
+  Bus-bar temperatures below).
+- **NI cDAQ**: slot 6 an NI 9212 (bank thermocouples), slot 7 an NI 9215
+  (current), slot 8 an NI 9205 (the 12 taps), 10:1 dividers
+  (`voltage_multiplier = 11.0`, with an optional gain per tap).
 
 Both Arduinos and the SIL dongle are discovered by COM-port sweep using the
 `?WHOAMI` handshake — no fixed port assignments.
@@ -186,8 +220,16 @@ exactly the bug that shipped originally, on the P45B's 180 A pack, as
 
 Hand-editing a threshold in the sidebar that derivation computes (V crit, cell
 min, max current, max temp, derate start) sets `derive_from_pack = False`, so
-your override is not reverted the next time the config loads. Re-enable
-derivation by editing that flag in `rig_config.json`. The other sidebar controls
+your override is not reverted the next time the config loads. Tick **Derive
+limits from pack** in the sidebar to go back to the derived values; that used to
+mean editing the flag in `rig_config.json`.
+
+**While the limits are hand-set, the main window says `LIMITS HAND-SET` in
+amber**, with the figures and the way back in its tooltip, and `LOAD CHECK OFF`
+likewise while the load check is switched off. The window saves the config when
+it closes, so a session on bench supplies once left the file at 60 A with the
+per-cell trip on the 2.5 V cutoff, waiting unseen for the first module.
+A per-cell trip sitting exactly on the cutoff is also an advisory now. The other sidebar controls
 are not overrides and leave derivation on: **V warn** only moves a dashed line on
 the plot and never reaches the controller (it used to switch derivation off for
 every limit), and changing the **E-stop buffer** or the **thermal derate**
@@ -288,7 +330,7 @@ compute_required_power(velocity_ms, acceleration, params=fast)
 | Field | Default | Notes |
 |---|---|---|
 | `mass_car_kg` / `mass_driver_kg` | 233 / 95.3 | 328.3 kg total: the 2026 car as weighed with today's pack, and the heaviest driver (210 lb) |
-| `rotational_mass_factor` | 1.05 | Wheels, rotors, axles, drivetrain as virtual mass |
+| `rotational_mass_factor` | 1.00 | Wheels, rotors, axles, drivetrain as virtual mass. 1.00 switches it off: the 1.05 first used was a textbook figure, not this car's. Raise it once the inertia is measured |
 | `air_density_kgm3` | 1.2255 | ISA sea level, 15 °C |
 | `gravity_ms2` | 9.81 | |
 | `drag_coefficient` / `drag_area_m2` | 0.6 / 2.224 | |
@@ -311,11 +353,13 @@ Two modelling subtleties that are easy to get wrong and are locked by tests:
 downforce, rolling, accel, total) so the breakdown can be inspected and tested;
 `compute_required_power()` builds on it and applies the efficiency correction.
 
-Effect of the rotational-mass and efficiency terms versus the earlier model:
-**+5.26 %** at steady speed (efficiency alone), rising to **+10.3 %** under hard
-acceleration. At 10 m/s and a = +8 m/s² that moves the bank from 6.73 Ω to
-6.10 Ω — roughly two 0.25 Ω steps, so it is resolvable by the hardware rather
-than lost in quantisation.
+Effect of the efficiency term versus the earlier model: **+5.26 %** at every
+speed. With a rotational mass factor of 1.05 the total rises to **+10.3 %**
+under hard acceleration: at 10 m/s and a = +8 m/s² that moves the bank from
+6.73 Ω to 6.10 Ω, roughly two 0.25 Ω steps, so it is resolvable by the hardware
+rather than lost in quantisation. As shipped the factor is 1.00, so only the
+efficiency term is in force, and the bench slightly under-loads the module
+during acceleration.
 
 ## Cell constants — Reliance RS50
 
@@ -450,7 +494,9 @@ Three independent layers. They must all be verified separately.
      never fire while the cells kept heating. Readings now carry an age and are
      refused past `temp_stale_timeout_s`.
 
-   **Over-temperature and over-current are checked in every state.** Everything
+   **Over-temperature and over-current are checked in every state**, as are
+   bus-bar over-temperature, bank overpower and resistor over-temperature, and
+   they latch from `DISCONNECTED` as well. Everything
    else — undervoltage, per-cell, and all data-integrity checks — applies only in
    `ARMED`/`RUNNING`, because before arming those readings describe a bench that
    is not loaded yet. A rig powered up before the battery is plugged in reads
@@ -509,8 +555,41 @@ Three independent layers. They must all be verified separately.
    rather than blocking. The loop sits in `try/finally`, so however it ends the
    load is killed and the port closed, and an unexpected error sends the GUI a
    final FAULT packet. **Limit:** the firmware does not answer `alive`, so a
-   controller that hangs while still enumerated is not detected by the host;
-   its own 2 s watchdog is what sheds the load then.
+   controller whose sketch hangs while still enumerated is not detected by the
+   host. The chip's own watchdog timer restarts it within 2 s, which opens
+   every relay, and the host then reads the start-up banner.
+
+   **The measured current is checked against the ladder setting** (`LOAD
+   MISMATCH`, `load_mismatch()`). Nothing compared the two before. Both wiring
+   faults found so far were of that kind and were found with a meter: the
+   command word sent in reverse, 202 A where 1.6 A was asked for, and the 8 and
+   16 Ω relays crossed. A run faults when the current has not fitted the setting
+   for three DAQ samples in a row, each taken after the setting had settled:
+   more than 15% over, or more than 35% under, with a 2 A floor. The under side
+   is the looser because wiring, contacts and hot elements all take current off;
+   nothing innocent adds it. It also catches a contactor or relay that did not
+   move, a controller that restarted, and a current sensor that stopped reading,
+   which would otherwise leave the over-current and bank-power trips blind. It
+   cannot see a wrong bank above about 16 Ω, where the difference is under 2 A,
+   or a profile whose rows change faster than the 0.5 s settle. **The bench
+   supplies do not agree with it**, the taps on one supply and the bank on
+   another, so the sidebar's *Check load against ladder* box switches it off
+   for those tests; SIL mode skips it, since the plant's current is a slider.
+
+   **The host reads what the controller prints**, each pass, without waiting.
+   Its start-up banner after the port has settled means it restarted:
+   `CONTROLLER RESET` if armed or running. It used to drop every relay, come
+   back two seconds later, take the next row's command and carry on with
+   nothing on record. Its shed notice mid-run, when the host has sent no KILL,
+   is its own watchdog: `CONTROLLER SHED LOAD`. A rejected line is reported,
+   and while running the setting is sent again, once.
+
+   **Outside a run the keep-alive is KILL, not `alive`.** `alive` feeds the
+   Arduino's watchdog; KILL does not. When a run ended, one KILL went out and
+   the rig went back to feeding the watchdog in `IDLE`, so had that one line
+   been lost the contactor stayed closed at the last setting. Now `alive` is
+   sent only while `RUNNING`, and every other state repeats KILL twice a
+   second.
 2. **Operator E-STOP** — GUI button, raises its own latched `estop_event`
    (`request_estop()`) rather than queueing a `STOP`, and the logic loop takes it
    ahead of every queued command. It used to go through
@@ -519,11 +598,42 @@ Three independent layers. They must all be verified separately.
    its own puts, so a STOP pressed into a full queue could be dropped while
    heartbeats carried on and the Arduino watchdog never fired. An Event has no
    capacity to run out of. Any `ARM`, `RUN` or `RESET` pressed before the stop
-   is void (see the state machine above).
+   is void (see the state machine above). **Esc** raises it from any of the
+   rig's windows. Nothing modal opens during a run, because a modal dialog
+   takes the button's clicks and Qt holds the shortcut back: Configure and Load
+   Profile are refused while running, with a line in the window instead of a
+   box. If the logic process goes quiet for 1.5 s the state banner says
+   `NO TELEMETRY`; the window used to show its last state for ever.
 3. **Arduino serial watchdog** — 2 s of host silence opens the main contactor
-   and sheds all load, independent of the host entirely.
+   and sheds all load, independent of the host entirely. Behind it, the chip's
+   own watchdog timer restarts a sketch whose `loop()` has stopped turning.
 
 Layer 3 is the backstop when layer 1 is stalled (see Open Questions).
+
+### Bus-bar temperatures
+
+One DS18B20 on each bus bar that joins one group of four parallel cells to the
+next: eleven on a 12S module, the bar between S1 and S2 first. The cell sensors
+sit on the cell tops; these sit on the current path itself, so a poor weld or a
+bar running hot shows there first.
+
+**None are fitted as shipped, and nothing changes until they are.**
+`busbar_sensor_count` is 0 in `rig_config.json` and `BUSBAR_SENSOR_COUNT` is 0
+in the temperature sketch: no line is sent, nothing is expected, nothing can
+trip, and the thermal map draws the eleven places empty. To fit them: wire them
+to pins 8 and 9 of the temperature Arduino, put their addresses in
+`busbarSensors[]` in the sketch, set both counts to 11, flash, restart. Set the
+two counts together: the host takes the board's `B,...` line only when it
+carries exactly the configured number of readings.
+
+Once fitted they are held to `busbar_max_temp_c` (80 °C as shipped, the RS50's
+own cut-off; the cell-top sensors trip at 65 °C because a cell top reads cooler
+than the cell, and a bus bar needs no such allowance). `BUSBAR OVERTEMP` applies
+in every state. Once armed, a sensor that stops reporting is `BUSBAR SENSOR
+FAULT` and a configured count with nothing arriving is `NO BUSBAR DATA`. Trips
+name the bar and the groups it joins. The thermal map shows them in a row under
+the cells, each between its two series groups; the main window gains a Max Bus
+Bar card; the recording gains `BusBar_1_T` onwards.
 
 ## Testing
 
@@ -531,10 +641,17 @@ Layer 3 is the backstop when layer 1 is stalled (see Open Questions).
 python -m pytest
 ```
 
-194 unit tests, no hardware required. They cover the pure decision logic extracted
-from the control loop: trip thresholds at/around boundaries, FSM transition
-guards, coulomb counting and SOC clamping, the thermal derate curve, road-load
-power, and the E-STOP command dispatch path.
+About 700 unit tests (686 passing in November 2026), no hardware required.
+`python -m pip install -r requirements.txt` installs what they and the rig need.
+They cover the pure decision logic extracted from the control loop (trip
+thresholds at and around their boundaries, FSM transition guards, coulomb
+counting and SOC clamping, the thermal derate curve, road-load power), the real
+logic loop and DAQ loop driven through their queues against fakes, the window's
+widgets off-screen, and the sketches' tables read from their source.
+
+Fourteen of them compile the resistor controller's sketch for the PC and skip
+without `g++` or `clang++` on PATH. The pin table itself is checked without a
+compiler, by reading it out of the sketch.
 
 `tests/SIL_CHECKLIST.md` is the manual desk-test procedure for what unit tests
 structurally cannot reach — process/queue plumbing, GUI responsiveness, timing,
@@ -574,6 +691,22 @@ Mooch measured 6.5 mΩ per cell, and `cell_dc_milliohm` now carries it; the
 figure matters beyond the rig: the 2027 pack study's cell heat scales with it,
 1.6× from the old 4.0 mΩ estimate to 6.5 mΩ. A module that reads well above
 6.5 mΩ per cell has a weak cell group or a poor collector-plate weld.
+
+**Calibrate the taps before trusting a per-cell figure.** Each tap has its own
+10:1 divider and none is exactly 10:1. A cell voltage is the difference of two
+taps, so the dividers' errors grow up the stack: with 1% parts, taps 11 and 12
+near 46 V and 50 V can put cell 12 almost a volt out, and its measured
+resistance a fifth out, however large the pulse. `python tools/tap_calibrate.py`
+reads every tap, takes a multimeter reading for each, and prints the
+`voltage_tap_gains` list for `rig_config.json`. Empty, as shipped, every tap
+takes the 11.0 multiplier alone.
+
+**The recording** (`logs/telemetry_*.csv`) stamps each row with the DAQ's own
+sample time, writes every sample once, and reaches the disk row by row. After
+the columns it always had it carries the lap and profile row, `Asked_Res`
+beside `Target_Res`, `Expected_A` (what the step sent should draw), remaining
+Ah, the packet's age, the resistor bank temperatures and any bus-bar
+temperatures.
 
 ## Bugs found and fixed (2026-07-23 → 25)
 
@@ -616,13 +749,19 @@ is still physically correct and matters if computed power is ever used for
 energy prediction, but it does not change bank behaviour today. Coulomb counting
 uses measured current, not this figure, so it does not propagate there either.
 
-**3. E-STOP latency during port scanning.** The queue fix guarantees the GUI
-never freezes, but the logic process still cannot *act* on a STOP while blocked
-inside `auto_detect_resistor()`. This is tolerable only because `res_ser` is
-`None` during a scan — the resistor Arduino is disconnected, so its own 2 s
-watchdog has already shed load in hardware. **This means load-shedding in that
-window rests entirely on the Arduino watchdog, not on software.** Verify on the
-bench.
+**3. The November 2026 firmware is in the repo, not on the boards.** Both
+sketches changed: the resistor controller gained the hardware watchdog and
+refuses `00000000`, and the temperature sketch gained the bus-bar line (off
+until `BUSBAR_SENSOR_COUNT` is set). They compile for the Uno, Nano and Mega
+but have not been flashed or run. The host works with the older resistor
+sketch too: it never sends `00000000`, and KILL as the idle keep-alive needs
+only that KILL does not feed the watchdog, which has been so since October.
+After flashing, run the bench check in `arduino/README.md`.
+
+(Port discovery used to block the logic loop, so an E-STOP could not be acted on
+during a scan. It has run on its own thread since October 2026, and the SIL
+dongle is now looked for before the logic process starts, so nothing sweeps the
+COM ports at the same time as anything else.)
 
 **4. The `SIL_KEY` dongle firmware is not in this repo.** `main_v2.py` probes for
 a device replying `SIL_KEY` to unlock software-in-the-loop mode, and no such
@@ -634,5 +773,18 @@ elsewhere and should join them.
 `V Warn` below `V Crit`, or `Derate Start` above `Max Temp`. The derate case now
 fails safe rather than crashing, but the UI still accepts nonsense combinations.
 
-**6. Everything so far is desk-tested only.** No validation against real
-hardware, real cells, or real current has been performed.
+**6. Tested on bench supplies, not yet on a module.** Every trip was fired on
+the real rig with supplies in place of the module in October 2026
+(`tests/BENCH_CHECKLIST.md`, `logs/trip_log.csv`). No run on real cells has
+been made. The November 2026 changes (the load check, the controller read-back,
+KILL as the idle keep-alive, row timing, the recording, per-tap gains and the
+bus-bar sensors) are unit-tested against fakes and have not been run on the
+rig. Run the bench checklist again before the first module, with the load
+check's two new steps.
+
+**7. Things only the hardware can answer.** Whether the relay MOSFET gates have
+pull-downs, so the relays stay released while the controller is in reset.
+Whether the module is fused. What tolerance the tap dividers' resistors are,
+which decides how much `tools/tap_calibrate.py` is needed. Which board the
+resistor controller is: a Nano on its old bootloader restarts over and over
+after a hardware-watchdog restart until power-cycled (see `arduino/README.md`).

@@ -35,6 +35,18 @@ rig_config.json. Reads only; it never changes the config.
 Cell voltages are the difference of two cumulative taps, so each carries a few
 millivolts of DAQ error. That is under 1 mOhm per cell at the 20 A pulse and
 about 0.2 at the 67 A one: trust the larger pulses.
+
+A larger pulse does not help with the other error, the taps' dividers. Each tap
+has its own, none exactly 10:1, and a mismatch between two neighbouring taps
+scales that cell's resistance: with 1% parts, by up to a fifth for the cells at
+the top of the stack. The module figure, from the top tap alone, is good to the
+one divider's 1%. Run tools/tap_calibrate.py and put its gains in
+rig_config.json before reading anything into one cell against another.
+
+The recording's Timestamp is the DAQ's own sample time, and each sample is
+written once. Recordings made before November 2026 were stamped by the window
+on its 50 ms redraw and could repeat a sample; they still read, with that much
+jitter on the 1 s figure.
 """
 
 import glob
